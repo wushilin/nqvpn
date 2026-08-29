@@ -1,0 +1,36 @@
+[package]
+name = "nqvpn-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+ipnet.workspace = true
+prefix-trie.workspace = true
+uuid.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+snow.workspace = true
+x25519-dalek.workspace = true
+hex.workspace = true
+rustls-pki-types.workspace = true
+
+quinn.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "lpm"
+harness = false

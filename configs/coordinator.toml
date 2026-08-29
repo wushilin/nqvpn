@@ -1,0 +1,8 @@
+[listen]
+api = "127.0.0.1:18443"
+
+[state]
+dir = "./state"
+
+[admin]
+bearer_token = "dev-admin-token"

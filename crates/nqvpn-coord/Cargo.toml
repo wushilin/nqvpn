@@ -1,0 +1,32 @@
+[package]
+name = "nqvpn-coord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nqvpn-proto.workspace = true
+rustls.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+ipnet.workspace = true
+uuid.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+argon2.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+axum.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+nqvpn-proto.workspace = true

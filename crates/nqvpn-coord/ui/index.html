@@ -1,0 +1,1335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nqvpn control plane</title>
+<style>
+:root{--bg:#fbfbfd;--fg:#1d1d22;--muted:#6b6b78;--line:#e3e3ea;--card:#fff;--sunk:#f5f5f8;
+      --ok:#0a7a44;--okbg:#e6f5ed;--off:#8a8a96;--offbg:#f0f0f3;--warn:#a4571a;--warnbg:#fdf1e3;
+      --accent:#2b5fd9;--accent2:#7d3fd1;--heat:43,95,217;--shadow:0 1px 3px rgba(0,0,0,.07),0 8px 24px rgba(0,0,0,.06);}
+@media (prefers-color-scheme:dark){
+:root{--bg:#131317;--fg:#ececf1;--muted:#9a9aa6;--line:#2a2a33;--card:#1b1b21;--sunk:#16161b;
+      --ok:#54d19a;--okbg:#14301f;--off:#8a8a96;--offbg:#232329;--warn:#e0a35c;--warnbg:#33240f;
+      --accent:#7ea2ff;--accent2:#b48cff;--heat:126,162,255;--shadow:0 1px 3px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+       padding:14px 24px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:13px}
+main{padding:20px 24px 60px;max-width:1240px;margin:0 auto}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:118px}
+.card .n{font-size:24px;font-weight:640;letter-spacing:-.02em}
+.card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+   margin:26px 0 10px;font-weight:600}
+h2:first-child{margin-top:4px}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;
+   letter-spacing:.04em;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.on{background:var(--okbg);color:var(--ok)}
+.offl{background:var(--offbg);color:var(--off)}
+.dis{background:var(--warnbg);color:var(--warn)}
+.warnpill{background:var(--warnbg);color:var(--warn)}
+button{font:inherit;font-size:13px;padding:5px 11px;border:1px solid var(--line);
+       border-radius:7px;background:var(--card);color:var(--fg);cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.5;cursor:default}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.msg{font-size:13px;color:var(--muted)}
+.err{color:var(--warn)}
+input{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
+      border-radius:7px;background:var(--card);color:var(--fg);min-width:240px}
+.muted{color:var(--muted)}
+.tiny{font-size:12px}
+.note{color:var(--muted);font-size:13px;margin:-4px 0 12px;max-width:70ch}
+
+/* ---- tabs ---- */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:20px}
+.tabs button{border:none;background:none;border-radius:0;padding:9px 15px;color:var(--muted);
+             font-weight:560;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button:hover{color:var(--fg)}
+.tabs button[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
+.pane[hidden]{display:none}
+
+/* ---- traffic matrix ---- */
+.matrix{border-collapse:separate;border-spacing:0;font-size:13px;width:auto;min-width:100%}
+.matrix th,.matrix td{border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+.matrix th:last-child,.matrix td:last-child{border-right:none}
+.matrix thead th{position:sticky;top:0;background:var(--card);z-index:2;text-align:center;padding:9px 12px}
+.matrix tbody th{text-align:left;position:sticky;left:0;background:var(--card);z-index:1;
+                 text-transform:none;font-size:13px;letter-spacing:0;color:var(--fg);font-weight:600}
+.matrix td{padding:8px 12px;text-align:right;font-variant-numeric:tabular-nums;position:relative}
+.matrix .corner{background:var(--card);z-index:3;left:0}
+.cell{display:flex;flex-direction:column;gap:1px;align-items:flex-end;position:relative;z-index:1}
+.cell .up{color:var(--fg);font-weight:560}
+.cell .dn{color:var(--muted);font-size:12px}
+.cell .rate{color:var(--accent);font-size:11px;font-weight:600}
+.zero{color:var(--muted);opacity:.45}
+.diag{background:var(--sunk)}
+.heat{position:absolute;inset:0;background:rgb(var(--heat));z-index:0;pointer-events:none}
+.down{outline:1px dashed var(--warn);outline-offset:-2px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+
+/* ---- topology ---- */
+.map{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.map svg{display:block;width:100%;height:auto}
+.node{cursor:pointer}
+.node:hover .ring{stroke-width:3}
+.nlabel{font:600 13px ui-sans-serif,system-ui,sans-serif;fill:var(--fg);text-anchor:middle}
+.nsub{font:11px ui-monospace,Menlo,monospace;fill:var(--muted);text-anchor:middle}
+.clabel{font:10px ui-sans-serif,system-ui,sans-serif;fill:var(--muted);text-anchor:middle}
+.link{stroke:var(--accent);stroke-linecap:round}
+.link.dead{stroke:var(--off);stroke-dasharray:5 5;opacity:.4}
+
+/* ---- modal ---- */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
+         justify-content:center;padding:24px;z-index:50;backdrop-filter:blur(2px)}
+.overlay[hidden]{display:none}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);
+       max-width:620px;width:100%;max-height:82vh;overflow:auto}
+.modal header{border-radius:14px 14px 0 0;position:sticky;top:0}
+.modal .body{padding:18px 22px 22px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;font-size:13px;margin-bottom:18px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-family:ui-monospace,Menlo,monospace}
+.clist{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.clist li{display:flex;align-items:center;gap:10px;padding:9px 13px;border-bottom:1px solid var(--line);font-size:13px}
+.clist li:last-child{border-bottom:none}
+.clist .nm{font-weight:560}
+.clist .ips{margin-left:auto;font-family:ui-monospace,Menlo,monospace;color:var(--muted);font-size:12px}
+.empty{color:var(--muted);font-size:13px;padding:14px;text-align:center;
+       border:1px dashed var(--line);border-radius:9px}
+
+/* ---- page furniture ---- */
+.page-head{margin-bottom:20px}
+.page-head h3{font-size:20px;margin:0 0 4px;font-weight:650;letter-spacing:-.02em}
+.page-head p{margin:0;color:var(--muted);font-size:13px;max-width:74ch;line-height:1.55}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:20px}
+.panel-head{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;
+            align-items:center;gap:10px;flex-wrap:wrap}
+.panel-head h4{margin:0;font-size:14px;font-weight:620}
+.panel-head .hint{color:var(--muted);font-size:12px}
+.panel-body{padding:18px}
+.panel .wrap{border:none;border-radius:0;background:none}
+
+/* ---- form ---- */
+.field{display:flex;flex-direction:column;gap:6px}
+.field label{font-size:12px;font-weight:600;color:var(--muted);
+             text-transform:uppercase;letter-spacing:.04em}
+.field .help{font-size:12px;color:var(--muted);line-height:1.45}
+.form-grid{display:grid;grid-template-columns:minmax(200px,1.2fr) minmax(180px,1fr);
+           gap:18px;align-items:start}
+@media (max-width:720px){.form-grid{grid-template-columns:1fr}}
+select{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
+       border-radius:7px;background:var(--card);color:var(--fg)}
+input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+
+/* ---- segmented kind picker ---- */
+.seg{display:flex;gap:8px;flex-wrap:wrap}
+.seg .opt{flex:1;min-width:150px;border:1px solid var(--line);border-radius:9px;
+          padding:10px 12px;cursor:pointer;background:var(--card);text-align:left}
+.seg .opt:hover{border-color:var(--accent)}
+.seg .opt[aria-pressed="true"]{border-color:var(--accent);
+          box-shadow:inset 0 0 0 1px var(--accent);background:var(--sunk)}
+.seg .opt .t{display:block;font-weight:620;font-size:13px;margin-bottom:2px}
+.seg .opt .d{display:block;color:var(--muted);font-size:11.5px;line-height:1.4}
+
+/* ---- toolbar + badges ---- */
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+         padding:12px 18px;border-bottom:1px solid var(--line)}
+.toolbar input{min-width:220px}
+.count{color:var(--muted);font-size:12px;margin-left:auto}
+.badge{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;
+       font-weight:650;letter-spacing:.02em}
+.b-admin{background:var(--warnbg);color:var(--warn)}
+.b-relay{background:rgba(var(--heat),.16);color:var(--accent)}
+.b-client{background:var(--okbg);color:var(--ok)}
+.b-fallback{background:var(--offbg);color:var(--off)}
+
+/* ---- the one-time secret ---- */
+.secret-box{border:1px solid var(--accent);border-radius:10px;background:var(--sunk);
+            padding:16px;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+            word-break:break-all;user-select:all}
+.warnbar{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:9px;
+         background:var(--warnbg);color:var(--warn);font-size:13px;line-height:1.5;
+         margin-bottom:14px}
+.warnbar b{font-weight:680}
+</style>
+</head>
+<body>
+<header>
+  <h1>nqvpn</h1>
+  <span class="sub">control plane</span>
+  <span style="flex:1"></span>
+  <span class="sub" id="clock"></span>
+</header>
+<main>
+  <div class="bar">
+    <input id="token" type="password" placeholder="admin bearer token" autocomplete="off">
+    <button id="save">Connect</button>
+    <button id="reload">Reload config</button>
+    <span class="msg" id="msg"></span>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" data-tab="members" aria-selected="true">Members</button>
+    <button role="tab" data-tab="routing" aria-selected="false">Routing</button>
+    <button role="tab" data-tab="stats" aria-selected="false">Stats</button>
+    <button role="tab" data-tab="topology" aria-selected="false">Topology</button>
+    <button role="tab" data-tab="secrets" aria-selected="false">Secrets</button>
+  </div>
+
+  <div class="pane" id="pane-members"></div>
+  <div class="pane" id="pane-routing" hidden></div>
+  <div class="pane" id="pane-stats" hidden></div>
+  <div class="pane" id="pane-topology" hidden></div>
+  <div class="pane" id="pane-secrets" hidden></div>
+</main>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <header>
+      <h1 id="modal-title">node</h1>
+      <span class="sub" id="modal-sub"></span>
+      <span style="flex:1"></span>
+      <button id="modal-close">Close</button>
+    </header>
+    <div class="body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c;
+  if (txt !== undefined) e.textContent = txt; return e; };
+const svgEl = (t, attrs = {}) => { const e = document.createElementNS('http://www.w3.org/2000/svg', t);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
+
+let token = sessionStorage.getItem('nqvpn_token') || '';
+$('#token').value = token;
+let activeTab = sessionStorage.getItem('nqvpn_tab') || 'members';
+/** Last payload, so the modal can render without another round trip. */
+let snapshot = null;
+/// Network ids, kept so the secrets tab can render without a refetch.
+let knownNetworks = [];
+
+function msg(text, isErr) { const m = $('#msg'); m.textContent = text; m.className = isErr ? 'msg err' : 'msg'; }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers||{}), 'Authorization': 'Bearer ' + token } });
+  if (!r.ok) {
+    let detail = r.status;
+    try { const b = await r.json(); if (b.error) detail = b.error.code + ': ' + b.error.message; } catch {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+/* ---------- formatting ---------- */
+
+// Binary units, because these count octets on a wire, not disk marketing.
+const UNITS = ['B','KiB','MiB','GiB','TiB','PiB'];
+function fmtBytes(n) {
+  if (!n) return '0';
+  let v = n, i = 0;
+  while (v >= 1024 && i < UNITS.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(2)) + ' ' + UNITS[i];
+}
+// Rates are quoted in bits, the convention every link speed uses.
+const RUNITS = ['bps','kbps','Mbps','Gbps','Tbps'];
+function fmtRate(bytesPerSec) {
+  if (!bytesPerSec) return '';
+  let v = bytesPerSec * 8, i = 0;
+  while (v >= 1000 && i < RUNITS.length - 1) { v /= 1000; i++; }
+  return (i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + RUNITS[i];
+}
+function fmtPkts(n) {
+  if (n < 1000) return n + '';
+  if (n < 1e6) return (n/1e3).toFixed(1) + 'K';
+  if (n < 1e9) return (n/1e6).toFixed(1) + 'M';
+  return (n/1e9).toFixed(2) + 'G';
+}
+
+/* ---------- shared bits ---------- */
+
+function pill(m) {
+  if (m.disabled) return el('span', 'pill dis', 'disabled');
+  return m.online ? el('span', 'pill on', 'online') : el('span', 'pill offl', 'offline');
+}
+
+function table(headers, rows) {
+  const wrap = el('div', 'wrap');
+  const t = el('table');
+  const thead = el('thead'), htr = el('tr');
+  headers.forEach(h => htr.append(el('th', null, h)));
+  thead.append(htr); t.append(thead);
+  const tb = el('tbody'); rows.forEach(r => tb.append(r)); t.append(tb);
+  wrap.append(t);
+  return wrap;
+}
+
+function memberRow(net, m) {
+  const tr = el('tr');
+  tr.append(el('td', null, m.name));
+  const idc = el('td'); idc.append(el('code', null, '#' + m.node_id)); tr.append(idc);
+  tr.append(el('td', 'muted', m.role));
+  const st = el('td'); st.append(pill(m)); tr.append(st);
+  const ip = el('td'); ip.append(el('code', null, [m.ip4, m.ip6].filter(Boolean).join('  ') || '—')); tr.append(ip);
+  const cidrs = el('td'); cidrs.append(el('code', null, (m.registered_cidrs||[]).join(' ') || '—')); tr.append(cidrs);
+  tr.append(el('td', 'muted', m.attached_relay || '—'));
+  const keyc = el('td');
+  const rotating = (m.pins || []).filter(p => p.retires_unix);
+  if (!m.pinned) {
+    keyc.append(el('span', 'pill dis', 'unpinned'));
+    keyc.title = 'No key is pinned yet. The next join will pin whatever key it presents, ' +
+                 'so this member is claimable by anyone holding its secret.';
+  } else if (rotating.length) {
+    keyc.append(el('span', 'pill warnpill', 'rotating'));
+    const until = Math.min(...rotating.map(p => p.retires_unix));
+    keyc.title = 'A rotation is in flight: a new identity is registered and the previous one ' +
+                 'still works until ' + new Date(until * 1000).toLocaleString() +
+                 '. Both authenticate until then, so a restart mid-rotation is safe.';
+  } else {
+    keyc.append(el('span', 'muted', 'pinned'));
+  }
+  keyc.onclick = () => showPins(m);
+  keyc.style.cursor = 'pointer';
+  tr.append(keyc);
+  const reach = el('td');
+  if (m.advertised_reachable === 'unreachable') {
+    reach.append(el('span', 'pill dis', 'unreachable'));
+    reach.title = 'The coordinator cannot dial this relay\'s advertised address. ' +
+                  'Other relays will fail to mesh with it — check the firewall and relay_addr.';
+  } else if (m.advertised_reachable === 'reachable') {
+    reach.append(el('span', 'pill on', 'reachable'));
+  } else {
+    reach.append(el('span', 'muted', m.role === 'relay' ? '—' : ''));
+  }
+  tr.append(reach);
+
+  const act = el('td');
+  const toggle = el('button', null, m.disabled ? 'Enable' : 'Disable');
+  toggle.onclick = async () => {
+    toggle.disabled = true;
+    try {
+      await api(`/api/v1/networks/${net}/clients/${m.name}/${m.disabled ? 'enable' : 'disable'}`, { method: 'POST' });
+      msg(`${m.disabled ? 'Enabled' : 'Disabled'} ${m.name}`); refresh();
+    } catch (e) { msg('' + e.message, true); toggle.disabled = false; }
+  };
+  const reset = el('button', null, 'Reset pin');
+  reset.style.marginLeft = '6px';
+  reset.onclick = async () => {
+    if (!confirm(`Reset the TOFU key pin for ${m.name}?\n\nIt will be re-pinned on its next join. A member that is currently online is removed from the relay fleet until it re-joins.`)) return;
+    reset.disabled = true;
+    try { await api(`/api/v1/networks/${net}/clients/${m.name}/reset-pin`, { method: 'POST' });
+          msg(`Pin reset for ${m.name}`); refresh(); }
+    catch (e) { msg('' + e.message, true); reset.disabled = false; }
+  };
+  const del = el('button', null, 'Delete');
+  del.style.cssText = 'margin-left:6px;border-color:var(--warn);color:var(--warn)';
+  del.onclick = () => confirmModal({
+    title: 'Delete ' + m.name + '?',
+    sub: net,
+    lead: 'This forgets the member. It does not ban it — if the member is still in the ' +
+          'network config it can join again, and having no pins it would be re-pinned by ' +
+          'trust-on-first-use. Use Disable if the intent is to keep it out.',
+    details: [
+      'Its VPN address (' + ([m.ip4, m.ip6].filter(Boolean).join(', ') || 'none') +
+        ') is released back to the pool',
+      'Its pinned key and certificate are forgotten',
+      'Any routes it owns are withdrawn; the next-oldest registrant takes over',
+      'Any managed secret for it is deleted',
+      m.online ? 'It is currently ONLINE and its session will be closed' : 'It is offline',
+    ],
+    danger: 'Delete member',
+    onConfirm: async () => {
+      const r = await api(`/api/v1/networks/${net}/clients/${m.name}`, { method: 'DELETE' });
+      msg(`Deleted ${m.name}` +
+          (r.still_in_config ? ' — still in the network config, so it can re-join' : ''));
+      refresh();
+    },
+  });
+  act.append(toggle, reset, del);
+  tr.append(act);
+  return tr;
+}
+
+/* ---------- stats: the N x N traffic matrix ---------- */
+
+function relaysOf(st) {
+  return st.members.filter(m => m.role === 'relay').sort((a, b) => a.node_id - b.node_id);
+}
+
+function trafficIndex(st) {
+  // relay name -> its reported row, and (src,dst) -> link.
+  const rows = new Map(), links = new Map();
+  for (const r of (st.relay_traffic || [])) {
+    rows.set(r.relay, r);
+    for (const l of r.links) links.set(r.relay + ' ' + l.peer, l);
+  }
+  return { rows, links };
+}
+
+function matrixPane(st) {
+  const pane = el('div');
+  const relays = relaysOf(st);
+  pane.append(el('h2', null, `Fleet traffic · ${st.network_id}`));
+
+  if (!relays.length) { pane.append(el('div', 'empty', 'No relays in this network.')); return pane; }
+
+  const idx = trafficIndex(st);
+  if (!idx.rows.size) {
+    pane.append(el('div', 'empty',
+      'No relay has reported traffic yet. Reports arrive every 5 seconds from relays with a live control session.'));
+    return pane;
+  }
+
+  pane.append(el('p', 'note',
+    'Row is the sending relay, column the receiving one. Each cell is what the row relay measured on that link: ' +
+    '↑ bytes it sent, ↓ bytes it received. Every link therefore appears twice — a gap between one relay’s ' +
+    '↑ and its peer’s ↓ is loss on that link. The diagonal is traffic switched between two members ' +
+    'attached to the same relay, which crosses no link at all. Counters are cumulative since each relay started.'));
+
+  // Scale the heat to the largest single number in the matrix, on a log
+  // curve — linear shading would leave everything but the busiest link
+  // invisible.
+  let peak = 0;
+  for (const l of idx.links.values()) peak = Math.max(peak, l.tx_bytes, l.rx_bytes);
+  for (const r of idx.rows.values()) peak = Math.max(peak, r.local_bytes);
+  // Log position, then cubed. Log alone is far too flat here: traffic
+  // spans nine orders of magnitude, so a 1 MiB link and a 500 GiB one
+  // land within a few percent of each other and the whole matrix reads
+  // as one uniform block. Cubing restores the contrast that makes the
+  // busy links findable at a glance.
+  const heat = v => {
+    if (!v || !peak) return 0;
+    const t = Math.log(v + 1) / Math.log(peak + 1);
+    return .03 + .35 * t * t * t;
+  };
+
+  const t = el('table', 'matrix');
+  const thead = el('thead'), htr = el('tr');
+  const corner = el('th', 'corner', 'src \\ dst');
+  htr.append(corner);
+  relays.forEach(r => {
+    const th = el('th');
+    th.append(el('div', null, r.name));
+    th.append(el('div', 'tiny muted', '#' + r.node_id));
+    htr.append(th);
+  });
+  thead.append(htr); t.append(thead);
+
+  const tb = el('tbody');
+  for (const src of relays) {
+    const tr = el('tr');
+    const th = el('th');
+    th.append(el('div', null, src.name));
+    const row = idx.rows.get(src.name);
+    th.append(el('div', 'tiny muted', row ? `${row.age_secs}s ago` : 'no report'));
+    tr.append(th);
+
+    for (const dst of relays) {
+      const td = el('td');
+      if (src.node_id === dst.node_id) {
+        // Diagonal: locally switched, never crossed a mesh link.
+        td.className = 'diag';
+        const v = row ? row.local_bytes : 0;
+        if (v) {
+          td.append(shade(heat(v)));
+          const c = el('div', 'cell');
+          c.append(el('div', 'up', fmtBytes(v)));
+          c.append(el('div', 'dn', fmtPkts(row.local_pkts) + ' pkts'));
+          td.append(c);
+          td.title = `${src.name} switched ${fmtBytes(v)} between members attached to it`;
+        } else {
+          td.append(el('span', 'zero', '·'));
+        }
+        tr.append(td);
+        continue;
+      }
+      const link = idx.links.get(src.name + ' ' + dst.name);
+      if (!link || (!link.tx_bytes && !link.rx_bytes)) {
+        td.append(el('span', 'zero', link ? '0' : '—'));
+        td.title = link ? 'Link exists, nothing sent yet' : 'No mesh link reported between these relays';
+        if (link && !link.up) td.className = 'down';
+        tr.append(td);
+        continue;
+      }
+      td.append(shade(heat(Math.max(link.tx_bytes, link.rx_bytes))));
+      if (!link.up) td.className = 'down';
+      const c = el('div', 'cell');
+      c.append(el('div', 'up', '↑ ' + fmtBytes(link.tx_bytes)));
+      c.append(el('div', 'dn', '↓ ' + fmtBytes(link.rx_bytes)));
+      const rate = [link.tx_bps && '↑' + fmtRate(link.tx_bps),
+                    link.rx_bps && '↓' + fmtRate(link.rx_bps)].filter(Boolean).join('  ');
+      if (rate) c.append(el('div', 'rate', rate));
+      td.append(c);
+      td.title = `${src.name} → ${dst.name}\n` +
+                 `sent ${fmtBytes(link.tx_bytes)} (${fmtPkts(link.tx_pkts)} pkts)\n` +
+                 `received ${fmtBytes(link.rx_bytes)} (${fmtPkts(link.rx_pkts)} pkts)\n` +
+                 (link.up ? 'link up' : 'link DOWN — these are historical totals');
+      tr.append(td);
+    }
+    tb.append(tr);
+  }
+  t.append(tb);
+  const wrap = el('div', 'wrap'); wrap.append(t);
+  pane.append(wrap);
+
+  const legend = el('div', 'legend');
+  const sw = (bg, label) => { const s = el('span'); const b = el('i', 'sw'); b.style.background = bg;
+    s.append(b, document.createTextNode(label)); return s; };
+  legend.append(sw('rgba(var(--heat),.28)', 'busier link'));
+  legend.append(sw('var(--sunk)', 'diagonal — switched locally, no link crossed'));
+  const dead = el('span'); const db = el('i', 'sw');
+  db.style.cssText = 'border:1px dashed var(--warn);background:transparent';
+  dead.append(db, document.createTextNode('link currently down'));
+  legend.append(dead);
+  pane.append(legend);
+
+  // Per-relay totals, which the matrix alone does not add up for you.
+  pane.append(el('h2', null, 'Relay totals'));
+  const rows = relays.map(r => {
+    const row = idx.rows.get(r.name);
+    const tr = el('tr');
+    tr.append(el('td', null, r.name));
+    if (!row) {
+      const td = el('td', 'muted'); td.colSpan = 6; td.textContent = 'no report yet';
+      tr.append(td); return tr;
+    }
+    const tx = row.links.reduce((a, l) => a + l.tx_bytes, 0);
+    const rx = row.links.reduce((a, l) => a + l.rx_bytes, 0);
+    const txr = row.links.reduce((a, l) => a + l.tx_bps, 0);
+    const rxr = row.links.reduce((a, l) => a + l.rx_bps, 0);
+    tr.append(el('td', null, fmtBytes(tx)));
+    tr.append(el('td', null, fmtBytes(rx)));
+    tr.append(el('td', 'muted', [fmtRate(txr), fmtRate(rxr)].filter(Boolean).join(' / ') || '—'));
+    tr.append(el('td', null, fmtBytes(row.local_bytes)));
+    tr.append(el('td', null, fmtBytes(row.terminated_bytes)));
+    tr.append(el('td', 'muted tiny', row.links.filter(l => l.up).length + ' up'));
+    return tr;
+  });
+  pane.append(table(['Relay','Mesh sent','Mesh received','Rate now','Switched locally','Terminated here','Links'], rows));
+  return pane;
+}
+
+function shade(alpha) {
+  const d = el('div', 'heat');
+  d.style.opacity = alpha;
+  return d;
+}
+
+/* ---------- topology ---------- */
+
+function topologyPane(st) {
+  const pane = el('div');
+  pane.append(el('h2', null, `Topology · ${st.network_id}`));
+  const relays = relaysOf(st);
+  if (!relays.length) { pane.append(el('div', 'empty', 'No relays in this network.')); return pane; }
+
+  pane.append(el('p', 'note',
+    'Relays form a full mesh; every client attaches to exactly one of them and reaches everyone else through it. ' +
+    'Line weight follows how much traffic a link has carried. Click any node for its details.'));
+
+  const idx = trafficIndex(st);
+  const byRelay = new Map(relays.map(r => [r.name, []]));
+  const unattached = [];
+  for (const m of st.members) {
+    if (m.role === 'relay') continue;
+    if (m.attached_relay && byRelay.has(m.attached_relay)) byRelay.get(m.attached_relay).push(m);
+    else if (m.online) unattached.push(m);
+  }
+
+  const W = 940, H = 700, cx = W/2, cy = H/2 - 10;
+  const R = relays.length === 1 ? 0 : Math.min(185, 92 + relays.length * 24);
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img' });
+
+  const pos = new Map();
+  relays.forEach((r, i) => {
+    const a = -Math.PI/2 + (i * 2 * Math.PI) / relays.length;
+    pos.set(r.name, { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a), a });
+  });
+
+  // Links first, so nodes paint over them.
+  let peak = 0;
+  for (const l of idx.links.values()) peak = Math.max(peak, l.tx_bytes + l.rx_bytes);
+  const drawn = new Set();
+  for (const a of relays) for (const b of relays) {
+    if (a.node_id >= b.node_id) continue;
+    const key = a.name + ' ' + b.name;
+    if (drawn.has(key)) continue;
+    drawn.add(key);
+    const ab = idx.links.get(a.name + ' ' + b.name);
+    const ba = idx.links.get(b.name + ' ' + a.name);
+    if (!ab && !ba) continue;
+    const vol = (ab ? ab.tx_bytes + ab.rx_bytes : 0) + (ba ? ba.tx_bytes + ba.rx_bytes : 0);
+    const up = (ab && ab.up) || (ba && ba.up);
+    const p1 = pos.get(a.name), p2 = pos.get(b.name);
+    const w = peak ? 1.2 + 6 * (Math.log(vol + 1) / Math.log(peak * 2 + 1)) : 1.2;
+    const line = svgEl('line', {
+      x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
+      class: 'link' + (up ? '' : ' dead'),
+      'stroke-width': w.toFixed(2), 'stroke-opacity': up ? 0.42 : 0.3,
+    });
+    const t = svgEl('title');
+    t.textContent = `${a.name} ↔ ${b.name}\n${fmtBytes(vol)} total\n${up ? 'up' : 'DOWN'}`;
+    line.append(t);
+    svg.append(line);
+  }
+
+  // Clients, drawn on a short arc pointing away from the circle centre.
+  relays.forEach(r => {
+    const p = pos.get(r.name);
+    const kids = byRelay.get(r.name) || [];
+    const online = kids.filter(k => k.online);
+    const outward = relays.length === 1 ? -Math.PI/2 : p.a;
+    online.forEach((c, i) => {
+      // 0.5 rad between neighbours keeps dots and their labels apart at
+      // this radius; anything tighter and two clients on one relay
+      // overlap into an unreadable blob. Alternating the radius buys
+      // room for the labels once a relay carries more than a handful.
+      const spread = Math.min(2.6, 0.5 * (online.length - 1));
+      const a = outward - spread/2 + (online.length === 1 ? 0 : spread * i / (online.length - 1));
+      const rad = 84 + (i % 2) * 28;
+      const cxx = p.x + rad * Math.cos(a), cyy = p.y + rad * Math.sin(a);
+      svg.append(svgEl('line', {
+        x1: p.x, y1: p.y, x2: cxx, y2: cyy,
+        stroke: 'currentColor', 'stroke-opacity': .22, 'stroke-width': 1,
+      }));
+      const g = svgEl('g', { class: 'node' });
+      g.append(svgEl('circle', { cx: cxx, cy: cyy, r: 9, fill: 'var(--accent2)', 'fill-opacity': .85 }));
+      const lbl = svgEl('text', { x: cxx, y: cyy + 22, class: 'clabel' });
+      lbl.textContent = c.name.length > 14 ? c.name.slice(0, 13) + '…' : c.name;
+      g.append(lbl);
+      const t = svgEl('title');
+      t.textContent = `${c.name}\n${[c.ip4, c.ip6].filter(Boolean).join('  ') || 'no address'}`;
+      g.append(t);
+      g.onclick = () => showMember(st, c);
+      svg.append(g);
+    });
+  });
+
+  // Relay nodes.
+  relays.forEach(r => {
+    const p = pos.get(r.name);
+    const kids = (byRelay.get(r.name) || []).filter(k => k.online).length;
+    const g = svgEl('g', { class: 'node' });
+    g.append(svgEl('circle', {
+      cx: p.x, cy: p.y, r: 30,
+      fill: r.online ? 'var(--accent)' : 'var(--off)', 'fill-opacity': r.online ? .16 : .1,
+    }));
+    g.append(svgEl('circle', {
+      class: 'ring', cx: p.x, cy: p.y, r: 30, fill: 'none',
+      stroke: r.online ? 'var(--accent)' : 'var(--off)', 'stroke-width': 2,
+      'stroke-dasharray': r.online ? '' : '4 4',
+    }));
+    const count = svgEl('text', { x: p.x, y: p.y + 5, class: 'nlabel' });
+    count.textContent = kids;
+    g.append(count);
+    const name = svgEl('text', { x: p.x, y: p.y + 48, class: 'nlabel' });
+    name.textContent = r.name;
+    g.append(name);
+    const sub = svgEl('text', { x: p.x, y: p.y + 63, class: 'nsub' });
+    sub.textContent = r.ip4 || ('#' + r.node_id);
+    g.append(sub);
+    const t = svgEl('title');
+    t.textContent = `${r.name} (#${r.node_id})\n${kids} client(s) attached\n${r.online ? 'online' : 'offline'}`;
+    g.append(t);
+    g.onclick = () => showRelay(st, r);
+    svg.append(g);
+  });
+
+  const map = el('div', 'map'); map.append(svg);
+  pane.append(map);
+
+  if (unattached.length) {
+    pane.append(el('h2', null, 'Online but attached to no relay'));
+    pane.append(table(['Member','Node','VPN address'], unattached.map(m => {
+      const tr = el('tr');
+      tr.append(el('td', null, m.name));
+      const c = el('td'); c.append(el('code', null, '#' + m.node_id)); tr.append(c);
+      const ip = el('td'); ip.append(el('code', null, [m.ip4, m.ip6].filter(Boolean).join('  ') || '—'));
+      tr.append(ip);
+      return tr;
+    })));
+  }
+  return pane;
+}
+
+/* ---------- modal ---------- */
+
+function openModal(title, sub) {
+  $('#modal-title').textContent = title;
+  $('#modal-sub').textContent = sub || '';
+  const body = $('#modal-body'); body.replaceChildren();
+  $('#overlay').hidden = false;
+  return body;
+}
+function closeModal() { $('#overlay').hidden = true; }
+$('#modal-close').onclick = closeModal;
+$('#overlay').onclick = e => { if (e.target === $('#overlay')) closeModal(); };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+/// Ask before something irreversible. `details` is a list of consequences
+/// the operator should see *before* deciding, not after.
+function confirmModal({ title, sub, lead, details, danger, onConfirm }) {
+  const body = openModal(title, sub);
+  body.append(el('p', 'note', lead));
+  if (details && details.length) {
+    const ul = el('ul', 'clist');
+    details.forEach(d => { const li = el('li'); li.append(el('span', null, d)); ul.append(li); });
+    body.append(ul);
+  }
+  const bar = el('div', 'bar');
+  bar.style.marginTop = '18px';
+  const go = el('button', null, danger || 'Confirm');
+  go.style.cssText = 'border-color:var(--warn);color:var(--warn);font-weight:600';
+  const cancel = el('button', null, 'Cancel');
+  go.onclick = async () => {
+    go.disabled = true; cancel.disabled = true;
+    try { await onConfirm(); closeModal(); }
+    catch (e) { msg('' + e.message, true); closeModal(); }
+  };
+  cancel.onclick = closeModal;
+  bar.append(go, cancel);
+  body.append(bar);
+}
+
+function kv(pairs) {
+  const d = el('dl', 'kv');
+  for (const [k, v] of pairs) {
+    if (v === undefined || v === null || v === '') continue;
+    d.append(el('dt', null, k), el('dd', null, v));
+  }
+  return d;
+}
+
+function showRelay(st, r) {
+  const body = openModal(r.name, `relay · #${r.node_id} · ${r.online ? 'online' : 'offline'}`);
+  const idx = trafficIndex(st);
+  const row = idx.rows.get(r.name);
+  const kids = st.members.filter(m => m.role !== 'relay' && m.attached_relay === r.name);
+  const online = kids.filter(k => k.online);
+
+  body.append(kv([
+    ['VPN address', [r.ip4, r.ip6].filter(Boolean).join('  ') || '—'],
+    ['Routed CIDRs', (r.registered_cidrs || []).join(' ') || '—'],
+    ['Dialable', r.advertised_reachable || 'unknown'],
+    ['Key', r.pinned ? 'pinned' : 'unpinned'],
+    ['Mesh sent', row ? fmtBytes(row.links.reduce((a, l) => a + l.tx_bytes, 0)) : '—'],
+    ['Mesh received', row ? fmtBytes(row.links.reduce((a, l) => a + l.rx_bytes, 0)) : '—'],
+    ['Switched locally', row ? fmtBytes(row.local_bytes) : '—'],
+    ['Terminated here', row ? fmtBytes(row.terminated_bytes) : '—'],
+  ]));
+
+  body.append(el('h2', null, `Attached clients (${online.length})`));
+  if (!online.length) {
+    body.append(el('div', 'empty', 'No clients are attached to this relay right now.'));
+  } else {
+    const ul = el('ul', 'clist');
+    for (const c of online.sort((a, b) => a.name.localeCompare(b.name))) {
+      const li = el('li');
+      li.append(el('span', 'nm', c.name));
+      li.append(el('code', 'tiny muted', '#' + c.node_id));
+      li.append(el('span', 'ips', [c.ip4, c.ip6].filter(Boolean).join('  ') || 'no address'));
+      ul.append(li);
+    }
+    body.append(ul);
+  }
+
+  const offline = kids.filter(k => !k.online);
+  if (offline.length) {
+    body.append(el('h2', null, `Last seen here, now offline (${offline.length})`));
+    const ul = el('ul', 'clist');
+    for (const c of offline) {
+      const li = el('li');
+      li.append(el('span', 'nm muted', c.name));
+      li.append(el('span', 'ips', [c.ip4, c.ip6].filter(Boolean).join('  ') || '—'));
+      ul.append(li);
+    }
+    body.append(ul);
+  }
+
+  if (row && row.links.length) {
+    body.append(el('h2', null, 'Mesh links'));
+    body.append(table(['Peer','Sent','Received','Rate now','State'], row.links.map(l => {
+      const tr = el('tr');
+      tr.append(el('td', null, l.peer));
+      tr.append(el('td', null, fmtBytes(l.tx_bytes)));
+      tr.append(el('td', null, fmtBytes(l.rx_bytes)));
+      tr.append(el('td', 'muted', [fmtRate(l.tx_bps), fmtRate(l.rx_bps)].filter(Boolean).join(' / ') || '—'));
+      const s = el('td'); s.append(el('span', 'pill ' + (l.up ? 'on' : 'offl'), l.up ? 'up' : 'down'));
+      tr.append(s);
+      return tr;
+    })));
+  }
+}
+
+function showPins(m) {
+  const body = openModal(m.name, 'pinned identities');
+  const pins = m.pins || [];
+  if (!pins.length) {
+    body.append(el('div', 'empty',
+      'No pins yet — the next join will pin whatever key it presents.'));
+    return;
+  }
+  body.append(el('p', 'note',
+    'Every unexpired pin authenticates this member. More than one means a rotation is in ' +
+    'flight: the new identity is registered while the previous one keeps working, so a ' +
+    'member that restarts before switching is not locked out.'));
+  body.append(table(['Kind', 'Key', 'State'], pins.map(p => {
+    const tr = el('tr');
+    tr.append(el('td', 'muted', p.kind));
+    const k = el('td'); k.append(el('code', null, p.key + '…')); tr.append(k);
+    const st = el('td');
+    if (p.retires_unix) {
+      st.append(el('span', 'pill warnpill', 'retires ' + new Date(p.retires_unix * 1000).toLocaleString()));
+    } else {
+      st.append(el('span', 'pill on', 'current'));
+    }
+    tr.append(st);
+    return tr;
+  })));
+}
+
+function showMember(st, m) {
+  const body = openModal(m.name, `${m.role} · #${m.node_id} · ${m.online ? 'online' : 'offline'}`);
+  body.append(kv([
+    ['VPN address', [m.ip4, m.ip6].filter(Boolean).join('  ') || '—'],
+    ['Attached relay', m.attached_relay || '—'],
+    ['Routed CIDRs', (m.registered_cidrs || []).join(' ') || '—'],
+    ['Key', m.pinned ? 'pinned' : 'unpinned'],
+    ['Disabled', m.disabled ? 'yes' : 'no'],
+    ['Last join', m.last_join_unix ? new Date(m.last_join_unix * 1000).toLocaleString() : '—'],
+  ]));
+  if (m.attached_relay) {
+    const relay = st.members.find(r => r.name === m.attached_relay);
+    if (relay) {
+      const b = el('button', null, `Open ${relay.name}`);
+      b.onclick = () => showRelay(st, relay);
+      body.append(b);
+    }
+  }
+}
+
+/* ---------- secrets ---------- */
+
+let secretFilter = '';
+let mintKind = 'client';
+/// Members already warned about in this session, so the confirm appears
+/// once rather than on every attempt.
+const mintWarned = new Set();
+
+const KINDS = [
+  { id: 'client', title: 'Client',
+    desc: 'Joins as a member. Cannot register routes or advertise an address.' },
+  { id: 'relay',  title: 'Relay',
+    desc: 'Forwards traffic and may register the routes its config permits.' },
+  { id: 'admin',  title: 'Admin',
+    desc: 'Signs in to this console. Can never be used to join a network.' },
+];
+
+async function secretsPane(networks) {
+  const pane = el('div');
+
+  const head = el('div', 'page-head');
+  head.append(el('h3', null, 'Credentials'));
+  head.append(el('p', null,
+    'Each credential is minted here and shown exactly once — only its argon2 hash is stored, ' +
+    'so it cannot be retrieved later. The kind determines what it can do: a client credential ' +
+    'cannot join as a relay, and an admin credential cannot join a network at all. Members ' +
+    'without a managed credential fall back to the secret_hash in their network config, so a ' +
+    'deployment can be migrated one member at a time.'));
+  pane.append(head);
+
+  let data;
+  try { data = await api('/api/v1/secrets'); }
+  catch (e) {
+    pane.append(el('div', 'empty', 'Could not load credentials: ' + e.message));
+    return pane;
+  }
+  const managed = data.secrets || [];
+
+  // Cross-reference members so the page can show what is still on the
+  // config fallback — that is the migration status, and the reason a
+  // deployment ends up with one secret shared by everyone.
+  const byKey = new Map(managed.map(s => [(s.network || '-') + '/' + s.client_id, s]));
+  const fallback = [];
+  for (const st of (snapshot || [])) {
+    for (const m of st.members) {
+      if (!byKey.has(st.network_id + '/' + m.name)) {
+        fallback.push({ client_id: m.name, network: st.network_id, role: m.role });
+      }
+    }
+  }
+
+  pane.append(summaryCards(managed, fallback));
+  pane.append(mintPanel(networks));
+  pane.append(credentialTable(managed, fallback));
+  return pane;
+}
+
+function summaryCards(managed, fallback) {
+  const cards = el('div', 'cards');
+  const n = k => managed.filter(s => s.kind === k && !s.disabled).length;
+  const add = (num, label, title) => {
+    const c = el('div', 'card');
+    c.append(el('div', 'n', String(num)), el('div', 'l', label));
+    if (title) c.title = title;
+    cards.append(c);
+  };
+  add(managed.filter(s => !s.disabled).length, 'Managed');
+  add(fallback.length, 'On config fallback',
+      'Members with no managed credential. They authenticate with the secret_hash in the ' +
+      'network config — often the same secret shared by every member.');
+  add(n('relay'), 'Relay');
+  add(n('client'), 'Client');
+  add(n('admin'), 'Admin');
+  const revoked = managed.filter(s => s.disabled).length;
+  if (revoked) add(revoked, 'Revoked');
+  return cards;
+}
+
+function mintPanel(networks) {
+  const panel = el('div', 'panel');
+  const ph = el('div', 'panel-head');
+  ph.append(el('h4', null, 'Issue a credential'));
+  ph.append(el('span', 'hint', 'Shown once — copy it before closing'));
+  panel.append(ph);
+
+  const body = el('div', 'panel-body');
+
+  // Kind first: it decides what the rest of the form means.
+  const kindField = el('div', 'field');
+  kindField.append(el('label', null, 'Kind'));
+  const seg = el('div', 'seg');
+  const netField = el('div', 'field');
+  const netSel = el('select');
+  const idIn = el('input');
+
+  const paintKind = () => {
+    seg.replaceChildren();
+    KINDS.forEach(k => {
+      const b = el('button', 'opt');
+      b.type = 'button';
+      b.setAttribute('aria-pressed', String(k.id === mintKind));
+      b.append(el('span', 't', k.title), el('span', 'd', k.desc));
+      b.onclick = () => { mintKind = k.id; paintKind(); syncNet(); };
+      seg.append(b);
+    });
+  };
+  const syncNet = () => {
+    const isAdmin = mintKind === 'admin';
+    netSel.disabled = isAdmin;
+    netSel.value = isAdmin ? '-' : (networks[0] || '-');
+    netHelp.textContent = isAdmin
+      ? 'Admin credentials belong to no network.'
+      : 'The network this member joins.';
+  };
+  paintKind();
+  kindField.append(seg);
+
+  const idField = el('div', 'field');
+  idField.append(el('label', null, 'Member ID'));
+  idIn.placeholder = 'e.g. laptop-5';
+  idIn.autocomplete = 'off';
+  idField.append(idIn);
+  idField.append(el('div', 'help',
+    'Must match the client_id the member presents. Issuing again for an existing ' +
+    'member replaces its credential, and the previous one stops working immediately.'));
+
+  netField.append(el('label', null, 'Network'));
+  netSel.append(new Option('—', '-'));
+  networks.forEach(n => netSel.append(new Option(n, n)));
+  netField.append(netSel);
+  const netHelp = el('div', 'help', '');
+  netField.append(netHelp);
+  syncNet();
+
+  const grid = el('div', 'form-grid');
+  grid.append(idField, netField);
+
+  const actions = el('div', 'bar');
+  actions.style.marginTop = '18px';
+  const mint = el('button', null, 'Issue credential');
+  mint.style.cssText = 'border-color:var(--accent);color:var(--accent);font-weight:600';
+  const status = el('span', 'msg');
+  const doMint = async () => {
+    const id = idIn.value.trim();
+    if (!id) { status.textContent = 'A member ID is required.'; status.className = 'msg err'; idIn.focus(); return; }
+    // Issuing to a member that is connected right now cuts it off the
+    // moment it next re-joins: the store refuses rather than falling back
+    // to its config secret. That is correct, and it is also how a live
+    // relay gets taken off the mesh by an operator who did not expect it.
+    const live = (snapshot || []).flatMap(st => st.members)
+      .find(m => m.name === id && m.online);
+    if (live && !mintWarned.has(id)) {
+      mintWarned.add(id);
+      confirmModal({
+        title: id + ' is online right now',
+        sub: live.role,
+        lead: 'Issuing a credential replaces whatever ' + id + ' authenticates with today. It ' +
+              'keeps running on its current session, but the next time it re-joins it will be ' +
+              'refused until it is given the new credential.',
+        details: [
+          live.role === 'relay'
+            ? 'This is a relay — refusing it takes its site off the mesh'
+            : 'This member will not be able to re-join until updated',
+          'Its network config secret_hash stops being accepted once a managed credential exists',
+        ],
+        danger: 'Issue anyway',
+        onConfirm: doMint,
+      });
+      return;
+    }
+    mint.disabled = true; status.textContent = 'Issuing…'; status.className = 'msg';
+    try {
+      const net = mintKind === 'admin' ? '-' : netSel.value;
+      const r = await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(id)}/mint`,
+        { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ kind: mintKind }) });
+      idIn.value = '';
+      showMintedSecret(r, net);
+      renderSecrets();
+    } catch (e) { status.textContent = '' + e.message; status.className = 'msg err'; }
+    finally { mint.disabled = false; }
+  };
+  mint.onclick = doMint;
+  // Enter in the ID field is the obvious gesture; not honouring it is the
+  // kind of small thing that makes a console feel unfinished.
+  idIn.onkeydown = e => { if (e.key === 'Enter') doMint(); };
+  actions.append(mint, status);
+
+  body.append(kindField, el('div', null, ' '), grid, actions);
+  panel.append(body);
+  return panel;
+}
+
+function credentialTable(managed, fallback) {
+  const panel = el('div', 'panel');
+  const ph = el('div', 'panel-head');
+  ph.append(el('h4', null, 'Issued credentials'));
+  panel.append(ph);
+
+  const bar = el('div', 'toolbar');
+  const search = el('input');
+  search.placeholder = 'Filter by member or network…';
+  search.value = secretFilter;
+  search.oninput = () => { secretFilter = search.value; paint(); };
+  const showFallback = el('button', null, 'Show config fallback');
+  let withFallback = true;
+  showFallback.setAttribute('aria-pressed', 'true');
+  showFallback.onclick = () => {
+    withFallback = !withFallback;
+    showFallback.setAttribute('aria-pressed', String(withFallback));
+    showFallback.style.color = withFallback ? 'var(--accent)' : '';
+    paint();
+  };
+  showFallback.style.color = 'var(--accent)';
+  const count = el('span', 'count');
+  bar.append(search, showFallback, count);
+  panel.append(bar);
+
+  const host = el('div');
+  panel.append(host);
+
+  function paint() {
+    const q = secretFilter.trim().toLowerCase();
+    const hit = r => !q || r.client_id.toLowerCase().includes(q) ||
+                     (r.network || '').toLowerCase().includes(q);
+    const rowsManaged = managed.filter(hit);
+    const rowsFallback = withFallback ? fallback.filter(hit) : [];
+    count.textContent = `${rowsManaged.length} managed` +
+      (withFallback ? ` · ${rowsFallback.length} on config fallback` : '');
+
+    if (!rowsManaged.length && !rowsFallback.length) {
+      host.replaceChildren(el('div', 'empty', q
+        ? `Nothing matches “${secretFilter}”.`
+        : 'No credentials issued yet — every member is authenticating with its network config secret_hash.'));
+      return;
+    }
+    const rows = [
+      ...rowsManaged.map(managedRow),
+      ...rowsFallback.map(fallbackRow),
+    ];
+    const t = table(['Member', 'Kind', 'Network', 'Source', 'Issued', 'State', ''], rows);
+    host.replaceChildren(t);
+  }
+
+  function managedRow(sec) {
+    const net = sec.network || '-';
+    const tr = el('tr');
+    tr.append(el('td', null, sec.client_id));
+    const k = el('td'); k.append(el('span', 'badge b-' + sec.kind, sec.kind)); tr.append(k);
+    tr.append(el('td', 'muted', sec.network || '—'));
+    tr.append(el('td', 'muted tiny', 'managed'));
+    tr.append(el('td', 'muted tiny',
+      sec.created_unix ? new Date(sec.created_unix * 1000).toLocaleDateString() : '—'));
+    const st = el('td');
+    st.append(el('span', 'pill ' + (sec.disabled ? 'dis' : 'on'), sec.disabled ? 'revoked' : 'active'));
+    tr.append(st);
+
+    const act = el('td');
+    const rot = el('button', null, 'Reissue');
+    rot.onclick = () => confirmModal({
+      title: 'Reissue the credential for ' + sec.client_id + '?',
+      sub: net === '-' ? 'admin' : net,
+      lead: 'A new credential is generated and shown once. This is also how you recover a ' +
+            'lost credential, because the existing one cannot be read back.',
+      details: [
+        'The current credential stops working immediately',
+        sec.kind === 'admin'
+          ? 'Any console session using it must sign in again'
+          : sec.client_id + ' cannot re-join until it is given the new credential',
+      ],
+      danger: 'Reissue',
+      onConfirm: async () => {
+        const r = await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}/mint`,
+          { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ kind: sec.kind }) });
+        showMintedSecret(r, net); renderSecrets();
+      },
+    });
+    const rev = el('button', null, sec.disabled ? 'Restore' : 'Revoke');
+    rev.style.marginLeft = '6px';
+    rev.onclick = async () => {
+      try {
+        await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}/revoke`,
+          { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ disabled: !sec.disabled }) });
+        msg((sec.disabled ? 'Restored ' : 'Revoked ') + sec.client_id);
+        renderSecrets();
+      } catch (e) { msg('' + e.message, true); }
+    };
+    const del = el('button', null, 'Remove');
+    del.style.cssText = 'margin-left:6px;border-color:var(--warn);color:var(--warn)';
+    del.onclick = () => confirmModal({
+      title: 'Remove the managed credential for ' + sec.client_id + '?',
+      sub: net === '-' ? 'admin' : net,
+      lead: 'The credential is deleted. This is not the same as revoking it: the member ' +
+            'falls back to the secret_hash in its network config, if it has one.',
+      details: [
+        sec.kind === 'admin'
+          ? 'An admin with no credential cannot sign in at all'
+          : 'If ' + sec.client_id + ' has a config secret_hash it can still join with it',
+        'Revoke instead if the intent is to keep it out',
+      ],
+      danger: 'Remove credential',
+      onConfirm: async () => {
+        await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}`,
+          { method: 'DELETE' });
+        msg('Removed the credential for ' + sec.client_id);
+        renderSecrets();
+      },
+    });
+    act.append(rot, rev, del);
+    tr.append(act);
+    return tr;
+  }
+
+  function fallbackRow(m) {
+    const tr = el('tr');
+    tr.append(el('td', 'muted', m.client_id));
+    const k = el('td'); k.append(el('span', 'badge b-' + m.role, m.role)); tr.append(k);
+    tr.append(el('td', 'muted', m.network));
+    const src = el('td');
+    src.append(el('span', 'badge b-fallback', 'config'));
+    src.title = 'Authenticates with the secret_hash in the network config — commonly the ' +
+                'same secret shared by every member. Issue a credential to give it its own.';
+    tr.append(src);
+    tr.append(el('td', 'muted tiny', '—'));
+    tr.append(el('td', 'muted tiny', '—'));
+    const act = el('td');
+    const give = el('button', null, 'Issue');
+    give.onclick = async () => {
+      try {
+        const kind = m.role === 'relay' ? 'relay' : 'client';
+        const r = await api(`/api/v1/secrets/${encodeURIComponent(m.network)}/${encodeURIComponent(m.client_id)}/mint`,
+          { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ kind }) });
+        showMintedSecret(r, m.network); renderSecrets();
+      } catch (e) { msg('' + e.message, true); }
+    };
+    act.append(give);
+    tr.append(act);
+    return tr;
+  }
+
+  paint();
+  return panel;
+}
+
+/// The one moment the plaintext exists. There is no way to see it again,
+/// so this screen has to be unmissable and easy to act on.
+function showMintedSecret(r, network) {
+  const body = openModal(r.client_id, `${r.kind} credential`);
+
+  const warn = el('div', 'warnbar');
+  warn.append(el('span', null, '⚠'));
+  const wt = el('div');
+  wt.append(el('b', null, 'This is the only time this credential is shown. '));
+  wt.append(document.createTextNode(
+    'Only its hash is stored, so it cannot be retrieved. If it is lost, reissue to ' +
+    'generate a replacement.'));
+  warn.append(wt);
+  body.append(warn);
+
+  const box = el('div', 'secret-box', r.secret);
+  body.append(box);
+
+  const bar = el('div', 'bar');
+  bar.style.margin = '14px 0 4px';
+  const copy = el('button', null, 'Copy credential');
+  copy.style.cssText = 'border-color:var(--accent);color:var(--accent);font-weight:600';
+  const done = el('span', 'msg');
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(r.secret);
+      done.textContent = 'Copied to clipboard';
+    } catch {
+      // Clipboard access needs a secure context, which plain HTTP is not.
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      sel.removeAllRanges(); sel.addRange(range);
+      done.textContent = 'Selected — copy with ' +
+        (navigator.platform.includes('Mac') ? '\u2318C' : 'Ctrl+C');
+    }
+  };
+  bar.append(copy, done);
+  body.append(bar);
+
+  if (r.kind !== 'admin') {
+    body.append(el('h2', null, 'Member configuration'));
+    const cfg = el('div', 'wrap');
+    const pre = el('div');
+    pre.style.cssText = 'padding:14px;font:12.5px/1.6 ui-monospace,Menlo,monospace;' +
+                        'white-space:pre;overflow-x:auto;user-select:all';
+    pre.textContent =
+      `network_id = "${network}"\n` +
+      `client_id = "${r.client_id}"\n` +
+      `client_secret = "${r.secret}"`;
+    cfg.append(pre);
+    body.append(cfg);
+    body.append(el('p', 'note',
+      'Paste into the member\u2019s config. Prefer client_secret_file in production so the ' +
+      'credential is not stored in the config file itself.'));
+  }
+}
+
+/* ---------- tabs + refresh ---------- */
+
+async function renderSecrets() {
+  const pane = $('#pane-secrets');
+  pane.replaceChildren(await secretsPane(knownNetworks));
+}
+
+function selectTab(name) {
+  activeTab = name;
+  sessionStorage.setItem('nqvpn_tab', name);
+  document.querySelectorAll('.tabs button').forEach(b =>
+    b.setAttribute('aria-selected', b.dataset.tab === name ? 'true' : 'false'));
+  ['members','routing','stats','topology','secrets'].forEach(t =>
+    $('#pane-' + t).hidden = (t !== name));
+  if (name === 'secrets') renderSecrets();
+}
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => selectTab(b.dataset.tab));
+selectTab(activeTab);
+
+async function refresh() {
+  if (!token) { msg('Enter the admin token to connect.'); return; }
+  try {
+    const global = await api('/api/v1/status');
+    const totals = global.networks.reduce((a, n) => ({
+      m: a.m + n.members_total, o: a.o + n.members_online, r: a.r + n.relays_total }), {m:0,o:0,r:0});
+
+    const statuses = [];
+    for (const n of global.networks) statuses.push(await api(`/api/v1/networks/${n.network_id}/status`));
+    snapshot = statuses;
+
+    let fleetBytes = 0;
+    for (const st of statuses)
+      for (const row of (st.relay_traffic || []))
+        fleetBytes += row.links.reduce((a, l) => a + l.tx_bytes, 0) + row.local_bytes;
+
+    const cards = el('div');
+    const transport = statuses.length
+      ? statuses[0].transport + (statuses[0].transport === 'stream' && statuses[0].lanes > 1
+          ? ` ×${statuses[0].lanes}` : '')
+      : '—';
+    [['Networks', global.networks.length], ['Members', totals.m], ['Online', totals.o],
+     ['Relays', totals.r], ['Fleet traffic', fmtBytes(fleetBytes)], ['Transport', transport]
+    ].forEach(([l, n]) => {
+      const c = el('div', 'card'); c.append(el('div', 'n', n), el('div', 'l', l)); cards.append(c);
+    });
+    // Swapped in one go, only once every value is known: clearing before
+    // the per-network fetches would blank the cards on every refresh.
+    $('#cards').replaceChildren(...cards.children);
+
+    const members = $('#pane-members'); members.replaceChildren();
+    const routing = $('#pane-routing'); routing.replaceChildren();
+    const stats = $('#pane-stats'); stats.replaceChildren();
+    const topo = $('#pane-topology'); topo.replaceChildren();
+
+    for (const st of statuses) {
+      members.append(el('h2', null, `${st.network_id} · ${st.network_uuid}`));
+      members.append(table(
+        ['Member','Node','Role','State','VPN address','Routed CIDRs','Attached relay','Key','Dialable','Actions'],
+        st.members.map(m => memberRow(st.network_id, m))));
+
+      routing.append(el('h2', null, `Prefix ownership · ${st.network_id}`));
+      routing.append(table(['Prefix','Owner','Standby (age order)'], (st.prefix_table || []).map(p => {
+        const tr = el('tr');
+        const c = el('td'); c.append(el('code', null, p.cidr)); tr.append(c);
+        tr.append(el('td', null, p.owner));
+        tr.append(el('td', 'muted tiny', (p.standby || []).join(', ') || '—'));
+        return tr;
+      })));
+
+      stats.append(matrixPane(st));
+      topo.append(topologyPane(st));
+    }
+
+    // Deliberately NOT rebuilt here. The periodic refresh would replace
+    // the mint form mid-typing and discard whatever had been entered,
+    // which made the tab impossible to use. It is rebuilt on tab
+    // selection and after an action instead.
+    knownNetworks = statuses.map(s => s.network_id);
+    msg('Updated ' + new Date().toLocaleTimeString());
+  } catch (e) { msg('' + e.message, true); }
+}
+
+$('#save').onclick = () => { token = $('#token').value.trim();
+  sessionStorage.setItem('nqvpn_token', token); refresh(); };
+$('#reload').onclick = async () => {
+  try { const r = await api('/api/v1/reload', { method: 'POST' });
+    msg(`Reloaded: ${r.reloaded.join(', ') || 'none'}` + (r.warnings?.length ? ` — ${r.warnings.length} warning(s)` : ''));
+    if (r.warnings?.length) console.warn(r.warnings);
+    refresh();
+  } catch (e) { msg('' + e.message, true); }
+};
+setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString(); }, 1000);
+// Refreshing while a modal is open would replace the data underneath it.
+setInterval(() => {
+  // Refreshing under an open modal, or while someone is typing, throws
+  // away what they were doing. Neither is worth five seconds of freshness.
+  const busy = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+  if ($('#overlay').hidden && !busy) refresh();
+}, 5000);
+refresh();
+</script>
+</body>
+</html>

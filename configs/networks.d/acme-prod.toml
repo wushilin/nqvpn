@@ -1,0 +1,21 @@
+network_id = "acme-prod"
+cidrs = ["10.99.0.0/16", "fd99::/64"]
+
+[pools.default]
+cidr = "10.99.1.0/24"
+[pools.v6]
+cidr = "fd99::1:0/112"
+
+[relays.home]
+secret_hash = '$argon2id$v=19$m=19456,t=2,p=1$7fhjM1Wyp3EK5qisfFJ+Uw$zTgiwMzzc1ewW5jxuqOYZyoOBo4V4TzTKOPqliwwYvU'
+relay_addr = "203.0.113.7:4444"
+allowed_cidrs = ["192.168.1.0/24"]
+preferred_ip4 = "10.99.0.1"
+
+[relays.home-backup]
+secret_hash = '$argon2id$v=19$m=19456,t=2,p=1$7fhjM1Wyp3EK5qisfFJ+Uw$zTgiwMzzc1ewW5jxuqOYZyoOBo4V4TzTKOPqliwwYvU'
+relay_addr = "203.0.113.8:4444"
+allowed_cidrs = ["192.168.1.0/24"]
+
+[clients.laptop-1]
+secret_hash = '$argon2id$v=19$m=19456,t=2,p=1$7fhjM1Wyp3EK5qisfFJ+Uw$zTgiwMzzc1ewW5jxuqOYZyoOBo4V4TzTKOPqliwwYvU'

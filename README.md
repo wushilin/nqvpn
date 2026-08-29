@@ -250,6 +250,22 @@ cargo test                      # everything, ~2 minutes
 cargo test -p nqvpn-client --test chaos -- --nocapture   # watch the chaos
 ```
 
+## Building static Linux binaries
+
+`build_all.sh` produces fully static `amd64` and `arm64` Linux binaries
+(musl, no libc dependency — one artifact runs on any distro) from macOS
+or Linux:
+
+```sh
+./build_all.sh --setup      # first time: installs zig + cargo-zigbuild into .build-tools/
+./build_all.sh              # dist/linux-amd64/, dist/linux-arm64/, tarballs + sha256
+./build_all.sh arm64        # one target
+```
+
+It uses `cargo zigbuild` when available, `cross` if that is on PATH, and
+otherwise native musl toolchains on a Linux host (fetching a musl.cc
+cross toolchain for the other architecture).
+
 ## Status
 
 Linux and macOS clients and relays; Windows, DNS and full-tunnel exit nodes

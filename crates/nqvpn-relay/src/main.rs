@@ -175,7 +175,7 @@ fn member_config(cfg: &RelayConfig, n: &NetworkCfg) -> Result<MemberConfig> {
     Ok(MemberConfig {
         coordinator: cfg.coordinator.clone(),
         network_id: n.network_id.clone(),
-        node_id: n.node_id,
+        name: n.name.clone(),
         secret: n.secret()?,
         tls: cfg.tls(),
         role: Role::Relay,

@@ -10,9 +10,9 @@
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use nqvpn_proto::lpm::overlaps;
-use nqvpn_proto::types::{NodeId, Role};
+use nqvpn_proto::types::Role;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -195,9 +195,6 @@ fn d_transport() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberCfg {
-    /// The member's identity on the wire. Operator-chosen, unique within
-    /// the network, never 0.
-    pub node_id: NodeId,
     /// The member's secret. Optional here: a secret minted into the
     /// managed store (admin API / UI) takes precedence, and a member with
     /// neither cannot join.
@@ -223,29 +220,11 @@ pub struct MemberCfg {
 }
 
 impl NetworkConfig {
-    /// Look a member up by its wire identity.
-    pub fn member_by_id(&self, id: NodeId) -> Option<(&str, &MemberCfg, Role)> {
-        self.clients
-            .iter()
-            .find(|(_, m)| m.node_id == id)
-            .map(|(n, m)| (n.as_str(), m, Role::Client))
-            .or_else(|| {
-                self.relays
-                    .iter()
-                    .find(|(_, m)| m.node_id == id)
-                    .map(|(n, m)| (n.as_str(), m, Role::Relay))
-            })
-    }
-
     pub fn member_by_name(&self, name: &str) -> Option<(&MemberCfg, Role)> {
         self.clients
             .get(name)
             .map(|m| (m, Role::Client))
             .or_else(|| self.relays.get(name).map(|m| (m, Role::Relay)))
-    }
-
-    pub fn name_of(&self, id: NodeId) -> Option<&str> {
-        self.member_by_id(id).map(|(n, _, _)| n)
     }
 }
 
@@ -351,7 +330,6 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
             bail!("member {name} defined as both client and relay");
         }
     }
-    let mut seen_ids: HashMap<NodeId, &str> = HashMap::new();
     let mut seen4: BTreeMap<Ipv4Addr, String> = BTreeMap::new();
     let mut seen6: BTreeMap<Ipv6Addr, String> = BTreeMap::new();
     for (name, m, is_relay) in cfg
@@ -360,16 +338,6 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
         .map(|(n, m)| (n, m, false))
         .chain(cfg.relays.iter().map(|(n, m)| (n, m, true)))
     {
-        if m.node_id == 0 {
-            bail!("network {}: member {name}: node_id must not be 0", cfg.network_id);
-        }
-        if let Some(other) = seen_ids.insert(m.node_id, name) {
-            bail!(
-                "network {}: node_id {} is assigned to both {other} and {name}",
-                cfg.network_id,
-                m.node_id
-            );
-        }
         if let Some(s) = &m.secret {
             if s.trim().is_empty() {
                 bail!("member {name}: secret must not be empty");
@@ -512,13 +480,11 @@ cidrs = ["10.99.0.0/16", "fd99::/64"]
 [pools.default]
 cidr = "10.99.1.0/24"
 [relays.r1]
-node_id = 1
 secret = "s"
 relay_addr = "1.2.3.4:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 [clients.c1]
-node_id = 10
 secret = "s"
 pool = "default"
 "#
@@ -530,12 +496,12 @@ pool = "default"
     }
 
     #[test]
-    fn valid_config_passes_and_indexes_by_id() {
+    fn valid_config_passes_and_indexes_by_name() {
         let cfg = parse(&base());
         validate_network(&cfg).unwrap();
-        assert_eq!(cfg.member_by_id(10).unwrap().0, "c1");
-        assert_eq!(cfg.member_by_id(1).unwrap().2, Role::Relay);
-        assert!(cfg.member_by_id(99).is_none());
+        assert_eq!(cfg.member_by_name("c1").unwrap().1, Role::Client);
+        assert_eq!(cfg.member_by_name("r1").unwrap().1, Role::Relay);
+        assert!(cfg.member_by_name("nope").is_none());
         assert_eq!(cfg.settings.liveness_window_secs(), 15);
     }
 
@@ -558,14 +524,14 @@ pool = "default"
     #[test]
     fn client_with_relay_fields_fails() {
         let mut s = base();
-        s.push_str("[clients.c2]\nnode_id = 11\nrelay_addr = \"1.1.1.1:1\"\n");
+        s.push_str("[clients.c2]\nrelay_addr = \"1.1.1.1:1\"\n");
         assert!(validate_network(&parse(&s)).is_err());
     }
 
     #[test]
     fn relay_without_addr_fails() {
         let mut s = base();
-        s.push_str("[relays.r2]\nnode_id = 2\n");
+        s.push_str("[relays.r2]\n");
         assert!(validate_network(&parse(&s)).is_err());
     }
 
@@ -577,16 +543,13 @@ pool = "default"
     }
 
     #[test]
-    fn duplicate_preferred_ip_and_node_id_fail() {
+    fn duplicate_preferred_ip_fails_and_node_ids_are_not_configurable() {
         let mut s = base();
-        s.push_str("[clients.c9]\nnode_id = 9\npreferred_ip4 = \"10.99.0.1\"\n");
+        s.push_str("[clients.c9]\npreferred_ip4 = \"10.99.0.1\"\n");
         assert!(validate_network(&parse(&s)).is_err());
         let mut d = base();
-        d.push_str("[clients.c9]\nnode_id = 10\n");
-        let err = validate_network(&parse(&d)).unwrap_err();
-        assert!(format!("{err}").contains("node_id 10"), "{err}");
-        let z = base().replace("node_id = 10", "node_id = 0");
-        assert!(validate_network(&parse(&z)).is_err());
+        d.push_str("[clients.c9]\nnode_id = 7\n");
+        assert!(toml::from_str::<NetworkConfig>(&d).is_err(), "ids are assigned by the coordinator, never written in config");
     }
 
     #[test]
@@ -597,7 +560,7 @@ pool = "default"
     #[test]
     fn overlapping_allowed_cidrs_across_relays_ok_for_failover() {
         let mut s = base();
-        s.push_str("[relays.r2]\nnode_id = 2\nrelay_addr = \"5.6.7.8:4444\"\nallowed_cidrs = [\"192.168.1.0/24\"]\n");
+        s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nallowed_cidrs = [\"192.168.1.0/24\"]\n");
         validate_network(&parse(&s)).unwrap();
     }
 

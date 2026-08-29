@@ -29,21 +29,19 @@ cidr = "fd99::1:0/112"
 [settings]
 credential_ttl_mins = 15
 [relays.r1]
-node_id = 1
 secret = "{SECRET}"
 relay_addr = "1.2.3.4:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 [relays.r2]
-node_id = 2
 secret = "{SECRET}"
 relay_addr = "5.6.7.8:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 [clients.c1]
-node_id = 10
 secret = "{SECRET}"
 [clients.nosecret]
-node_id = 11
+[clients.auto]
+secret = "{SECRET}"
 "#
     )
 }
@@ -92,10 +90,21 @@ fn fp(seed: u8) -> String {
     format!("sha256:{}", hex::encode([seed; 32]))
 }
 
+fn name_of(node_id: NodeId) -> String {
+    match node_id {
+        1 => "r1".into(),
+        2 => "r2".into(),
+        10 => "c1".into(),
+        11 => "nosecret".into(),
+        99 => "ghost".into(),
+        n => format!("c{n}"),
+    }
+}
+
 fn req(node_id: NodeId, role: Role) -> JoinRequest {
     JoinRequest {
         network_id: "n1".into(),
-        node_id,
+        name: name_of(node_id),
         secret: SECRET.into(),
         pubkey: pubkey(node_id as u8),
         role,
@@ -143,7 +152,7 @@ fn client_join_happy_path_and_offline_verification() {
     )
     .unwrap();
     assert_eq!(claims.sub, "c1");
-    assert_eq!(claims.node_id, 10);
+    assert_eq!(claims.node_id, resp.node_id, "the id the coordinator assigned");
     assert_eq!(claims.cert_fp, fp(10));
     assert!(claims.prefixes.contains(&format!("{}/32", resp.ip4.unwrap())));
 }
@@ -172,11 +181,11 @@ fn a_different_machine_replaces_the_previous_instance() {
     assert_eq!(b.ip4, a.ip4, "same address: identity, not declaration");
     assert_eq!(b.login_gen, a.login_gen + 1, "but a new login generation");
     let ns = h.state.networks["n1"].lock().unwrap();
-    let rec = &ns.registry.members[&10];
+    let rec = ns.registry.by_name("c1").unwrap();
     assert_eq!(rec.pubkey.as_deref(), Some(pubkey(200).as_str()), "latest keys are recorded, never judged");
     assert_eq!(rec.replaced_from.as_deref(), Some("1.1.1.1"));
     assert!(rec.replaced_unix.is_some());
-    assert_eq!(ns.directory.published.member(10).unwrap().login_gen, 1, "published so acceptors evict the old one");
+    assert_eq!(ns.directory.published.member(a.node_id).unwrap().login_gen, 1, "published so acceptors evict the old one");
 }
 
 #[test]
@@ -196,7 +205,7 @@ fn wrong_secret_unknown_node_and_unknown_network_are_indistinguishable() {
 #[test]
 fn a_managed_secret_wins_over_the_config_secret_and_rotates() {
     let h = harness();
-    let minted = h.state.secrets.lock().unwrap().mint("n1", 10, 100);
+    let minted = h.state.secrets.lock().unwrap().mint("n1", "c1", 100);
     let mut r = req(10, Role::Client);
     r.secret = minted.clone();
     assert!(h.state.join(&r, "1.1.1.1").is_ok(), "managed secret authenticates");
@@ -208,16 +217,29 @@ fn a_managed_secret_wins_over_the_config_secret_and_rotates() {
     // A member with no managed secret keeps using config: migration path.
     assert!(h.state.join(&req(2, Role::Relay), "1.1.1.1").is_ok());
     // Minting again is rotation.
-    let rotated = h.state.secrets.lock().unwrap().mint("n1", 10, 200);
+    let rotated = h.state.secrets.lock().unwrap().mint("n1", "c1", 200);
     r.secret = minted;
     assert!(h.state.join(&r, "1.1.1.1").is_err());
     r.secret = rotated;
     assert!(h.state.join(&r, "1.1.1.1").is_ok());
     // A member with no config secret can be given a managed one.
-    let s = h.state.secrets.lock().unwrap().mint("n1", 11, 300);
+    let s = h.state.secrets.lock().unwrap().mint("n1", "nosecret", 300);
     let mut r = req(11, Role::Client);
     r.secret = s;
     assert!(h.state.join(&r, "1.1.1.1").is_ok());
+}
+
+#[test]
+fn a_name_is_assigned_a_durable_id_at_first_join() {
+    let h = harness();
+    let a = h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
+    let r = h.state.join(&req(1, Role::Relay), "1.1.1.1").unwrap();
+    assert!(a.node_id != 0 && r.node_id != 0 && a.node_id != r.node_id);
+    let again = h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
+    assert_eq!(again.node_id, a.node_id, "durable across joins");
+    let reg = h.state.networks["n1"].lock().unwrap();
+    assert_eq!(reg.registry.id_of("c1"), Some(a.node_id));
+    assert_eq!(reg.registry.members[&a.node_id].name, "c1");
 }
 
 #[test]
@@ -264,23 +286,23 @@ fn a_join_replaces_the_previous_declaration() {
     let mut r = req(1, Role::Relay);
     r.local_cidrs = vec!["192.168.1.0/24".parse().unwrap()];
     h.state.join(&r, "1.1.1.1").unwrap();
-    let age1 = h.state.networks["n1"].lock().unwrap().registry.members[&1].routes[0].first_granted_unix;
+    let age1 = h.state.networks["n1"].lock().unwrap().registry.by_name("r1").unwrap().routes[0].first_granted_unix;
 
     // Renewal with the same CIDR keeps its age.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     h.state.join(&r, "1.1.1.1").unwrap();
-    assert_eq!(h.state.networks["n1"].lock().unwrap().registry.members[&1].routes[0].first_granted_unix, age1);
+    assert_eq!(h.state.networks["n1"].lock().unwrap().registry.by_name("r1").unwrap().routes[0].first_granted_unix, age1);
 
     // A join without it withdraws it at once — not "at the next renewal".
     let plain = req(1, Role::Relay);
     let resp = h.state.join(&plain, "1.1.1.1").unwrap();
     assert!(resp.granted_cidrs.is_empty());
-    assert!(h.state.networks["n1"].lock().unwrap().registry.members[&1].routes.is_empty());
+    assert!(h.state.networks["n1"].lock().unwrap().registry.by_name("r1").unwrap().routes.is_empty());
 
     // Declaring it again is a fresh registration with a fresh age.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     h.state.join(&r, "1.1.1.1").unwrap();
-    let age2 = h.state.networks["n1"].lock().unwrap().registry.members[&1].routes[0].first_granted_unix;
+    let age2 = h.state.networks["n1"].lock().unwrap().registry.by_name("r1").unwrap().routes[0].first_granted_unix;
     assert!(age2 > age1, "left and came back: young again");
 }
 
@@ -338,17 +360,18 @@ fn overlapping_registration_age_resolves() {
     let ns = h.state.networks["n1"].lock().unwrap();
     let owners = ns.registry.resolve_owners();
     assert_eq!(owners.len(), 1);
-    assert_eq!(owners[0].1[0].0, 1, "older registration owns");
-    assert_eq!(owners[0].1[1].0, 2, "younger is standby");
+    assert_eq!(owners[0].1[0].0, ns.registry.id_of("r1").unwrap(), "older registration owns");
+    assert_eq!(owners[0].1[1].0, ns.registry.id_of("r2").unwrap(), "younger is standby");
 }
 
 #[test]
 fn disabled_member_rejected_then_enable_restores() {
     let h = harness();
     h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
-    h.state.networks["n1"].lock().unwrap().registry.members.get_mut(&10).unwrap().disabled = true;
+    let id = h.state.networks["n1"].lock().unwrap().registry.id_of("c1").unwrap();
+    h.state.networks["n1"].lock().unwrap().registry.members.get_mut(&id).unwrap().disabled = true;
     assert_eq!(h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap_err().code.as_str(), "client_disabled");
-    h.state.networks["n1"].lock().unwrap().registry.members.get_mut(&10).unwrap().disabled = false;
+    h.state.networks["n1"].lock().unwrap().registry.members.get_mut(&id).unwrap().disabled = false;
     h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
 }
 
@@ -362,8 +385,8 @@ fn registry_survives_reload_including_the_generation_mark() {
     };
     let reloaded = Registry::load_or_create(&path).unwrap();
     assert_eq!(reloaded.network_uuid, uuid);
-    assert_eq!(reloaded.members[&10].ip4, a.ip4);
-    assert_eq!(reloaded.members[&10].name, "c1");
+    assert_eq!(reloaded.members[&a.node_id].ip4, a.ip4);
+    assert_eq!(reloaded.members[&a.node_id].name, "c1");
     assert!(reloaded.gen_hwm > gen, "the high-water mark is ahead of anything handed out");
     assert!(reloaded.initial_gen(0) > gen, "a restart continues above the old generation");
 }
@@ -415,7 +438,7 @@ fn concurrent_joins_never_hand_out_the_same_address() {
     const N: usize = 24;
     let toml = format!(
         "network_id = \"n1\"\ncidrs = [\"10.99.0.0/16\"]\n[pools.default]\ncidr = \"10.99.1.0/24\"\n[settings]\n{}",
-        (0..N).map(|i| format!("[clients.c{i}]\nnode_id = {}\nsecret = \"{SECRET}\"\n", 100 + i)).collect::<String>()
+        (0..N).map(|i| format!("[clients.c{}]\nsecret = \"{SECRET}\"\n", 100 + i)).collect::<String>()
     );
     let toml = toml.replace("[settings]\n", "");
     let h = harness_with(&toml);

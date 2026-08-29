@@ -36,20 +36,16 @@ heartbeat_secs = 1
 offline_after = 3
 hold_down_secs = 0
 [relays.r1]
-node_id = 1
 secret = "{SECRET}"
 relay_addr = "1.2.3.4:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 [relays.r2]
-node_id = 2
 secret = "{SECRET}"
 relay_addr = "5.6.7.8:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 [clients.c1]
-node_id = 10
 secret = "{SECRET}"
 [clients.c2]
-node_id = 11
 secret = "{SECRET}"
 "#
     )
@@ -165,9 +161,16 @@ fn hb_of(view: &Snapshot) -> Heartbeat {
 }
 
 fn join_as(env: &Env, node_id: NodeId, role: Role, id: &TlsIdentity, cidrs: Vec<&str>) -> (String, u32) {
+    let name = match node_id {
+        1 => "r1",
+        2 => "r2",
+        10 => "c1",
+        11 => "c2",
+        _ => panic!("unknown test member"),
+    };
     let req = JoinRequest {
         network_id: "n1".into(),
-        node_id,
+        name: name.into(),
         secret: SECRET.into(),
         pubkey: B64.encode([node_id as u8; 32]),
         role,
@@ -479,9 +482,13 @@ async fn a_member_behind_is_caught_up_by_deltas_and_a_stranger_by_snapshot() -> 
     assert_eq!(d.base_gen, g0);
     view.apply(&d)?;
     let st = env.state.clone();
+    let (r1n, r2n) = {
+        let ns = st.networks["n1"].lock().unwrap();
+        (ns.registry.id_of("r1").unwrap(), ns.registry.id_of("r2").unwrap())
+    };
     c.until(&mut view, |v| {
         let ns = st.networks["n1"].lock().unwrap();
-        v.gen == ns.directory.gen && v.member(1).is_some() && v.member(2).is_some()
+        v.gen == ns.directory.gen && v.member(r1n).is_some() && v.member(r2n).is_some()
     })
     .await?;
     let _ = payload;

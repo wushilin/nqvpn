@@ -109,9 +109,10 @@ Five rules keep it reviewable:
 
 ## 2. Addressing & routes
 
-- The coordinator config assigns each member a stable **node id**
-  (`u32`), the wire identity in every frame header. All forwarding uses
-  node ids, never inner IPs.
+- The coordinator assigns each member a stable **node id** (`u32`) at
+  its first join — the wire identity in every frame header, never
+  configured by anyone. All forwarding uses node ids, never inner IPs;
+  people only ever deal in member **names**.
 - **Clients** own exactly their VPN address(es), advertised as /32 and
   /128. **Relays** may register **local CIDRs** they front, permitted by
   `allowed_cidrs` in their config entry; a gateway relay may be headless.
@@ -143,11 +144,15 @@ unknown_pool`) and a `preferred_ip4/6` anywhere in the tunnel CIDRs
 the allocator cycles forward DHCP-style so a freed address is not
 reissued immediately. Relays use the identical mechanism.
 
-### 3.2 Security model: node id + secret
+### 3.2 Security model: name + secret
 
-**A member is a node id and a secret. Nothing else authenticates.**
+**A member is a name and a secret. Nothing else authenticates.** The
+name is what people configure, type and see; the 32-bit node id is the
+wire identity, assigned by the coordinator at the member's first join,
+durable for the life of the record, never reused, and never written in
+any config.
 
-- Join is `POST /api/v1/join` over HTTPS with `{network_id, node_id,
+- Join is `POST /api/v1/join` over HTTPS with `{network_id, name,
   secret, …}`. The coordinator checks the secret and nothing about the
   machine: there is no pinning, no device lock, no identity rotation.
   Anyone with the id and secret *is* that node; rotate the secret to
@@ -232,7 +237,7 @@ Errors are `{error:{code,message}}` with codes `bad_credentials`
 `client_disabled`, `prefix_conflict`, `address_in_use`, `pool_exhausted`,
 `unknown_pool`, `relay_unreachable`, `bad_request`, `rate_limited`. The
 **web UI** (`/ui`, dependency-free, embedded) is a client of this API
-and speaks only in node ids and secrets.
+and speaks in names and secrets; ids appear only as information.
 
 ## 4. Control plane: a generation-numbered view
 
@@ -525,23 +530,20 @@ relay_reachability = "warn"    # off | warn | deny
 transport = "stream"           # stream | datagram
 lanes = 1
 
-# A member is a node id + a secret. A secret minted from the admin
+# A member is a name + a secret. A secret minted from the admin
 # API/UI (kept in the state dir) takes precedence over one written here.
 [relays.home]
-node_id = 1
 secret = "change-me-home"
 relay_addr = "203.0.113.7:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 
 [relays.home-backup]           # overlapping CIDR = age-based failover
-node_id = 2
 secret = "change-me-backup"
 relay_addr = "203.0.113.8:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 
 [clients.laptop-1]
-node_id = 10
 secret = "change-me-laptop"
 ```
 
@@ -559,14 +561,14 @@ workers = 0                    # 0 = one per core
 
 [[networks]]                   # any number
 network_id = "acme-prod"
-node_id = 1
+name = "home"                  # this relay's member name at the coordinator
 secret = "change-me-home"      # or secret_file
 local_cidrs = ["192.168.1.0/24"]   # gateway role; omit for a pure forwarder
 # want_vpn_ip = true
 
 [[networks]]
 network_id = "lab"
-node_id = 7
+name = "home"
 secret = "..."
 want_vpn_ip = false
 ```
@@ -576,12 +578,12 @@ want_vpn_ip = false
 coordinator = "https://coord.example.com:8443"
 # trust_any_cert = true
 network_id  = "acme-prod"
-node_id     = 10
+name        = "laptop-1"
 secret      = "change-me-laptop"   # or secret_file
 state_dir   = "/var/lib/nqvpn-client"
 
 [relay]
-# preferred = 1           # relay node id; omit => lowest RTT
+# preferred = "home"      # relay name; omit => lowest RTT
 
 [address]
 # pool = "default"

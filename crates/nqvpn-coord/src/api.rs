@@ -28,13 +28,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/status", get(global_status))
         .route("/api/v1/networks", get(list_networks))
         .route("/api/v1/networks/{id}/status", get(network_status))
-        .route("/api/v1/networks/{id}/members/{node}/disable", post(|s, p| set_disabled(s, p, true)))
-        .route("/api/v1/networks/{id}/members/{node}/enable", post(|s, p| set_disabled(s, p, false)))
+        .route("/api/v1/networks/{id}/members/{name}/disable", post(|s, p| set_disabled(s, p, true)))
+        .route("/api/v1/networks/{id}/members/{name}/enable", post(|s, p| set_disabled(s, p, false)))
         .route(
-            "/api/v1/networks/{id}/members/{node}/secret",
+            "/api/v1/networks/{id}/members/{name}/secret",
             get(show_secret).post(mint_secret).delete(delete_secret),
         )
-        .route("/api/v1/networks/{id}/members/{node}", axum::routing::delete(delete_member))
+        .route("/api/v1/networks/{id}/members/{name}", axum::routing::delete(delete_member))
         .route("/api/v1/reload", post(reload))
         .route("/ui", get(ui))
         .route("/ui/", get(ui))
@@ -82,11 +82,11 @@ async fn join(
         let (policy, addr) = {
             let net = state.networks.get(&req.network_id).expect("joined");
             let ns = net.lock().unwrap();
-            let addr = ns.cfg.member_by_id(req.node_id).and_then(|(_, m, _)| m.relay_addr.clone());
+            let addr = ns.cfg.member_by_name(&req.name).and_then(|(m, _)| m.relay_addr.clone());
             (ns.cfg.settings.relay_reachability.clone(), addr)
         };
         if let (true, Some(addr)) = (policy != "off", addr) {
-            let (st, netid, node) = (state.clone(), req.network_id.clone(), req.node_id);
+            let (st, netid, node) = (state.clone(), req.network_id.clone(), resp.node_id);
             tokio::spawn(async move {
                 let verdict = crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
                 if verdict == crate::reach::Reachability::Unreachable {
@@ -240,18 +240,24 @@ async fn network_status(
     }))
 }
 
-type MemberPath = Path<(String, NodeId)>;
+type MemberPath = Path<(String, String)>;
+
+/// Members are addressed by name in the API; the registry resolves it.
+fn node_of(ns: &crate::state::NetState, name: &str) -> Result<NodeId, ApiError> {
+    ns.registry.id_of(name).ok_or_else(|| ApiError::not_found(format!("member {name:?} has never joined")))
+}
 
 async fn set_disabled(
     state: State<Arc<AppState>>,
-    (headers, Path((id, node))): (HeaderMap, MemberPath),
+    (headers, Path((id, name))): (HeaderMap, MemberPath),
     disabled: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let State(state) = state;
     check_admin(&state, &headers)?;
     let net = state.networks.get(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
     let mut ns = net.lock().unwrap();
-    let rec = ns.registry.members.get_mut(&node).ok_or_else(|| ApiError::not_found(format!("node {node}")))?;
+    let node = node_of(&ns, &name)?;
+    let rec = ns.registry.members.get_mut(&node).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
     rec.disabled = disabled;
     let role = rec.role;
     ns.commit()?;
@@ -275,41 +281,42 @@ async fn set_disabled(
 async fn delete_member(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, node)): MemberPath,
+    Path((id, name)): MemberPath,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
     let net = state.networks.get(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
     let (freed4, freed6, still_configured) = {
         let mut ns = net.lock().unwrap();
-        let rec = ns.registry.members.remove(&node).ok_or_else(|| ApiError::not_found(format!("node {node}")))?;
+        let node = node_of(&ns, &name)?;
+        let rec = ns.registry.members.remove(&node).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         ns.commit()?;
         ns.close_session(node, "member deleted");
         ns.leases.remove_relay(node);
         ns.directory.traffic.remove(&node);
         ns.directory.reported_mtu.remove(&node);
         state.publish(&mut ns);
-        (rec.ip4, rec.ip6, ns.cfg.member_by_id(node).is_some())
+        (rec.ip4, rec.ip6, ns.cfg.member_by_name(&name).is_some())
     };
     let secret_removed = {
         let mut store = state.secrets.lock().unwrap();
-        let removed = store.remove(&id, node);
+        let removed = store.remove(&id, &name);
         if removed {
             store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
         }
         removed
     };
-    tracing::info!(network = %id, node_id = node, still_configured, "member deleted");
+    tracing::info!(network = %id, member = %name, still_configured, "member deleted");
     Ok(Json(serde_json::json!({
         "ok": true, "freed_ip4": freed4, "freed_ip6": freed6,
         "secret_removed": secret_removed, "still_in_config": still_configured,
     })))
 }
 
-fn member_exists(state: &AppState, id: &str, node: NodeId) -> Result<(), ApiError> {
+fn member_exists(state: &AppState, id: &str, name: &str) -> Result<(), ApiError> {
     let net = state.networks.get(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
     let ns = net.lock().unwrap();
-    if ns.cfg.member_by_id(node).is_none() {
-        return Err(ApiError::not_found(format!("node {node} is not configured in {id:?}")));
+    if ns.cfg.member_by_name(name).is_none() {
+        return Err(ApiError::not_found(format!("member {name:?} is not configured in {id:?}")));
     }
     Ok(())
 }
@@ -319,20 +326,20 @@ fn member_exists(state: &AppState, id: &str, node: NodeId) -> Result<(), ApiErro
 async fn show_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, node)): MemberPath,
+    Path((id, name)): MemberPath,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
-    member_exists(&state, &id, node)?;
-    let managed = state.secrets.lock().unwrap().find(&id, node).cloned();
+    member_exists(&state, &id, &name)?;
+    let managed = state.secrets.lock().unwrap().find(&id, &name).cloned();
     let (secret, source, disabled) = match managed {
         Some(m) => (Some(m.secret), "managed", m.disabled),
         None => {
             let ns = state.networks[&id].lock().unwrap();
-            let s = ns.cfg.member_by_id(node).and_then(|(_, m, _)| m.secret.clone());
+            let s = ns.cfg.member_by_name(&name).and_then(|(m, _)| m.secret.clone());
             (s, "config", false)
         }
     };
-    Ok(Json(serde_json::json!({ "node_id": node, "secret": secret, "source": source, "disabled": disabled })))
+    Ok(Json(serde_json::json!({ "name": name, "secret": secret, "source": source, "disabled": disabled })))
 }
 
 /// Mint (or replace) a member's secret. Replacing is rotation: the
@@ -341,18 +348,18 @@ async fn show_secret(
 async fn mint_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, node)): MemberPath,
+    Path((id, name)): MemberPath,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
-    member_exists(&state, &id, node)?;
+    member_exists(&state, &id, &name)?;
     let secret = {
         let mut store = state.secrets.lock().unwrap();
-        let s = store.mint(&id, node, now_unix());
+        let s = store.mint(&id, &name, now_unix());
         store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
         s
     };
-    tracing::info!(network = %id, node_id = node, "secret minted");
-    Ok(Json(serde_json::json!({ "ok": true, "node_id": node, "secret": secret })))
+    tracing::info!(network = %id, member = %name, "secret minted");
+    Ok(Json(serde_json::json!({ "ok": true, "name": name, "secret": secret })))
 }
 
 /// Remove the managed secret; the member falls back to its config
@@ -360,12 +367,12 @@ async fn mint_secret(
 async fn delete_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((id, node)): MemberPath,
+    Path((id, name)): MemberPath,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
     let mut store = state.secrets.lock().unwrap();
-    if !store.remove(&id, node) {
-        return Err(ApiError::not_found(format!("no managed secret for node {node}")));
+    if !store.remove(&id, &name) {
+        return Err(ApiError::not_found(format!("no managed secret for {name:?}")));
     }
     store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
     Ok(Json(serde_json::json!({ "ok": true })))

@@ -202,7 +202,7 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
-const memberPath = (net, m) => `/api/v1/networks/${enc(net)}/members/${enc(m.node_id)}`;
+const memberPath = (net, m) => `/api/v1/networks/${enc(net)}/members/${enc(m.name)}`;
 
 /* ---------- formatting ---------- */
 
@@ -459,7 +459,6 @@ function paintSecret(body, net, m, r, fresh) {
     const cfg = el('div', 'wrap');
     cfg.append(el('div', 'cfg',
       `network_id = "${net}"\n` +
-      `node_id = ${r.node_id}\n` +
       `secret = "${r.secret}"`));
     body.append(cfg);
     body.append(el('p', 'note',

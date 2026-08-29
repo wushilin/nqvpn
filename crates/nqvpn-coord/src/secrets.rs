@@ -13,7 +13,6 @@
 //! the old stops working at once.
 
 use anyhow::{Context, Result};
-use nqvpn_proto::types::NodeId;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -22,7 +21,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretRecord {
     pub network: String,
-    pub node_id: NodeId,
+    pub name: String,
     pub secret: String,
     #[serde(default)]
     pub created_unix: u64,
@@ -106,18 +105,18 @@ impl SecretStore {
         Ok(())
     }
 
-    pub fn find(&self, network: &str, node_id: NodeId) -> Option<&SecretRecord> {
-        self.members.iter().find(|s| s.network == network && s.node_id == node_id)
+    pub fn find(&self, network: &str, name: &str) -> Option<&SecretRecord> {
+        self.members.iter().find(|s| s.network == network && s.name == name)
     }
 
     /// Mint a secret, replacing any existing one for the same member.
     /// This is also rotation: the previous secret stops working now.
-    pub fn mint(&mut self, network: &str, node_id: NodeId, now: u64) -> String {
+    pub fn mint(&mut self, network: &str, name: &str, now: u64) -> String {
         let secret = generate_secret();
-        self.members.retain(|s| !(s.network == network && s.node_id == node_id));
+        self.members.retain(|s| !(s.network == network && s.name == name));
         self.members.push(SecretRecord {
             network: network.to_string(),
-            node_id,
+            name: name.to_string(),
             secret: secret.clone(),
             created_unix: now,
             disabled: false,
@@ -125,14 +124,14 @@ impl SecretStore {
         secret
     }
 
-    pub fn remove(&mut self, network: &str, node_id: NodeId) -> bool {
+    pub fn remove(&mut self, network: &str, name: &str) -> bool {
         let before = self.members.len();
-        self.members.retain(|s| !(s.network == network && s.node_id == node_id));
+        self.members.retain(|s| !(s.network == network && s.name == name));
         self.members.len() != before
     }
 
-    pub fn set_disabled(&mut self, network: &str, node_id: NodeId, disabled: bool) -> bool {
-        match self.members.iter_mut().find(|s| s.network == network && s.node_id == node_id) {
+    pub fn set_disabled(&mut self, network: &str, name: &str, disabled: bool) -> bool {
+        match self.members.iter_mut().find(|s| s.network == network && s.name == name) {
             Some(s) => {
                 s.disabled = disabled;
                 true
@@ -141,8 +140,8 @@ impl SecretStore {
         }
     }
 
-    pub fn verify(&self, network: &str, node_id: NodeId, secret: &str) -> Verdict {
-        let Some(rec) = self.find(network, node_id) else {
+    pub fn verify(&self, network: &str, name: &str, secret: &str) -> Verdict {
+        let Some(rec) = self.find(network, name) else {
             return Verdict::Unknown;
         };
         if rec.disabled {
@@ -163,20 +162,20 @@ mod tests {
     #[test]
     fn mint_verify_rotate() {
         let mut s = SecretStore::default();
-        let a = s.mint("n1", 7, 100);
-        assert_eq!(s.verify("n1", 7, &a), Verdict::Match);
-        assert_eq!(s.verify("n1", 7, "wrong"), Verdict::Mismatch, "must not fall through");
-        assert_eq!(s.verify("n1", 8, &a), Verdict::Unknown);
-        assert_eq!(s.verify("n2", 7, &a), Verdict::Unknown, "networks are namespaces");
-        let b = s.mint("n1", 7, 200);
+        let a = s.mint("n1", "m7", 100);
+        assert_eq!(s.verify("n1", "m7", &a), Verdict::Match);
+        assert_eq!(s.verify("n1", "m7", "wrong"), Verdict::Mismatch, "must not fall through");
+        assert_eq!(s.verify("n1", "m8", &a), Verdict::Unknown);
+        assert_eq!(s.verify("n2", "m7", &a), Verdict::Unknown, "networks are namespaces");
+        let b = s.mint("n1", "m7", 200);
         assert_ne!(a, b);
-        assert_eq!(s.verify("n1", 7, &a), Verdict::Mismatch);
-        assert_eq!(s.verify("n1", 7, &b), Verdict::Match);
+        assert_eq!(s.verify("n1", "m7", &a), Verdict::Mismatch);
+        assert_eq!(s.verify("n1", "m7", &b), Verdict::Match);
         assert_eq!(s.members.len(), 1);
-        assert!(s.set_disabled("n1", 7, true));
-        assert_eq!(s.verify("n1", 7, &b), Verdict::Disabled);
-        assert!(s.remove("n1", 7));
-        assert_eq!(s.verify("n1", 7, &b), Verdict::Unknown);
+        assert!(s.set_disabled("n1", "m7", true));
+        assert_eq!(s.verify("n1", "m7", &b), Verdict::Disabled);
+        assert!(s.remove("n1", "m7"));
+        assert_eq!(s.verify("n1", "m7", &b), Verdict::Unknown);
     }
 
     #[test]
@@ -193,10 +192,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.toml");
         let mut s = SecretStore::default();
-        let secret = s.mint("n1", 3, 1);
+        let secret = s.mint("n1", "m3", 1);
         s.commit(&path).unwrap();
         let back = SecretStore::load_or_create(&path).unwrap();
-        assert_eq!(back.verify("n1", 3, &secret), Verdict::Match);
+        assert_eq!(back.verify("n1", "m3", &secret), Verdict::Match);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

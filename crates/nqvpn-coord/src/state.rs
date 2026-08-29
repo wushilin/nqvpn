@@ -164,7 +164,7 @@ impl AppState {
 
     /// The whole join transaction.
     pub fn join(&self, req: &JoinRequest, peer_ip: &str) -> Result<JoinResponse, ApiError> {
-        self.check_rate(format!("{}@{}", req.node_id, req.network_id), peer_ip.to_string())?;
+        self.check_rate(format!("{}@{}", req.name, req.network_id), peer_ip.to_string())?;
 
         let net = self
             .networks
@@ -174,12 +174,12 @@ impl AppState {
         // ---- phase 1: authenticate against immutable config ----
         let (name, member_cfg, role): (String, MemberCfg, Role) = {
             let ns = net.lock().unwrap();
-            match ns.cfg.member_by_id(req.node_id) {
-                Some((n, m, r)) => (n.to_string(), m.clone(), r),
+            match ns.cfg.member_by_name(&req.name) {
+                Some((m, r)) => (req.name.clone(), m.clone(), r),
                 None => return Err(ApiError::bad_credentials()),
             }
         };
-        let verdict = self.secrets.lock().unwrap().verify(&req.network_id, req.node_id, &req.secret);
+        let verdict = self.secrets.lock().unwrap().verify(&req.network_id, &name, &req.secret);
         match verdict {
             Verdict::Match => {}
             Verdict::Mismatch | Verdict::Disabled => return Err(ApiError::bad_credentials()),
@@ -189,10 +189,7 @@ impl AppState {
             },
         }
         if role != req.role {
-            return Err(ApiError::bad_request(format!(
-                "node {} is configured as {role}, joined as {}",
-                req.node_id, req.role
-            )));
+            return Err(ApiError::bad_request(format!("{name} is configured as {role}, joined as {}", req.role)));
         }
         if !valid_pubkey(&req.pubkey) {
             return Err(ApiError::bad_request("pubkey must be a base64 32-byte X25519 key"));
@@ -232,7 +229,7 @@ impl AppState {
         let now = now_unix();
         let ttl_secs = ns.cfg.settings.credential_ttl_mins * 60;
 
-        let existing = ns.registry.members.get(&req.node_id).cloned();
+        let existing = ns.registry.by_name(&name).cloned();
         if let Some(rec) = &existing {
             if rec.disabled {
                 return Err(ApiError::client_disabled());
@@ -254,7 +251,7 @@ impl AppState {
                 let granted = crate::ipam::allocate(
                     cfg,
                     registry,
-                    req.node_id,
+                    &name,
                     req.pool.as_deref(),
                     want4.or(have4),
                     want6.or(have6),
@@ -287,7 +284,7 @@ impl AppState {
             })
             .unwrap_or(false);
 
-        let rec = ns.registry.member_mut(req.node_id, &name, role, now);
+        let rec = ns.registry.member_by_name_mut(&name, role, now);
         if replaced {
             rec.login_gen += 1;
             rec.replaced_unix = Some(now);
@@ -396,13 +393,14 @@ pub fn relay_entries(ns: &NetState) -> Vec<RelayEntry> {
 pub fn config_matches_registry(cfg: &NetworkConfig, reg: &Registry) -> Vec<String> {
     let mut warnings = Vec::new();
     for (id, rec) in &reg.members {
-        let Some((name, m, _)) = cfg.member_by_id(*id) else {
+        let name = rec.name.as_str();
+        let Some((m, _)) = cfg.member_by_name(name) else {
             warnings.push(format!(
-                "node {id} ({}) is in the registry but no longer in config; it cannot join until re-added or deleted",
-                rec.name
+                "node {id} ({name}) is in the registry but no longer in config; it cannot join until re-added or deleted"
             ));
             continue;
         };
+
         for r in &rec.routes {
             let ok = m.allowed_cidrs.iter().any(|a| a.contains(&r.cidr.network()) && a.prefix_len() <= r.cidr.prefix_len());
             if !ok {

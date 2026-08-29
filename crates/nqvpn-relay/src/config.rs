@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 use nqvpn_proto::joinapi::JoinTls;
-use nqvpn_proto::types::NodeId;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +38,8 @@ pub struct RelayConfig {
 #[serde(deny_unknown_fields)]
 pub struct NetworkCfg {
     pub network_id: String,
-    pub node_id: NodeId,
+    /// This relay's member name at the coordinator.
+    pub name: String,
     #[serde(default)]
     pub secret: Option<String>,
     #[serde(default)]
@@ -118,12 +118,12 @@ listen = "0.0.0.0:4444"
 relay_addr = "home.example:4444"
 [[networks]]
 network_id = "acme"
-node_id = 1
+name = "home"
 secret = "s"
 local_cidrs = ["192.168.1.0/24"]
 [[networks]]
 network_id = "lab"
-node_id = 7
+name = "home"
 secret = "t"
 want_vpn_ip = false
 "#,

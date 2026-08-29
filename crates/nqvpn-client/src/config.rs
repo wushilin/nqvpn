@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 use nqvpn_proto::joinapi::JoinTls;
-use nqvpn_proto::types::NodeId;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -21,7 +20,8 @@ pub struct ClientConfig {
     #[serde(default)]
     pub ca: Option<PathBuf>,
     pub network_id: String,
-    pub node_id: NodeId,
+    /// This client's member name at the coordinator.
+    pub name: String,
     #[serde(default)]
     pub secret: Option<String>,
     #[serde(default)]
@@ -42,10 +42,10 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayCfg {
-    /// Node id of the relay to attach to when reachable; otherwise the
+    /// Name of the relay to attach to when reachable; otherwise the
     /// fleet is ranked by measured RTT.
     #[serde(default)]
-    pub preferred: Option<NodeId>,
+    pub preferred: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -96,7 +96,7 @@ impl ClientConfig {
         Ok(nqvpn_sync::MemberConfig {
             coordinator: self.coordinator.clone(),
             network_id: self.network_id.clone(),
-            node_id: self.node_id,
+            name: self.name.clone(),
             secret: self.secret()?,
             tls: self.tls(),
             role: nqvpn_proto::types::Role::Client,
@@ -120,7 +120,7 @@ mod tests {
             r#"
 coordinator = "https://coord.example:8443"
 network_id = "acme"
-node_id = 10
+name = "laptop-1"
 secret = "s"
 "#,
         )
@@ -128,7 +128,7 @@ secret = "s"
         assert_eq!(c.secret().unwrap(), "s");
         assert!(c.trust_any_cert);
         assert!(c.relay.preferred.is_none());
-        assert_eq!(c.member().unwrap().node_id, 10);
+        assert_eq!(c.member().unwrap().name, "laptop-1");
     }
 
     #[test]
@@ -139,19 +139,19 @@ coordinator = "https://coord.example:8443"
 trust_any_cert = false
 ca = "/etc/nqvpn/coord-ca.pem"
 network_id = "acme"
-node_id = 10
+name = "laptop-1"
 secret = "s"
 tun_name = "nqvpn0"
 state_dir = "/tmp/x"
 [relay]
-preferred = 1
+preferred = "home"
 [address]
 pool = "default"
 preferred_ip4 = "10.99.1.50"
 "#,
         )
         .unwrap();
-        assert_eq!(c.relay.preferred, Some(1));
+        assert_eq!(c.relay.preferred.as_deref(), Some("home"));
         assert!(!c.trust_any_cert);
         assert_eq!(c.tls().ca_pem, Some(PathBuf::from("/etc/nqvpn/coord-ca.pem")));
     }

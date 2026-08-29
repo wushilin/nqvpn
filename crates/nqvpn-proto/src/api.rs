@@ -17,7 +17,10 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub network_id: String,
-    pub node_id: NodeId,
+    /// The member's name, as configured at the coordinator. Names are
+    /// what people use everywhere; the coordinator assigns the wire
+    /// identity (`node_id`) and returns it.
+    pub name: String,
     pub secret: String,
     /// X25519 public key, base64.
     pub pubkey: String,

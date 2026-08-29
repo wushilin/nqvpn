@@ -7,7 +7,7 @@ use nqvpn_proto::credential::Claims;
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::joinapi::{self, JoinError, JoinTls};
 use nqvpn_proto::seal::StaticKeys;
-use nqvpn_proto::types::{NodeId, Role};
+use nqvpn_proto::types::Role;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,9 @@ pub struct MemberConfig {
     /// `https://host[:port]`
     pub coordinator: String,
     pub network_id: String,
-    pub node_id: NodeId,
+    /// The member's name at the coordinator; the wire id comes back in
+    /// the join response.
+    pub name: String,
     pub secret: String,
     pub tls: JoinTls,
     pub role: Role,
@@ -36,7 +38,7 @@ impl MemberConfig {
     pub fn request(&self, identity: &TlsIdentity, keys: &StaticKeys) -> JoinRequest {
         JoinRequest {
             network_id: self.network_id.clone(),
-            node_id: self.node_id,
+            name: self.name.clone(),
             secret: self.secret.clone(),
             pubkey: keys.public_b64(),
             role: self.role,

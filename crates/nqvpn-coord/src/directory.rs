@@ -260,13 +260,13 @@ impl Directory {
 pub fn relay_endpoints(cfg: &NetworkConfig, reg: &Registry) -> Vec<RelayEndpoint> {
     let mut out = Vec::new();
     for (name, m) in &cfg.relays {
-        let Some(rec) = reg.members.get(&m.node_id) else { continue };
+        let Some(rec) = reg.by_name(name) else { continue };
         if rec.disabled || rec.role != Role::Relay {
             continue;
         }
         if let (Some(fp), Some(addr)) = (&rec.cert_fp, &m.relay_addr) {
             out.push(RelayEndpoint {
-                relay_id: m.node_id,
+                relay_id: rec.node_id,
                 name: name.clone(),
                 addr: addr.clone(),
                 cert_fp: fp.clone(),
@@ -291,15 +291,12 @@ cidrs = ["10.99.0.0/16"]
 [pools.default]
 cidr = "10.99.1.0/24"
 [relays.old]
-node_id = 1
 relay_addr = "1.2.3.4:1"
 allowed_cidrs = ["192.168.1.0/24"]
 [relays.new]
-node_id = 2
 relay_addr = "5.6.7.8:1"
 allowed_cidrs = ["192.168.1.0/24"]
 [clients.c]
-node_id = 10
 "#,
         )
         .unwrap()

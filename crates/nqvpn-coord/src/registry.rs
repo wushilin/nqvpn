@@ -155,6 +155,32 @@ impl Registry {
         false
     }
 
+    /// The record for a name, if the member ever joined.
+    pub fn by_name(&self, name: &str) -> Option<&MemberRecord> {
+        self.members.values().find(|m| m.name == name)
+    }
+
+    pub fn id_of(&self, name: &str) -> Option<NodeId> {
+        self.by_name(name).map(|m| m.node_id)
+    }
+
+    /// Get-or-create the record for a *name*. A new member gets the next
+    /// never-used id: ids are the coordinator's to assign, and a name
+    /// keeps its id for as long as the record exists.
+    pub fn member_by_name_mut(&mut self, name: &str, role: Role, now: u64) -> &mut MemberRecord {
+        let id = match self.id_of(name) {
+            Some(id) => id,
+            None => {
+                let mut id = self.next_node_id.max(1);
+                while self.members.contains_key(&id) {
+                    id += 1;
+                }
+                id
+            }
+        };
+        self.member_mut(id, name, role, now)
+    }
+
     /// Get-or-create the record for a member by its wire identity.
     pub fn member_mut(&mut self, id: NodeId, name: &str, role: Role, now: u64) -> &mut MemberRecord {
         let rec = self.members.entry(id).or_insert_with(|| MemberRecord {
@@ -252,6 +278,19 @@ mod tests {
         // A restart one millisecond later must not reuse anything.
         assert!(r.initial_gen(1_000_001) > busy);
         assert!(r.initial_gen(1_000_001) >= r.gen_hwm);
+    }
+
+    #[test]
+    fn names_get_assigned_ids_that_are_never_reused() {
+        let mut r = Registry::new();
+        let a = r.member_by_name_mut("a", Role::Client, 1).node_id;
+        let b = r.member_by_name_mut("b", Role::Client, 1).node_id;
+        assert!(a != 0 && b != 0 && a != b);
+        assert_eq!(r.member_by_name_mut("a", Role::Client, 2).node_id, a, "a name keeps its id");
+        assert_eq!(r.id_of("b"), Some(b));
+        r.members.remove(&a);
+        let c = r.member_by_name_mut("c", Role::Client, 5).node_id;
+        assert!(c > b && c != a, "removed ids are not recycled");
     }
 
     #[test]

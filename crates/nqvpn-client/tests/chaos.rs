@@ -42,10 +42,10 @@ fn net_toml(relays: &[(NodeId, u16)], clients: &[NodeId]) -> String {
          [settings]\nheartbeat_secs = 1\noffline_after = 3\nhold_down_secs = 0\nallow_loopback_relays = true\ntransport = \"datagram\"\n"
     );
     for (id, p) in relays {
-        s.push_str(&format!("[relays.r{id}]\nnode_id = {id}\nsecret = \"{SECRET}\"\nrelay_addr = \"127.0.0.1:{p}\"\n"));
+        s.push_str(&format!("[relays.r{id}]\nsecret = \"{SECRET}\"\nrelay_addr = \"127.0.0.1:{p}\"\n"));
     }
     for id in clients {
-        s.push_str(&format!("[clients.c{id}]\nnode_id = {id}\nsecret = \"{SECRET}\"\n"));
+        s.push_str(&format!("[clients.c{id}]\nsecret = \"{SECRET}\"\n"));
     }
     s
 }
@@ -135,10 +135,14 @@ impl Coord {
 }
 
 fn member(coord_url: &str, node_id: NodeId, role: Role, relay_addr: Option<String>) -> Arc<MemberConfig> {
+    let name = match role {
+        Role::Relay => format!("r{node_id}"),
+        Role::Client => format!("c{node_id}"),
+    };
     Arc::new(MemberConfig {
         coordinator: coord_url.to_string(),
         network_id: NET.into(),
-        node_id,
+        name,
         secret: SECRET.into(),
         tls: nqvpn_proto::joinapi::JoinTls::default(),
         role,
@@ -157,6 +161,7 @@ async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> J
 
 struct RelayHandle {
     net: Arc<RelayNet>,
+    node_id: NodeId,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     sync: Option<tokio::task::JoinHandle<()>>,
     endpoint: quinn::Endpoint,
@@ -184,6 +189,7 @@ impl RelayHandle {
         )
         .unwrap();
         let joined = join(&cfg, &identity, &keys).await;
+        let node_id = joined.node_id;
         let net = RelayNet::new(NET.into(), joined.network_uuid.clone(), node_id, identity.clone(), joined.credential.clone(), Mode::parse(&joined.transport), 1, 0, 1);
         net.set_signing_keys(&joined.coordinator_signing_keys);
         let mut nets = HashMap::new();
@@ -192,7 +198,7 @@ impl RelayHandle {
             tokio::spawn(Arc::new(Fleet { nets }).accept_loop(endpoint.clone())),
             nqvpn_sync::spawn_reconciler(net.view.clone(), Arc::new(NetReconciler(net.clone())), Duration::from_secs(1)),
         ];
-        let mut h = RelayHandle { net, tasks, sync: None, endpoint, cfg, identity, keys };
+        let mut h = RelayHandle { net, node_id, tasks, sync: None, endpoint, cfg, identity, keys };
         h.start_sync(joined);
         h
     }
@@ -264,6 +270,7 @@ impl ClientHandle {
             tokio::spawn(client.clone().run_uplink()),
         ];
         let ip4 = joined.ip4.expect("address");
+        let node_id = joined.node_id;
         let mut h = ClientHandle { client, tun, ip4, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
         h.start_sync(joined);
         h
@@ -410,7 +417,7 @@ async fn four_clients_across_two_relays_all_reach_each_other() -> Result<()> {
         clients.iter().all(|c| w.coord().attachment_of(c.node_id) == c.attached_to() && c.attached_to().is_some())
     })
     .await?;
-    wait_until("mesh formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![2] && r2.net.mesh_peers() == vec![1]).await?;
+    wait_until("mesh formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![r2.node_id] && r2.net.mesh_peers() == vec![r1.node_id]).await?;
     Ok(())
 }
 
@@ -425,7 +432,7 @@ async fn a_relay_crash_moves_its_clients_and_traffic_resumes() -> Result<()> {
 
     // Kill whichever relay `a` is on.
     let dead = a.attached_to().expect("attached");
-    if dead == 1 {
+    if dead == r1.node_id {
         r1.kill();
         std::mem::forget(r2);
     } else {
@@ -435,7 +442,7 @@ async fn a_relay_crash_moves_its_clients_and_traffic_resumes() -> Result<()> {
     wait_until("clients leave the dead relay", Duration::from_secs(30), || a.attached_to() != Some(dead) && b.attached_to() != Some(dead)).await?;
     all_pairs_reach(&[&a, &b], Duration::from_secs(30)).await?;
     wait_until("coordinator sees the new attachments", Duration::from_secs(10), || {
-        w.coord().attachment_of(10) == a.attached_to() && w.coord().attachment_of(20) == b.attached_to()
+        w.coord().attachment_of(a.node_id) == a.attached_to() && w.coord().attachment_of(b.node_id) == b.attached_to()
     })
     .await?;
     Ok(())
@@ -451,16 +458,16 @@ async fn a_client_that_loses_its_coordinator_link_keeps_forwarding_both_ways() -
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
 
     a.cut_control();
-    wait_until("coordinator marks a offline", Duration::from_secs(15), || !w.coord().online(10)).await?;
+    wait_until("coordinator marks a offline", Duration::from_secs(15), || !w.coord().online(a.node_id)).await?;
     // The scenario that used to end in permanent one-way traffic.
     for _ in 0..3 {
         assert!(ping(&a, &b, Duration::from_secs(5)).await, "a -> b while a's control link is down");
         assert!(ping(&b, &a, Duration::from_secs(5)).await, "b -> a while a's control link is down");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert_eq!(w.coord().attachment_of(10), a.attached_to(), "the relay's declaration outlives the client's lease");
+    assert_eq!(w.coord().attachment_of(a.node_id), a.attached_to(), "the relay's declaration outlives the client's lease");
     a.restore_control().await;
-    wait_until("a is back online", Duration::from_secs(15), || w.coord().online(10)).await?;
+    wait_until("a is back online", Duration::from_secs(15), || w.coord().online(a.node_id)).await?;
     all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
     Ok(())
 }
@@ -478,15 +485,15 @@ async fn relays_that_lose_their_coordinator_link_keep_forwarding() -> Result<()>
     // from the data plane at all.
     r1.cut_control();
     r2.cut_control();
-    wait_until("coordinator marks both relays offline", Duration::from_secs(15), || !w.coord().online(1) && !w.coord().online(2)).await?;
+    wait_until("coordinator marks both relays offline", Duration::from_secs(15), || !w.coord().online(r1.node_id) && !w.coord().online(r2.node_id)).await?;
     for _ in 0..3 {
         all_pairs_reach(&[&a, &b], Duration::from_secs(5)).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(w.coord().attachment_of(10).is_some(), "attachments survive a relay's lease expiring");
+    assert!(w.coord().attachment_of(a.node_id).is_some(), "attachments survive a relay's lease expiring");
     r1.restore_control().await;
     r2.restore_control().await;
-    wait_until("relays back online", Duration::from_secs(15), || w.coord().online(1) && w.coord().online(2)).await?;
+    wait_until("relays back online", Duration::from_secs(15), || w.coord().online(r1.node_id) && w.coord().online(r2.node_id)).await?;
     all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
     Ok(())
 }
@@ -494,8 +501,8 @@ async fn relays_that_lose_their_coordinator_link_keep_forwarding() -> Result<()>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_coordinator_restart_never_interrupts_traffic() -> Result<()> {
     let (mut w, rp) = World::new(&[1, 2], &[10, 20]).await;
-    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
-    let _r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
     let a = ClientHandle::start(&w.url(), 10).await;
     let b = ClientHandle::start(&w.url(), 20).await;
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
@@ -509,8 +516,8 @@ async fn a_coordinator_restart_never_interrupts_traffic() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     wait_until("everyone re-registered with the new coordinator", Duration::from_secs(30), || {
-        w.coord().online(1) && w.coord().online(2) && w.coord().online(10) && w.coord().online(20)
-            && w.coord().attachment_of(10).is_some() && w.coord().attachment_of(20).is_some()
+        w.coord().online(r1.node_id) && w.coord().online(r2.node_id) && w.coord().online(a.node_id) && w.coord().online(b.node_id)
+            && w.coord().attachment_of(a.node_id).is_some() && w.coord().attachment_of(b.node_id).is_some()
     })
     .await?;
     assert!(w.coord().gen() > gen_before, "generations never go backwards across a restart");
@@ -557,9 +564,9 @@ async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
     let ends_before = a.uplink_ends();
     {
         let mut ns = w.coord().state.networks[NET].lock().unwrap();
-        ns.registry.members.get_mut(&10).unwrap().disabled = true;
-        ns.close_session(10, "disabled");
-        ns.leases.remove(10);
+        ns.registry.members.get_mut(&a.node_id).unwrap().disabled = true;
+        ns.close_session(a.node_id, "disabled");
+        ns.leases.remove(a.node_id);
         w.coord().state.publish(&mut ns);
     }
     wait_until("a loses its uplink", Duration::from_secs(15), || a.uplink_ends() > ends_before).await?;
@@ -593,6 +600,6 @@ async fn relay_flapping_converges() -> Result<()> {
     })
     .await?;
     let r1 = r1.take().unwrap();
-    wait_until("mesh re-formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![2]).await?;
+    wait_until("mesh re-formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![_r2.node_id]).await?;
     Ok(())
 }

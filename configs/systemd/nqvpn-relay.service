@@ -7,11 +7,11 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/nqvpn-relay --config /etc/nqvpn/relay.toml
 Restart=always
 RestartSec=2
-# A member that is kicked out — replaced by a newer join under the same
-# name (exit 3) or refused for good by the coordinator (exit 4) — must not
-# be restarted blindly: it would only take the identity back or hammer the
-# coordinator. Everything else (crash, network loss) is restarted.
-RestartPreventExitStatus=3 4
+# A member replaced by a newer join under the same name exits with 3 and
+# must not be restarted blindly: it would only take the identity back.
+# Everything else (crash, network loss; a disabled member keeps retrying
+# on its own) is restarted.
+RestartPreventExitStatus=3
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=true

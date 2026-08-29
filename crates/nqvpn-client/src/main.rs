@@ -63,17 +63,14 @@ async fn run(cli: Cli) -> Result<i32> {
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
-    let joined = match nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::error!("not joining: {e}");
-            return Ok(nqvpn_sync::EXIT_REFUSED);
-        }
-    };
-    if joined.role != nqvpn_proto::types::Role::Client {
-        tracing::error!(network = %joined.network_id, name = %joined.name, "this token belongs to a {} member, not a client", joined.role);
-        return Ok(nqvpn_sync::EXIT_REFUSED);
-    }
+    let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
+    anyhow::ensure!(
+        joined.role == nqvpn_proto::types::Role::Client,
+        "this token belongs to {} ({}), a {} member, not a client",
+        joined.name,
+        joined.network_id,
+        joined.role
+    );
     tracing::info!(node_id = joined.node_id, name = %joined.name, ip4 = ?joined.ip4, relays = joined.relays.len(), "joined {}", joined.network_id);
 
     let _guard = if cli.dry_run {
@@ -146,16 +143,10 @@ async fn run(cli: Cli) -> Result<i32> {
 }
 
 fn report_exit(exit: &nqvpn_sync::MemberExit) {
-    match exit {
-        nqvpn_sync::MemberExit::Replaced(reason) => tracing::error!(
-            %reason,
-            "another instance joined as this node; exiting with code {} and not re-joining. If that was not you, rotate this member's secret at the coordinator.",
-            exit.exit_code()
-        ),
-        nqvpn_sync::MemberExit::Refused(reason) => tracing::error!(
-            %reason,
-            "the coordinator refused this node; exiting with code {}. Fix it at the coordinator and restart.",
-            exit.exit_code()
-        ),
-    }
+    let nqvpn_sync::MemberExit::Replaced(reason) = exit;
+    tracing::error!(
+        %reason,
+        "another instance joined as this node; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
+        exit.exit_code()
+    );
 }

@@ -100,17 +100,14 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
     let mut guards = Vec::new();
     for (i, ncfg) in cfg.networks.iter().enumerate() {
         let member = Arc::new(MemberConfig::from_token(&ncfg.token()?, cfg.tls()));
-        let joined = match nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(token = i, "not joining: {e}");
-                return Ok(nqvpn_sync::EXIT_REFUSED);
-            }
-        };
-        if joined.role != Role::Relay {
-            tracing::error!(network = %joined.network_id, name = %joined.name, "this token belongs to a {} member, not a relay", joined.role);
-            return Ok(nqvpn_sync::EXIT_REFUSED);
-        }
+        let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
+        anyhow::ensure!(
+            joined.role == Role::Relay,
+            "token {i} belongs to {} ({}), a {} member, not a relay",
+            joined.name,
+            joined.network_id,
+            joined.role
+        );
         let network_id = joined.network_id.clone();
         tracing::info!(network = %network_id, name = %joined.name, node_id = joined.node_id, relay_addr = ?joined.relay_addr, relays = joined.relays.len(), "joined");
         if let Some(addr) = &joined.relay_addr {
@@ -220,20 +217,13 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
     let _guards = guards;
     match exit_rx.recv().await {
         Some((network, exit)) => {
-            match &exit {
-                nqvpn_sync::MemberExit::Replaced(reason) => tracing::error!(
-                    %network,
-                    %reason,
-                    "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, rotate this member's secret at the coordinator.",
-                    exit.exit_code()
-                ),
-                nqvpn_sync::MemberExit::Refused(reason) => tracing::error!(
-                    %network,
-                    %reason,
-                    "the coordinator refused this relay; exiting with code {}. Fix it at the coordinator and restart.",
-                    exit.exit_code()
-                ),
-            }
+            let nqvpn_sync::MemberExit::Replaced(reason) = &exit;
+            tracing::error!(
+                %network,
+                %reason,
+                "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
+                exit.exit_code()
+            );
             Ok(exit.exit_code())
         }
         None => std::future::pending().await,

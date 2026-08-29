@@ -251,7 +251,11 @@ fn dechunk(body: &str) -> Option<String> {
 /// transient ones back off quickly.
 pub fn retry_delay(terminal: bool, consecutive: u32) -> Duration {
     if terminal {
-        return Duration::from_secs(60);
+        // Refused (disabled, deleted, token regenerated): the operator
+        // may simply enable the member again, so keep asking — 1, 2,
+        // 4, 8, 16 seconds, then every 30 s.
+        let secs = 1u64 << consecutive.clamp(1, 16).saturating_sub(1);
+        return Duration::from_secs(secs.min(30));
     }
     // Tight: a member that lost its coordinator is back within seconds
     // of the coordinator being back. 1, 2, 4, 5, 5, ...
@@ -300,9 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_condition_keeps_retrying_slowly() {
-        assert_eq!(retry_delay(true, 0), Duration::from_secs(60));
-        assert_eq!(retry_delay(true, 50), Duration::from_secs(60));
+    fn a_refusal_backs_off_exponentially_and_never_gives_up() {
+        assert_eq!(retry_delay(true, 1), Duration::from_secs(1));
+        assert_eq!(retry_delay(true, 2), Duration::from_secs(2));
+        assert_eq!(retry_delay(true, 5), Duration::from_secs(16));
+        assert_eq!(retry_delay(true, 6), Duration::from_secs(30));
+        assert_eq!(retry_delay(true, u32::MAX), Duration::from_secs(30));
     }
 
     #[test]

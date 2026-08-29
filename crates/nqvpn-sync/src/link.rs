@@ -129,17 +129,18 @@ pub struct Stop(pub MemberExit);
 
 impl std::fmt::Display for Stop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            MemberExit::Replaced(r) => write!(f, "replaced: {r}"),
-            MemberExit::Refused(r) => write!(f, "refused: {r}"),
-        }
+        let MemberExit::Replaced(r) = &self.0;
+        write!(f, "replaced: {r}")
     }
 }
 
 impl std::error::Error for Stop {}
 
-/// Why `run_member` returned. It returns only when this instance has
-/// been kicked out; anything else is retried forever.
+/// Why `run_member` returned. It returns for exactly one reason;
+/// everything else — a lost coordinator, a disabled member, a
+/// regenerated token — is retried forever with backoff, so that the
+/// operator's next decision at the coordinator takes effect without
+/// anyone touching the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberExit {
     /// Another instance holds this member's identity now. Re-joining
@@ -148,32 +149,22 @@ pub enum MemberExit {
     /// join was not the operator's doing, the secret has leaked and
     /// must be rotated.
     Replaced(String),
-    /// The coordinator rejected this member for good: disabled,
-    /// deleted, or a secret that no longer matches. Exit with
-    /// `EXIT_REFUSED`; an operator fixes it at the coordinator and
-    /// restarts.
-    Refused(String),
 }
 
 impl MemberExit {
     pub fn exit_code(&self) -> i32 {
-        match self {
-            MemberExit::Replaced(_) => EXIT_REPLACED,
-            MemberExit::Refused(_) => EXIT_REFUSED,
-        }
+        EXIT_REPLACED
     }
 
     pub fn reason(&self) -> &str {
-        match self {
-            MemberExit::Replaced(r) | MemberExit::Refused(r) => r,
-        }
+        let MemberExit::Replaced(r) = self;
+        r
     }
 }
 
-/// Process exit codes for `MemberExit`. A supervisor can keep a kicked
-/// instance down (`RestartPreventExitStatus=3 4` in systemd).
+/// Process exit code for `MemberExit::Replaced`. A supervisor should
+/// keep a replaced instance down (`RestartPreventExitStatus=3`).
 pub const EXIT_REPLACED: i32 = 3;
-pub const EXIT_REFUSED: i32 = 4;
 
 impl LinkHandle {
     /// Another instance holds this member's identity: the coordinator
@@ -183,18 +174,11 @@ impl LinkHandle {
         self.stop(MemberExit::Replaced(reason));
     }
 
-    /// The coordinator turned this member away for good.
-    pub fn refused(&self, reason: String) {
-        self.stop(MemberExit::Refused(reason));
-    }
-
     pub fn stop(&self, exit: MemberExit) {
         let mut r = self.stop.lock().unwrap();
         if r.is_none() {
-            match &exit {
-                MemberExit::Replaced(reason) => tracing::error!(%reason, "this node was replaced by another instance"),
-                MemberExit::Refused(reason) => tracing::error!(%reason, "this node was refused by the coordinator"),
-            }
+            let MemberExit::Replaced(reason) = &exit;
+            tracing::error!(%reason, "this node was replaced by another instance");
             *r = Some(exit);
         }
         self.stop_notify.notify_one();
@@ -335,7 +319,7 @@ pub async fn run_session(
                 }
             },
             _ = handle.stop_notify.notified() => {
-                let exit = handle.stop_reason().unwrap_or(MemberExit::Refused("stopped".into()));
+                let exit = handle.stop_reason().unwrap_or(MemberExit::Replaced("stopped".into()));
                 break Err(Stop(exit).into());
             }
         };
@@ -409,13 +393,7 @@ pub async fn run_member(
                 if handle.stop_reason().is_some() {
                     return;
                 }
-                let r = match join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        handle.refused(e.to_string());
-                        return;
-                    }
-                };
+                let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
                 wait = renew_after(&r.credential);
                 *credential.lock().unwrap() = r.credential.clone();
                 if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
@@ -476,14 +454,7 @@ pub async fn run_member(
         if let Some(exit) = handle.stop_reason() {
             return exit;
         }
-        let r = match join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
-                let exit = MemberExit::Refused(e.to_string());
-                handle.stop(exit.clone());
-                return exit;
-            }
-        };
+        let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
         *credential.lock().unwrap() = r.credential.clone();
         if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
             *control_addr.lock().unwrap() = a;

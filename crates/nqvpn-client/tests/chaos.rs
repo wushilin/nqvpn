@@ -162,7 +162,7 @@ fn member(coord_url: &str, node_id: NodeId, role: Role) -> Arc<MemberConfig> {
 }
 
 async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
-    nqvpn_sync::join_with_backoff_async(cfg.clone(), id.clone(), keys.clone()).await.expect("join accepted")
+    nqvpn_sync::join_with_backoff_async(cfg.clone(), id.clone(), keys.clone()).await
 }
 
 struct RelayHandle {
@@ -639,10 +639,14 @@ async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!ping(&a, &b, Duration::from_secs(3)).await, "disabled member must not reach anyone");
     assert!(!ping(&b, &a, Duration::from_secs(3)).await, "nor be reachable");
-    // Kicked out for good: its re-join is refused and it stops (a real
-    // process exits with EXIT_REFUSED) instead of polling forever.
-    wait_until("the disabled instance stops", Duration::from_secs(20), || matches!(a.stop_reason(), Some(MemberExit::Refused(_)))).await?;
-    wait_until("and its control loop returns", Duration::from_secs(5), || a.control_finished()).await?;
+    // Disable is a lever, not a kill switch: the instance keeps asking
+    // (with backoff) and never stops on its own...
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(a.stop_reason().is_none() && !a.control_finished(), "a disabled member keeps retrying");
+    // ...so enabling it again brings it back without anyone touching it.
+    w.coord().state.set_disabled(NET, "c10", false).unwrap();
+    wait_until("a re-joins and re-attaches", Duration::from_secs(45), || a.attached_to().is_some()).await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
     Ok(())
 }
 

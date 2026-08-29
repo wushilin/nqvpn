@@ -35,29 +35,26 @@ pub fn join_once(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) 
     joinapi::join(&cfg.coordinator, &cfg.request(identity, keys), &cfg.tls)
 }
 
-/// Join, retrying until it succeeds or the coordinator says it never
-/// will. Transient failures (unreachable, 5xx, rate limited) retry
-/// tightly and forever: a member with a valid identity connects
-/// eventually, as long as the coordinator comes back. A terminal
-/// rejection — disabled, unknown, wrong secret — is returned: the
-/// member has been kicked out and must stop trying (retrying can only
-/// hammer the coordinator, or, after a replacement, fight the newer
-/// instance). Blocking: call from `spawn_blocking`.
-pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) -> Result<JoinResponse, JoinError> {
-    let mut consecutive: u32 = 0;
+/// Join, retrying until it succeeds. Never returns an error.
+///
+/// Transient failures (unreachable, 5xx, rate limited) retry tightly:
+/// a member with a valid token connects within seconds of the
+/// coordinator being back. A refusal — the member is disabled or
+/// deleted, or its token was regenerated — is an operator's decision
+/// that can be reversed at the coordinator, so it is retried too, with
+/// exponential backoff (1 s … 30 s) and one clear log line per
+/// attempt saying what was refused and when the next try is. Only a
+/// *replacement* ends a member, and that is decided on the control
+/// link, not here. Blocking: call from `spawn_blocking`.
+pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
+    let mut state = Retry::default();
     loop {
         match join_once(cfg, identity, keys) {
-            Ok(r) => return Ok(r),
-            Err(e) if e.is_terminal() => {
-                tracing::error!("join rejected: {e} — this instance stops; fix it at the coordinator and restart");
-                return Err(e);
+            Ok(r) => {
+                state.accepted();
+                return r;
             }
-            Err(e) => {
-                consecutive = consecutive.saturating_add(1);
-                let wait = joinapi::retry_delay(false, consecutive);
-                tracing::warn!("join failed ({e}); retrying in {wait:?}");
-                std::thread::sleep(wait);
-            }
+            Err(e) => std::thread::sleep(state.failed(&e)),
         }
     }
 }
@@ -66,29 +63,58 @@ pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &Stat
 /// cancelled between attempts (a blocking sleep in a `spawn_blocking`
 /// would pin the runtime's shutdown). Every attempt itself runs on the
 /// blocking pool.
-pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> Result<JoinResponse, JoinError> {
-    let mut consecutive: u32 = 0;
+pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> JoinResponse {
+    let mut state = Retry::default();
     loop {
         let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
-        let attempt = tokio::task::spawn_blocking(move || join_once(&c, &i, &k)).await;
-        let wait = match attempt {
-            Ok(Ok(r)) => return Ok(r),
-            Ok(Err(e)) if e.is_terminal() => {
-                tracing::error!("join rejected: {e} — this instance stops; fix it at the coordinator and restart");
-                return Err(e);
+        let wait = match tokio::task::spawn_blocking(move || join_once(&c, &i, &k)).await {
+            Ok(Ok(r)) => {
+                state.accepted();
+                return r;
             }
-            Ok(Err(e)) => {
-                consecutive = consecutive.saturating_add(1);
-                let wait = joinapi::retry_delay(false, consecutive);
-                tracing::warn!("join failed ({e}); retrying in {wait:?}");
-                wait
-            }
+            Ok(Err(e)) => state.failed(&e),
             Err(e) => {
                 tracing::error!("join task failed: {e}");
                 Duration::from_secs(5)
             }
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// The retry bookkeeping both loops share: counts, delays, and the log
+/// lines an operator needs to see what is happening and why.
+#[derive(Default)]
+struct Retry {
+    transient: u32,
+    refused: u32,
+}
+
+impl Retry {
+    fn failed(&mut self, e: &JoinError) -> Duration {
+        if e.is_terminal() {
+            self.refused = self.refused.saturating_add(1);
+            let wait = joinapi::retry_delay(true, self.refused);
+            tracing::error!(
+                attempt = self.refused,
+                next_retry_secs = wait.as_secs(),
+                "join refused: {e} — keeping trying; enable the member (or give it its new token) at the coordinator"
+            );
+            wait
+        } else {
+            self.transient = self.transient.saturating_add(1);
+            let wait = joinapi::retry_delay(false, self.transient);
+            tracing::warn!(attempt = self.transient, next_retry_secs = wait.as_secs(), "join failed: {e}");
+            wait
+        }
+    }
+
+    fn accepted(&self) {
+        if self.refused > 0 {
+            tracing::info!(refused_attempts = self.refused, "join accepted again — the member is back");
+        } else if self.transient > 0 {
+            tracing::info!(failed_attempts = self.transient, "join accepted");
+        }
     }
 }
 

@@ -202,7 +202,7 @@ impl Client {
         let mut failures: u32 = 0;
         loop {
             if self.link.stop_reason().is_some() {
-                // Kicked out (replaced or refused): the process exits.
+                // Replaced by another instance: the process exits.
                 return;
             }
             let candidates: Vec<RelayEntry> = self.view.with(|s| {

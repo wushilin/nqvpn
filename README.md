@@ -122,18 +122,22 @@ Three rules, each with a chaos test behind it:
    control-link retries are tight (1, 2, 4, 5, 5 … seconds, never longer),
    and a lost session is simply re-established — the view is kept, and the
    coordinator sends only what changed.
-2. **A kicked-out member stops.** If the coordinator turns a member away for
-   good — **replaced** by a newer join under the same name, **disabled**,
-   deleted, or a secret that no longer matches — the process learns the
-   reason, stops retrying and exits: `3` when replaced, `4` when refused.
-   It does *not* re-join: a re-join would win (last join wins, by design)
-   and the two instances would take turns replacing each other forever. A
-   replacement that was not your doing means the secret leaked — the
-   coordinator records where the replacing join came from — so rotate it.
-   Relays tell stale instances the same on the data plane, so a client
+2. **Disable is a lever; only replacement ends a member.** A member the
+   coordinator refuses — **disabled**, deleted, or holding a regenerated
+   token — is thrown off at once and keeps asking to come back with
+   exponential backoff (1, 2, 4, 8, 16, then every 30 s), one clear log
+   line per attempt.
+   Enable it again and it is back within the next retry, without anyone
+   touching the machine. The one thing a member never retries is being
+   **replaced** by a newer join under its own name: a re-join would win
+   (last join wins, by design) and the two instances would take turns
+   forever, so the process learns the reason, stops and exits with code
+   `3`. A replacement that was not your doing means the token leaked — the
+   coordinator records where the replacing join came from — so regenerate
+   it. Relays tell stale instances the same on the data plane, so a client
    whose coordinator link is down still finds out from its relay.
-   Supervisors should not restart these exit codes blindly
-   (`RestartPreventExitStatus=3 4`; see `configs/systemd/`).
+   Supervisors should not restart exit code `3` blindly
+   (`RestartPreventExitStatus=3`; see `configs/systemd/`).
 3. **A preferred relay is a preference.** A client may name a relay; it
    attaches there whenever the relay is reachable, falls back to the
    lowest-RTT relay when it is not (or does not exist), and moves back on

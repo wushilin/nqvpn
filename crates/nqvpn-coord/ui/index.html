@@ -554,7 +554,7 @@ function memberRow(st, m) {
   del.onclick = () => confirmModal({
     title: 'Delete ' + m.name + '?', sub: net,
     lead: 'This forgets the member completely: its token stops working, its address is released, and any routes it owns are withdrawn. Use Disable to keep it out but keep its record.',
-    details: [ m.online ? 'It is ONLINE now: its sessions are closed and the process stops (exit 4)' : 'It is offline',
+    details: [ m.online ? 'It is ONLINE now: its sessions are closed; it keeps retrying with backoff until it is enabled again or deleted' : 'It is offline',
       'Address ' + (addrOf(m) || 'none') + ' is released', (m.registered_cidrs || []).length ? 'Routes ' + m.registered_cidrs.join(', ') + ' fail over to the next registrant' : 'It owns no routes' ],
     danger: 'Delete member',
     onConfirm: async () => { await api(memberPath(net, m.name), { method: 'DELETE' }); msg(`Deleted ${m.name}`); },
@@ -652,7 +652,7 @@ function paintToken(body, r, fresh) {
   copy.onclick = async () => { try { await navigator.clipboard.writeText(r.token); copy.textContent = 'Copied'; } catch { const s = window.getSelection(); s.removeAllRanges(); const rg = document.createRange(); rg.selectNodeContents(box); s.addRange(rg); } };
   const regen = el('button', 'danger', 'Regenerate');
   regen.onclick = () => confirmModal({ title: 'Regenerate the token for ' + r.name + '?', sub: r.network_id,
-    lead: 'A new token is issued and the current one stops working immediately. Whoever holds the old one is thrown off the network and its process stops (exit 4).',
+    lead: 'A new token is issued and the current one stops working immediately. Whoever holds the old one is thrown off the network and keeps failing to re-join until it gets the new token.',
     details: ['Do this when a token may have leaked, or when a machine was replaced without your doing', 'Put the new token on the machine and restart it'],
     danger: 'Regenerate token',
     onConfirm: async () => { const n = await api(memberPath(r.network_id, r.name) + '/token', { method: 'POST' }); paintToken(openModal(n.name, n.network_id + ' · new token'), n, true); return true; } });

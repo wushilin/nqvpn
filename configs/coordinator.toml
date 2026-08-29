@@ -1,5 +1,6 @@
 [listen]
-api = "127.0.0.1:18443"
+api = "127.0.0.1:18443"     # HTTPS: /api/v1/* and /ui (self-signed unless [tls] is set)
+quic = "0.0.0.0:14433"      # QUIC control plane; published to members at join
 
 [state]
 dir = "./state"

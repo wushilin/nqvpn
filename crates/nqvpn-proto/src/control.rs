@@ -214,9 +214,14 @@ impl Snapshot {
         }
     }
 
-    /// Apply a delta in place. Refuses one that is not based on exactly
-    /// the generation held — the caller then resyncs; it never guesses.
+    /// Apply a delta in place. A delta up to a generation already held is
+    /// a harmless duplicate (a catch-up can race a push already queued);
+    /// one not based on exactly the generation held is a gap — the
+    /// caller then resyncs; it never guesses.
     pub fn apply(&mut self, d: &Delta) -> Result<(), GenerationGap> {
+        if d.gen <= self.gen {
+            return Ok(());
+        }
         if d.base_gen != self.gen {
             return Err(GenerationGap { base: d.base_gen, have: self.gen });
         }
@@ -420,6 +425,22 @@ mod tests {
         assert_eq!(s.apply(&d), Err(GenerationGap { base: 4, have: 5 }));
         assert_eq!(s.gen, 5, "nothing applied");
         assert_eq!(s, snap(5));
+    }
+
+    #[test]
+    fn a_duplicate_or_older_delta_is_a_no_op() {
+        let old = snap(1);
+        let mut new = snap(2);
+        new.members[0].online = false;
+        new.normalize();
+        let d = old.diff(&new);
+        let mut s = old.clone();
+        s.apply(&d).unwrap();
+        s.apply(&d).unwrap();
+        assert_eq!(s, new, "applying twice changes nothing");
+        let stale = Delta { base_gen: 0, gen: 1, ..Default::default() };
+        s.apply(&stale).unwrap();
+        assert_eq!(s.gen, 2);
     }
 
     #[test]

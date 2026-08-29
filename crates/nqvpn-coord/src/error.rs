@@ -22,14 +22,7 @@ impl ApiError {
     }
 
     pub fn bad_credentials() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, ErrorCode::BadCredentials, "unknown member or wrong secret")
-    }
-    pub fn pin_mismatch() -> Self {
-        Self::new(
-            StatusCode::FORBIDDEN,
-            ErrorCode::PinMismatch,
-            "presented key does not match the pinned identity; admin pin reset required",
-        )
+        Self::new(StatusCode::UNAUTHORIZED, ErrorCode::BadCredentials, "unknown node id or wrong secret")
     }
     pub fn client_disabled() -> Self {
         Self::new(StatusCode::FORBIDDEN, ErrorCode::ClientDisabled, "member is administratively disabled")

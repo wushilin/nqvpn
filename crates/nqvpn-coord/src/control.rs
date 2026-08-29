@@ -1,10 +1,15 @@
-//! Coordinator QUIC control plane (§3.2): the persistent two-way push
-//! channel every member holds. Mutual TLS + credential verification at
-//! `Hello`, then revisioned membership snapshots and deltas downstream,
-//! `Attach`/`Refresh`/`Ping` upstream.
+//! Coordinator QUIC control plane (§3.2): the persistent two-way channel
+//! every member holds. Mutual TLS + credential verification at `Hello`,
+//! then a generation-numbered view downstream and heartbeats upstream.
 //!
-//! No polling anywhere: the coordinator writes deltas to live sessions
-//! the moment state changes.
+//! Push for speed, generation for continuity, heartbeat for safety:
+//!  * every change is pushed as a delta the moment it happens;
+//!  * a member applies a delta only onto exactly the generation it
+//!    holds, otherwise it asks for a snapshot;
+//!  * every heartbeat says which generation the member holds and a
+//!    digest of it, so a member that missed a push is caught up within
+//!    one heartbeat, and one that disagrees at the same generation is
+//!    logged as the bug it is and resynced.
 
 use anyhow::{anyhow, Context, Result};
 use nqvpn_proto::control::*;
@@ -19,14 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::state::{now_unix, AppState, ISS};
+use crate::state::{now_ms, now_unix, AppState, NetState, ISS};
 
-/// Peers per membership snapshot chunk (§3.2: chunked well below the
-/// 1 MiB envelope cap).
-const SNAPSHOT_CHUNK: usize = 256;
 /// Bounded per-session push queue: a stalled member must not grow the
-/// coordinator's memory. Overflow closes that session; it re-syncs with
-/// a fresh snapshot on reconnect.
+/// coordinator's memory. Overflow closes that session; it reconnects and
+/// catches up from its generation.
 const PUSH_QUEUE: usize = 256;
 
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -34,49 +36,42 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 /// What a session's writer task can be asked to send.
 #[derive(Debug, Clone)]
 pub enum Push {
-    Membership(MembershipDelta),
-    Relays(RelayList),
-    Mtu(NetworkMtu),
-    Attachment(AttachmentDelta),
-    Keys(KeySet),
-    /// An already-encoded envelope, written verbatim. The RPC layer
-    /// produces these; routing them through this writer keeps a single
-    /// owner of the send stream.
+    Delta(Delta),
+    Snapshot(Snapshot),
+    /// An already-encoded envelope (RPC responses), written verbatim.
     Raw(Vec<u8>),
     Close(String),
 }
 
 pub struct Session {
     pub id: u64,
-    pub name: String,
     pub node_id: NodeId,
     pub role: Role,
+    /// Credential expiry; refreshed by `Refresh`. The sweep closes the
+    /// session when it passes.
+    pub exp: u64,
+    pub login_gen: u64,
+    /// Whether this session holds the current view (a snapshot or a
+    /// complete delta chain was queued). Deltas are only pushed to
+    /// synced sessions; the others are caught up by their heartbeat.
+    pub synced: bool,
     pub tx: mpsc::Sender<Push>,
-    /// Held so the liveness sweep can actually tear the session down —
-    /// stopping the writer alone would leave the reader (and therefore
-    /// the member's "online" state) hanging until the QUIC idle timeout.
     pub conn: quinn::Connection,
+    pub remote: String,
 }
 
 /// Application close codes.
-const CLOSE_TIMEOUT: u32 = 1;
-const CLOSE_SUPERSEDED: u32 = 2;
-/// Closed because the peer speaks a different protocol version. Sent
-/// with a readable reason so the operator sees both versions rather than
-/// an unexplained disconnect.
-const CLOSE_VERSION: u32 = 3;
+pub const CLOSE_TIMEOUT: u32 = 1;
+pub const CLOSE_SUPERSEDED: u32 = 2;
+pub const CLOSE_VERSION: u32 = 3;
+pub const CLOSE_EVICTED: u32 = 4;
+pub const CLOSE_OVERFLOW: u32 = 5;
+pub const CLOSE_EXPIRED: u32 = 6;
 
-/// Bind the control port. Split from `serve` so tests (and future
-/// socket-activation) can learn the bound address first.
 pub fn bind(addr: SocketAddr, id: &TlsIdentity) -> Result<quinn::Endpoint> {
-    // A conservative keepalive: per-network settings drive liveness, this
-    // only keeps NAT bindings and the QUIC connection itself alive.
     let cfg = server_config(id, 15).map_err(|e| anyhow!("quic server config: {e}"))?;
     let endpoint = quinn::Endpoint::server(cfg, addr).context("binding QUIC control port")?;
-    tracing::info!(
-        addr = %endpoint.local_addr()?, fingerprint = %id.fingerprint(),
-        "QUIC control listening"
-    );
+    tracing::info!(addr = %endpoint.local_addr()?, "QUIC control listening");
     Ok(endpoint)
 }
 
@@ -103,16 +98,13 @@ pub async fn serve(state: Arc<AppState>, endpoint: quinn::Endpoint) -> Result<()
 
 async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()> {
     let remote = conn.remote_address();
-    let fp = peer_fingerprint(&conn)
-        .ok_or_else(|| anyhow!("peer presented no certificate"))?;
-
-    // One bidirectional control stream per connection.
+    let fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("peer presented no certificate"))?;
     let (mut tx, mut rx) = conn.accept_bi().await.context("accepting control stream")?;
 
-    let env = read_envelope(&mut rx).await.context("reading Hello")?;
-    // One check per session, at the first message. A mismatch means a
-    // half-finished rollout, and saying so plainly beats running two
-    // protocols against each other and desyncing somewhere less obvious.
+    // A peer that connects and never says Hello must not hold a task.
+    let env = tokio::time::timeout(std::time::Duration::from_secs(10), read_envelope(&mut rx))
+        .await
+        .context("waiting for Hello")??;
     if let Err(e) = nqvpn_proto::envelope::check_version(env.major, env.minor) {
         tracing::warn!(%remote, "refusing session: {e}");
         conn.close(CLOSE_VERSION.into(), e.to_string().as_bytes());
@@ -124,32 +116,15 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
     let hello: Hello = parse(&env)?;
 
     let (claims, network_id) = verify_credential(&state, &hello.credential, &fp)?;
-    let name = claims.sub.clone();
     let node_id = claims.node_id;
     let role = claims.role;
+    let name = claims.sub.clone();
     let session_id = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
-
-    tracing::info!(
-        %remote, network = %network_id, member = %name, node_id, %role,
-        "control session authenticated"
-    );
+    tracing::info!(%remote, network = %network_id, member = %name, node_id, %role, have_gen = hello.have_gen, "control session authenticated");
 
     let (push_tx, mut push_rx) = mpsc::channel::<Push>(PUSH_QUEUE);
-
-    // RPC output is forwarded into the same push queue, so the writer
-    // task remains the only thing that touches the send stream.
     let (rpc_out, mut rpc_rx) = mpsc::channel::<Vec<u8>>(PUSH_QUEUE);
-    // The handler is bound to this session, so a verb never has to ask
-    // who is calling: mutual TLS and the verified cert_fp already
-    // established that at Hello.
-    let rpc = nqvpn_proto::rpc::RpcPeer::new(
-        rpc_out,
-        std::sync::Arc::new(crate::verbs::SessionVerbs {
-            state: state.clone(),
-            network_id: network_id.clone(),
-            member: name.clone(),
-        }),
-    );
+    let rpc = nqvpn_proto::rpc::RpcPeer::new(rpc_out, Arc::new(nqvpn_proto::rpc::NoVerbs));
     {
         let push_tx = push_tx.clone();
         tokio::spawn(async move {
@@ -161,107 +136,45 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
         });
     }
 
-    // Register the session, mark online, publish the resulting delta.
-    let (revision, snapshot, attach_snapshot, superseded, relay_list, network_mtu) = {
+    // Register: supersede any older session for this node, mark alive,
+    // publish, and decide what this session needs to be current.
+    let (superseded, gen) = {
         let net = state.networks.get(&network_id).expect("verified above");
         let mut ns = net.lock().unwrap();
         let now = now_unix();
-
         let superseded = ns.sessions.insert(
-            name.clone(),
+            node_id,
             Session {
                 id: session_id,
-                name: name.clone(),
                 node_id,
                 role,
+                exp: claims.exp,
+                login_gen: claims.login_gen,
+                synced: false,
                 tx: push_tx.clone(),
                 conn: conn.clone(),
+                remote: remote.to_string(),
             },
         );
-
-        ns.directory.set_online(&name, true, now);
-        let delta = ns.refresh_directory(now);
-        let chunks = ns.directory.snapshot_chunks(SNAPSHOT_CHUNK);
-        let rev = ns.directory.revision;
-        let attach = (role == Role::Relay).then(|| AttachmentSnapshot {
-            snapshot_rev: ns.directory.attach_revision,
-            entries: ns.directory.attachment_entries(),
-        });
-        // The joining session must NOT receive this delta: its snapshot
-        // already contains the change, and a delta whose base predates
-        // the snapshot would look like a revision gap.
-        if let Some(d) = delta {
-            broadcast_except(&ns, Push::Membership(d), &name);
+        ns.leases.seen(node_id, now_ms());
+        state.publish(&mut ns);
+        let gen = ns.directory.gen;
+        if !ns.in_grace(now) {
+            catch_up(&mut ns, node_id, hello.have_gen);
         }
-        let relays = RelayList { relays: relay_endpoints(&ns) };
-        let mtu = ns.directory.network_mtu(ns.cfg.settings.mtu);
-        (rev, chunks, attach, superseded, relays, mtu)
+        (superseded, gen)
     };
     if let Some(old) = superseded {
         let _ = old.tx.try_send(Push::Close("superseded".into()));
         old.conn.close(CLOSE_SUPERSEDED.into(), b"superseded by a newer session");
     }
 
-    // A relay that advertises an address nobody can dial joins fine and
-    // then silently fails to mesh (§3.2). Probe it now that its
-    // listener is necessarily up, and record the verdict for status.
-    if role == Role::Relay {
-        let advertised = {
-            let net = state.networks.get(&network_id).expect("verified above");
-            let ns = net.lock().unwrap();
-            ns.cfg.relays.get(&name).and_then(|m| m.relay_addr.clone())
-        };
-        if let Some(addr) = advertised {
-            let (st, netid, member) = (state.clone(), network_id.clone(), name.clone());
-            tokio::spawn(async move {
-                let verdict =
-                    crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
-                if verdict == crate::reach::Reachability::Unreachable {
-                    tracing::warn!(
-                        network = %netid, relay = %member, %addr,
-                        "advertised relay address is NOT reachable from the coordinator —                          other relays will fail to mesh with it (check the firewall and                          that relay_addr is correct)"
-                    );
-                } else {
-                    tracing::info!(relay = %member, %addr, "advertised address reachable");
-                }
-                if let Some(net) = st.networks.get(&netid) {
-                    net.lock().unwrap().directory.reachability.insert(member, verdict);
-                }
-            });
-        }
-    }
-
-    // Writer task: HelloAck, snapshot, then pushes forever.
-    let keys = state.keyring.key_infos();
     let writer = tokio::spawn(async move {
-        write_msg(&mut tx, Kind::HelloAck, &HelloAck { revision }).await?;
-        write_msg(&mut tx, Kind::KeySet, &KeySet { keys }).await?;
-        let n = snapshot.len() as u32;
-        for (i, peers) in snapshot.into_iter().enumerate() {
-            write_msg(
-                &mut tx,
-                Kind::MembershipSnapshot,
-                &MembershipSnapshot {
-                    snapshot_rev: revision,
-                    chunk_i: i as u32,
-                    chunk_n: n,
-                    peers,
-                },
-            )
-            .await?;
-        }
-        if let Some(a) = attach_snapshot {
-            write_msg(&mut tx, Kind::AttachmentSnapshot, &a).await?;
-        }
-        write_msg(&mut tx, Kind::RelayList, &relay_list).await?;
-        write_msg(&mut tx, Kind::NetworkMtu, &network_mtu).await?;
+        write_msg(&mut tx, Kind::HelloAck, &HelloAck { gen }).await?;
         while let Some(push) = push_rx.recv().await {
             match push {
-                Push::Membership(d) => write_msg(&mut tx, Kind::MembershipDelta, &d).await?,
-                Push::Attachment(d) => write_msg(&mut tx, Kind::AttachmentDelta, &d).await?,
-                Push::Keys(k) => write_msg(&mut tx, Kind::KeySet, &k).await?,
-                Push::Relays(r) => write_msg(&mut tx, Kind::RelayList, &r).await?,
-                Push::Mtu(m) => write_msg(&mut tx, Kind::NetworkMtu, &m).await?,
+                Push::Delta(d) => write_msg(&mut tx, Kind::Delta, &d).await?,
+                Push::Snapshot(s) => write_msg(&mut tx, Kind::Snapshot, &s).await?,
                 Push::Raw(bytes) => write_bytes(&mut tx, &bytes).await?,
                 Push::Close(reason) => {
                     tracing::debug!("closing session: {reason}");
@@ -272,80 +185,84 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
         Ok::<_, StreamError>(())
     });
 
-    // Reader loop: upstream messages until the member goes away.
-    let result =
-        reader_loop(&state, &network_id, &name, node_id, role, session_id, &fp, &mut rx, &rpc)
-            .await;
-    // Nothing can answer an outstanding call once the session is over.
+    let result = reader_loop(&state, &network_id, node_id, role, &fp, &mut rx, &rpc).await;
     rpc.close();
 
-    // Teardown: drop the session (unless already superseded), mark
-    // offline, withdraw its routes, and publish the delta.
+    // Teardown: drop the session (unless already superseded) and let the
+    // lease decide what that means.
     {
         let net = state.networks.get(&network_id).expect("verified above");
         let mut ns = net.lock().unwrap();
-        let still_mine = ns.sessions.get(&name).map(|s| s.id) == Some(session_id);
+        let still_mine = ns.sessions.get(&node_id).map(|s| s.id) == Some(session_id);
         if still_mine {
-            ns.sessions.remove(&name);
-            let now = now_unix();
-            ns.directory.set_online(&name, false, now);
-
-            // A relay going away detaches everyone it carried.
-            let mut attach_changed = Vec::new();
-            if role == Role::Relay {
-                let orphans: Vec<NodeId> = ns
-                    .directory
-                    .attachments
-                    .iter()
-                    .filter(|(_, r)| **r == node_id)
-                    .map(|(n, _)| *n)
-                    .collect();
-                for o in orphans {
-                    if ns.directory.set_attachment(o, None) {
-                        attach_changed.push(o);
-                    }
-                }
-            }
-            if ns.directory.set_attachment(node_id, None) {
-                attach_changed.push(node_id);
-            }
-            if !attach_changed.is_empty() {
-                let rev = ns.directory.attach_revision;
-                broadcast_relays(
-                    &ns,
-                    Push::Attachment(AttachmentDelta {
-                        base_rev: rev.saturating_sub(1),
-                        new_rev: rev,
-                        changed: vec![],
-                        detached: attach_changed,
-                    }),
-                );
-            }
-            if let Some(d) = ns.refresh_directory(now) {
-                broadcast(&ns, Push::Membership(d));
-            }
+            ns.sessions.remove(&node_id);
+            // A lost session is not proof of death; the lease expires on
+            // its own if no new session or heartbeat follows. Marking it
+            // offline immediately is what a clean close means, though,
+            // and a member that is merely reconnecting is back before
+            // anyone acts on it.
+            ns.leases.offline(node_id);
             // A member that left should stop constraining everyone else.
-            if ns.directory.reported_mtu.remove(&name).is_some() {
-                publish_mtu_if_changed(&mut ns);
-            }
-            tracing::info!(network = %network_id, member = %name, "control session closed");
+            ns.directory.reported_mtu.remove(&node_id);
+            state.publish(&mut ns);
+            tracing::info!(network = %network_id, node_id, "control session closed");
         }
     }
     writer.abort();
     result
 }
 
+/// Queue whatever brings `node`'s session from `have_gen` to current:
+/// nothing, a delta chain, or a snapshot. Marks the session synced.
+fn catch_up(ns: &mut NetState, node: NodeId, have_gen: u64) {
+    let Some(s) = ns.sessions.get_mut(&node) else { return };
+    match ns.directory.deltas_since(have_gen) {
+        Some(chain) => {
+            for d in chain {
+                if s.tx.try_send(Push::Delta(d)).is_err() {
+                    overflow(s);
+                    return;
+                }
+            }
+        }
+        None => {
+            if s.tx.try_send(Push::Snapshot(ns.directory.published.clone())).is_err() {
+                overflow(s);
+                return;
+            }
+        }
+    }
+    s.synced = true;
+}
+
+fn overflow(s: &mut Session) {
+    tracing::warn!(node_id = s.node_id, "push queue full; closing session so it resyncs");
+    s.synced = false;
+    s.conn.close(CLOSE_OVERFLOW.into(), b"push queue overflow");
+}
+
+/// Push a delta to every synced session. A session whose queue is full
+/// is closed: it reconnects and catches up from its generation.
+pub fn broadcast_delta(ns: &mut NetState, d: Delta) {
+    for s in ns.sessions.values_mut() {
+        if !s.synced {
+            continue;
+        }
+        if s.tx.try_send(Push::Delta(d.clone())).is_err() {
+            overflow(s);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reader_loop(
     state: &Arc<AppState>,
     network_id: &str,
-    name: &str,
     node_id: NodeId,
     role: Role,
-    session_id: u64,
     fp: &str,
     rx: &mut quinn::RecvStream,
-    rpc: &std::sync::Arc<nqvpn_proto::rpc::RpcPeer>,
+    rpc: &Arc<nqvpn_proto::rpc::RpcPeer>,
 ) -> Result<()> {
     loop {
         let env = match read_envelope(rx).await {
@@ -353,119 +270,82 @@ async fn reader_loop(
             Err(StreamError::Closed) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        // RPC first; it answers what it owns and leaves pushes alone.
         if rpc.on_envelope(&env) {
             continue;
         }
         match env.kind {
-            k if k == Kind::Ping as u16 => {
+            k if k == Kind::Heartbeat as u16 => {
+                let hb: Heartbeat = parse(&env)?;
                 let net = state.networks.get(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
-                ns.last_seen.insert(name.to_string(), now_unix());
-            }
-            k if k == Kind::Attach as u16 => {
-                if role != Role::Relay {
-                    anyhow::bail!("only relays may send Attach");
+                let now = now_unix();
+                ns.leases.heartbeat(node_id, role, &hb, now_ms());
+                if hb.usable_mtu > 0 {
+                    ns.directory.reported_mtu.insert(node_id, hb.usable_mtu);
                 }
-                let a: Attach = parse(&env)?;
-                let net = state.networks.get(network_id).expect("verified");
-                let mut ns = net.lock().unwrap();
-                let changed = ns
-                    .directory
-                    .set_attachment(a.node_id, a.attached.then_some(node_id));
-                if changed {
-                    let rev = ns.directory.attach_revision;
-                    let (changed_v, detached) = if a.attached {
-                        (vec![AttachmentEntry { node_id: a.node_id, relay_id: node_id }], vec![])
-                    } else {
-                        (vec![], vec![a.node_id])
-                    };
-                    broadcast_relays(
-                        &ns,
-                        Push::Attachment(AttachmentDelta {
-                            base_rev: rev.saturating_sub(1),
-                            new_rev: rev,
-                            changed: changed_v,
-                            detached,
-                        }),
+                if let Some(t) = &hb.traffic {
+                    if role == Role::Relay {
+                        ns.directory.record_traffic(node_id, t.clone(), now);
+                    }
+                }
+                state.publish(&mut ns);
+                if ns.in_grace(now) {
+                    continue;
+                }
+                let (cur, digest) = (ns.directory.gen, ns.directory.published_digest);
+                if hb.gen != cur {
+                    // Behind (a lost push, or a fresh coordinator): catch
+                    // it up now rather than at its next reconnect.
+                    catch_up(&mut ns, node_id, hb.gen);
+                } else if hb.digest != digest {
+                    tracing::error!(
+                        network = %network_id, node_id, gen = cur, theirs = hb.digest, ours = digest,
+                        "member holds a different view at the same generation — resyncing (this is a bug)"
                     );
+                    catch_up(&mut ns, node_id, 0);
                 }
             }
-            k if k == Kind::TrafficReport as u16 => {
-                if role != Role::Relay {
-                    anyhow::bail!("only relays may send TrafficReport");
-                }
-                let r: TrafficReport = parse(&env)?;
+            k if k == Kind::Resync as u16 => {
+                let r: Resync = parse(&env)?;
                 let net = state.networks.get(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
-                ns.directory.record_traffic(name, r, now_unix());
-            }
-            k if k == Kind::MtuReport as u16 => {
-                let r: MtuReport = parse(&env)?;
-                let net = state.networks.get(network_id).expect("verified");
-                let mut ns = net.lock().unwrap();
-                let changed = ns
-                    .directory
-                    .reported_mtu
-                    .insert(name.to_string(), r.usable_mtu)
-                    != Some(r.usable_mtu);
-                if changed {
-                    publish_mtu_if_changed(&mut ns);
+                if !ns.in_grace(now_unix()) {
+                    catch_up(&mut ns, node_id, r.have_gen);
                 }
             }
             k if k == Kind::Refresh as u16 => {
                 let r: Refresh = parse(&env)?;
                 let (claims, net_id) = verify_credential(state, &r.credential, fp)?;
-                // Identity continuity (§3.3): a Refresh may update
-                // authorization, never who the session belongs to.
-                if net_id != network_id
-                    || claims.sub != name
-                    || claims.node_id != node_id
-                    || claims.role != role
-                    || claims.cert_fp != fp
-                {
-                    anyhow::bail!(
-                        "Refresh identity mismatch: session is {name}/{node_id}, \
-                         credential is {}/{}",
-                        claims.sub,
-                        claims.node_id
-                    );
+                // A Refresh extends this session; it never rebinds it.
+                if net_id != network_id || claims.node_id != node_id || claims.role != role || claims.cert_fp != fp {
+                    anyhow::bail!("Refresh identity mismatch for node {node_id}");
                 }
                 let net = state.networks.get(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
-                ns.last_seen.insert(name.to_string(), now_unix());
-                tracing::debug!(member = %name, session_id, "credential refreshed");
+                if let Some(s) = ns.sessions.get_mut(&node_id) {
+                    s.exp = claims.exp;
+                    s.login_gen = claims.login_gen;
+                }
+                ns.leases.seen(node_id, now_ms());
             }
-            other => {
-                // Unknown kinds are skipped, not fatal (§5 rolling upgrades).
-                tracing::debug!(kind = other, "ignoring unknown control message");
-            }
+            other => tracing::debug!(kind = other, "ignoring unknown control message"),
         }
     }
 }
 
 /// Verify a credential offline and confirm the TLS possession proof.
-fn verify_credential(
-    state: &AppState,
-    token: &str,
-    presented_fp: &str,
-) -> Result<(Claims, String)> {
-    // The network is named inside the credential; find it, then verify
-    // against that network's uuid.
-    let unverified_net = credential::peek_network(token)
-        .ok_or_else(|| anyhow!("malformed credential"))?;
+fn verify_credential(state: &AppState, token: &str, presented_fp: &str) -> Result<(Claims, String)> {
+    let unverified_net = credential::peek_network(token).ok_or_else(|| anyhow!("malformed credential"))?;
     let net = state
         .networks
         .get(&unverified_net)
         .ok_or_else(|| anyhow!("unknown network {unverified_net}"))?;
-    let (uuid, disabled_or_missing) = {
-        let ns = net.lock().unwrap();
-        let uuid = ns.registry.network_uuid.to_string();
-        let sub = credential::peek_subject(token).unwrap_or_default();
-        let bad = ns.registry.members.get(&sub).map(|m| m.disabled).unwrap_or(true);
-        (uuid, bad)
-    };
     let keys = state.keyring.verifying_keys();
+    let (uuid, rec) = {
+        let ns = net.lock().unwrap();
+        let id = credential::peek_node_id(token).unwrap_or(0);
+        (ns.registry.network_uuid.to_string(), ns.registry.members.get(&id).cloned())
+    };
     let claims = credential::verify(
         token,
         &keys,
@@ -473,92 +353,27 @@ fn verify_credential(
         now_unix(),
     )
     .map_err(|e| anyhow!("credential rejected: {e}"))?;
-
-    if disabled_or_missing {
-        anyhow::bail!("member {} is disabled or unknown", claims.sub);
+    let Some(rec) = rec else { anyhow::bail!("node {} is unknown", claims.node_id) };
+    if rec.disabled {
+        anyhow::bail!("node {} is disabled", claims.node_id);
+    }
+    if claims.login_gen < rec.login_gen {
+        anyhow::bail!(
+            "node {} was replaced by a newer join (credential login_gen {} < {})",
+            claims.node_id,
+            claims.login_gen,
+            rec.login_gen
+        );
     }
     if claims.cert_fp != presented_fp {
-        anyhow::bail!(
-            "cert_fp mismatch: credential says {}, TLS presented {presented_fp}",
-            claims.cert_fp
-        );
+        anyhow::bail!("cert_fp mismatch: credential says {}, TLS presented {presented_fp}", claims.cert_fp);
     }
     Ok((claims, unverified_net))
 }
 
-/// Fan out to every live session in the network.
-pub fn broadcast(ns: &crate::state::NetState, push: Push) {
-    for s in ns.sessions.values() {
-        if s.tx.try_send(push.clone()).is_err() {
-            tracing::warn!(member = %s.name, "push queue full or closed; session will resync");
-        }
-    }
-}
-
-/// Fan out to every live session except one (used when that session is
-/// about to receive an equivalent snapshot).
-pub fn broadcast_except(ns: &crate::state::NetState, push: Push, skip: &str) {
-    for s in ns.sessions.values().filter(|s| s.name != skip) {
-        let _ = s.tx.try_send(push.clone());
-    }
-}
-
-/// The dialable relay fleet: relays that have joined at least once, so
-/// their address and certificate pin are known.
-pub fn relay_endpoints(ns: &crate::state::NetState) -> Vec<RelayEndpoint> {
-    let mut out = Vec::new();
-    for (name, m) in &ns.cfg.relays {
-        if let (Some(rec), Some(addr)) = (ns.registry.members.get(name), m.relay_addr.clone()) {
-            if let Some(fp) = &rec.cert_fp {
-                out.push(RelayEndpoint {
-                    relay_id: rec.node_id,
-                    name: name.clone(),
-                    addr,
-                    cert_fp: fp.clone(),
-                });
-            }
-        }
-    }
-    out.sort_by_key(|r| r.relay_id);
-    out
-}
-
-/// Publish the relay fleet if it changed since the last push.
-pub fn publish_relays_if_changed(ns: &mut crate::state::NetState) {
-    let now = relay_endpoints(ns);
-    if ns.published_relays.as_ref() == Some(&now) {
-        return;
-    }
-    ns.published_relays = Some(now.clone());
-    broadcast(ns, Push::Relays(RelayList { relays: now }));
-}
-
-/// Publish the network-wide tunnel MTU if the minimum moved. Members
-/// that cannot carry it would otherwise black-hole large packets at a
-/// hop nobody is watching (§8).
-pub fn publish_mtu_if_changed(ns: &mut crate::state::NetState) {
-    let now = ns.directory.network_mtu(ns.cfg.settings.mtu);
-    if ns.directory.published_mtu.as_ref() == Some(&now) {
-        return;
-    }
-    tracing::info!(
-        mtu = now.mtu,
-        limited_by = %now.limited_by,
-        "network tunnel MTU updated"
-    );
-    ns.directory.published_mtu = Some(now.clone());
-    broadcast(ns, Push::Mtu(now));
-}
-
-/// Fan out to relay sessions only (attachment registry is relay-only).
-pub fn broadcast_relays(ns: &crate::state::NetState, push: Push) {
-    for s in ns.sessions.values().filter(|s| s.role == Role::Relay) {
-        let _ = s.tx.try_send(push.clone());
-    }
-}
-
-/// Liveness sweep (§7): mark members offline after `offline_after`
-/// missed keepalives and withdraw their routes.
+/// Liveness sweep (§7): expire silent members, withdraw their routes,
+/// close sessions whose credential expired, and re-evaluate anything that
+/// falls due purely by time (hold-down).
 pub async fn liveness_sweep(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
@@ -566,40 +381,27 @@ pub async fn liveness_sweep(state: Arc<AppState>) {
         let now = now_unix();
         for net in state.networks.values() {
             let mut ns = net.lock().unwrap();
-
-            // A relay that stops reporting leaves its last sample behind.
-            // Pruning here as well as on write means a fleet that goes
-            // quiet clears out instead of freezing at its final state.
             ns.directory.prune_traffic(now);
-
-            // Route ownership can become due purely by the passage of
-            // time (a returning registrant's hold-down expiring, §2), so
-            // re-evaluate on the tick as well as on events. recompute()
-            // is a no-op unless something actually changed.
-            if let Some(d) = ns.refresh_directory(now) {
-                broadcast(&ns, Push::Membership(d));
-            }
-            let window =
-                ns.cfg.settings.keepalive_secs as u64 * ns.cfg.settings.offline_after as u64;
-            let stale: Vec<String> = ns
-                .sessions
-                .values()
-                .filter(|s| {
-                    let last = ns.last_seen.get(&s.name).copied().unwrap_or(0);
-                    last != 0 && now.saturating_sub(last) > window
-                })
-                .map(|s| s.name.clone())
-                .collect();
-            for name in stale {
-                tracing::info!(member = %name, "liveness timeout; closing session");
-                if let Some(s) = ns.sessions.get(&name) {
+            let window = ns.cfg.settings.liveness_window_secs();
+            let gone = ns.leases.expire(now_ms(), window * 1000);
+            for node in gone {
+                tracing::info!(network = %ns.cfg.network_id, node_id = node, "no heartbeat for {window}s; offline");
+                ns.directory.reported_mtu.remove(&node);
+                if let Some(s) = ns.sessions.remove(&node) {
                     let _ = s.tx.try_send(Push::Close("keepalive timeout".into()));
-                    // Closing the connection is what makes the reader
-                    // return and the teardown (offline + route
-                    // withdrawal) actually run.
                     s.conn.close(CLOSE_TIMEOUT.into(), b"keepalive timeout");
                 }
             }
+            let expired: Vec<NodeId> =
+                ns.sessions.values().filter(|s| s.exp <= now).map(|s| s.node_id).collect();
+            for node in expired {
+                tracing::info!(network = %ns.cfg.network_id, node_id = node, "credential expired without Refresh; closing");
+                if let Some(s) = ns.sessions.remove(&node) {
+                    let _ = s.tx.try_send(Push::Close("credential expired".into()));
+                    s.conn.close(CLOSE_EXPIRED.into(), b"credential expired");
+                }
+            }
+            state.publish(&mut ns);
         }
     }
 }

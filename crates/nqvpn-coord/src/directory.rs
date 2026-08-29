@@ -1,48 +1,35 @@
-//! The per-network directory: the derived, revisioned view that gets
-//! pushed to members (§3.2). Registry + liveness in, `PeerInfo` out.
+//! The per-network directory: the derived, generation-numbered view that
+//! gets pushed to members (§3.2). Registry + leases in, `Snapshot` out.
 //!
-//! Two rules from the design live here:
+//! Three rules from the design live here:
 //!  * **routes are liveness-bound, identity is not** (§2/§7) — an offline
 //!    member keeps its addresses but its route registrations are
 //!    withdrawn, so the next-oldest living registrant takes over;
 //!  * **flap damping** (§2) — a returning registrant waits `hold_down`
-//!    before reclaiming ownership from a live standby.
+//!    before reclaiming ownership from a live standby;
+//!  * **one generation per change** — the published snapshot only moves
+//!    when its content does, every move gets a new generation, and the
+//!    last few deltas are kept so a member one or two behind can catch
+//!    up without a full snapshot.
 
 use ipnet::IpNet;
-use nqvpn_proto::control::{AttachmentEntry, MembershipDelta, PeerInfo};
-use nqvpn_proto::types::{NodeId, Revision};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use nqvpn_proto::control::{AttachmentEntry, Delta, KeyInfo, NetworkMtu, PeerInfo, RelayEndpoint, Snapshot};
+use nqvpn_proto::types::{NodeId, Role};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::config::NetworkConfig;
+use crate::leases::Leases;
 use crate::registry::Registry;
 
-#[derive(Debug, Default)]
-pub struct Directory {
-    pub revision: Revision,
-    /// Last published view, by node id.
-    pub peers: BTreeMap<NodeId, PeerInfo>,
-    /// Member names with a live control connection.
-    pub online: BTreeSet<String>,
-    /// When each member last came online (for hold-down).
-    pub online_since: HashMap<String, u64>,
-    /// cidr string -> owning member name (sticky until death/hold-down).
-    pub owners: BTreeMap<String, String>,
-    /// member node id -> relay node id (relays only consumer).
-    pub attachments: BTreeMap<NodeId, NodeId>,
-    pub attach_revision: Revision,
-    /// Flap damping window (§2, decision #13); 0 disables.
-    pub hold_down_secs: u64,
-    /// Last reachability verdict per relay name (§3.2, advisory).
-    pub reachability: HashMap<String, crate::reach::Reachability>,
-    /// Usable inner MTU each member reported for its own uplink.
-    pub reported_mtu: HashMap<String, u16>,
-    /// Last MTU published to the network, so we only push on change.
-    pub published_mtu: Option<nqvpn_proto::control::NetworkMtu>,
-    /// Latest traffic sample per relay, plus the one before it. Two
-    /// samples are all a rate needs, and keeping only two means the
-    /// coordinator carries no history it would have to bound.
-    pub traffic: HashMap<String, TrafficSample>,
-}
+/// Deltas kept for catch-up. A member further behind gets a snapshot.
+pub const RING: usize = 512;
+
+/// Never go below the IPv6 minimum: a smaller MTU breaks v6 outright.
+pub const MIN_TUNNEL_MTU: u16 = 1280;
+
+/// How long a relay's last traffic report stays in the matrix after it
+/// goes quiet.
+const TRAFFIC_RETENTION_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct TrafficSample {
@@ -53,12 +40,8 @@ pub struct TrafficSample {
 }
 
 impl TrafficSample {
-    /// Bytes per second on one link since the previous sample.
-    ///
-    /// Counters are cumulative since the relay started, so a restart
-    /// makes the new value smaller than the old. `saturating_sub` reports
-    /// that as zero rather than as an enormous negative-turned-positive
-    /// spike; one interval of understatement beats a garbage number.
+    /// Bytes per second on one link since the previous sample. A relay
+    /// restart makes the counter smaller; that reads as zero, not a spike.
     pub fn rate(&self, peer_id: NodeId, tx: bool) -> u64 {
         let (Some(prev), true) = (&self.prev, self.at > self.prev_at) else {
             return 0;
@@ -70,129 +53,168 @@ impl TrafficSample {
                 .map(|l| if tx { l.tx_bytes } else { l.rx_bytes })
                 .unwrap_or(0)
         };
-        let now = pick(&self.report);
-        let then = pick(prev);
-        now.saturating_sub(then) / (self.at - self.prev_at)
+        pick(&self.report).saturating_sub(pick(prev)) / (self.at - self.prev_at)
     }
 }
 
-/// How long a relay's last report stays in the matrix after it goes
-/// quiet. Reports arrive every few seconds, so minutes of silence means
-/// the relay is gone, not slow — and a row that never expires would keep
-/// a decommissioned relay in the fleet view forever.
-const TRAFFIC_RETENTION_SECS: u64 = 300;
-
-impl Directory {
-    /// Fold in a relay's latest report, keeping the previous one so a
-    /// rate can be derived.
-    pub fn record_traffic(
-        &mut self,
-        relay: &str,
-        report: nqvpn_proto::control::TrafficReport,
-        now: u64,
-    ) {
-        let (prev, prev_at) = match self.traffic.get(relay) {
-            Some(s) => (Some(s.report.clone()), s.at),
-            None => (None, now),
-        };
-        self.traffic
-            .insert(relay.to_string(), TrafficSample { at: now, report, prev_at, prev });
-        self.prune_traffic(now);
-    }
-
-    /// Drop reports from relays that have stopped talking to us. Pruning
-    /// on write rather than on a timer keeps this free: the only thing
-    /// that grows the map is a report arriving.
-    pub fn prune_traffic(&mut self, now: u64) {
-        self.traffic.retain(|_, s| now.saturating_sub(s.at) <= TRAFFIC_RETENTION_SECS);
-    }
+#[derive(Debug)]
+pub struct Directory {
+    /// Current generation; `published.gen` equals it.
+    pub gen: u64,
+    pub published: Snapshot,
+    pub published_digest: u64,
+    ring: VecDeque<Delta>,
+    /// cidr string -> owning node id (sticky until death/hold-down).
+    pub owners: BTreeMap<String, NodeId>,
+    pub hold_down_secs: u64,
+    pub reachability: HashMap<NodeId, crate::reach::Reachability>,
+    pub reported_mtu: HashMap<NodeId, u16>,
+    pub traffic: HashMap<NodeId, TrafficSample>,
 }
 
 impl Directory {
-    /// Recompute the peer view. Returns a delta if anything changed.
+    pub fn new(initial_gen: u64, hold_down_secs: u64) -> Self {
+        let published = Snapshot { gen: initial_gen, ..Snapshot::default() };
+        let published_digest = published.digest();
+        Directory {
+            gen: initial_gen,
+            published,
+            published_digest,
+            ring: VecDeque::new(),
+            owners: BTreeMap::new(),
+            hold_down_secs,
+            reachability: HashMap::new(),
+            reported_mtu: HashMap::new(),
+            traffic: HashMap::new(),
+        }
+    }
+
+    /// Recompute the view. Returns the delta if anything changed, in
+    /// which case `gen` has advanced and the delta is in the ring.
     pub fn recompute(
         &mut self,
         cfg: &NetworkConfig,
         reg: &Registry,
+        leases: &Leases,
+        keys: &[KeyInfo],
         now: u64,
-    ) -> Option<MembershipDelta> {
-        self.resolve_owners(cfg, reg, now);
+    ) -> Option<Delta> {
+        self.resolve_owners(reg, leases, now);
 
-        let mut next: BTreeMap<NodeId, PeerInfo> = BTreeMap::new();
-        for (name, rec) in &reg.members {
-            let online = self.online.contains(name);
+        let mut members = Vec::new();
+        for (id, rec) in &reg.members {
+            if rec.disabled {
+                continue;
+            }
             let mut prefixes: Vec<IpNet> = Vec::new();
-            // Addresses are identity: they persist across death.
             if let Some(ip) = rec.ip4 {
                 prefixes.push(IpNet::from(ipnet::Ipv4Net::new(ip, 32).expect("/32")));
             }
             if let Some(ip) = rec.ip6 {
                 prefixes.push(IpNet::from(ipnet::Ipv6Net::new(ip, 128).expect("/128")));
             }
-            // Routes are liveness-bound and singly-owned.
             for (cidr, owner) in &self.owners {
-                if owner == name {
+                if owner == id {
                     if let Ok(net) = cidr.parse::<IpNet>() {
                         prefixes.push(net);
                     }
                 }
             }
             prefixes.sort_by_key(|p| p.to_string());
-            next.insert(
-                rec.node_id,
-                PeerInfo {
-                    node_id: rec.node_id,
-                    name: name.clone(),
-                    prefixes,
-                    pubkey: rec.pubkey.clone().unwrap_or_default(),
-                    online,
-                },
-            );
+            members.push(PeerInfo {
+                node_id: *id,
+                name: rec.name.clone(),
+                role: rec.role,
+                prefixes,
+                pubkey: rec.pubkey.clone().unwrap_or_default(),
+                online: leases.is_online(*id),
+                login_gen: rec.login_gen,
+            });
         }
 
-        let mut changed: Vec<PeerInfo> = Vec::new();
-        for (id, p) in &next {
-            if self.peers.get(id) != Some(p) {
-                changed.push(p.clone());
-            }
-        }
-        let removed: Vec<NodeId> =
-            self.peers.keys().filter(|id| !next.contains_key(id)).copied().collect();
+        let attachments: Vec<AttachmentEntry> = leases
+            .attachments()
+            .into_iter()
+            .filter(|(c, r)| {
+                let ok = |n: &NodeId| reg.members.get(n).map(|m| !m.disabled).unwrap_or(false);
+                ok(c) && ok(r)
+            })
+            .map(|(node_id, relay_id)| AttachmentEntry { node_id, relay_id })
+            .collect();
 
-        if changed.is_empty() && removed.is_empty() {
+        let mut reserved: Vec<IpNet> = cfg.cidrs.clone();
+        for rec in reg.members.values().filter(|m| !m.disabled) {
+            reserved.extend(rec.routes.iter().map(|r| r.cidr));
+        }
+
+        let mut next = Snapshot {
+            gen: self.gen,
+            members,
+            attachments,
+            relays: relay_endpoints(cfg, reg),
+            mtu: self.network_mtu(cfg.settings.mtu),
+            keys: keys.to_vec(),
+            reserved_prefixes: reserved,
+        };
+        next.normalize();
+        if next == self.published {
             return None;
         }
-        let base_rev = self.revision;
-        self.revision += 1;
-        self.peers = next;
-        Some(MembershipDelta { base_rev, new_rev: self.revision, changed, removed })
+        next.gen = self.gen + 1;
+        let delta = self.published.diff(&next);
+        self.gen = next.gen;
+        self.published = next;
+        self.published_digest = self.published.digest();
+        self.ring.push_back(delta.clone());
+        while self.ring.len() > RING {
+            self.ring.pop_front();
+        }
+        Some(delta)
+    }
+
+    /// The contiguous chain of deltas from `have_gen` to the current
+    /// generation, if the ring still holds it.
+    pub fn deltas_since(&self, have_gen: u64) -> Option<Vec<Delta>> {
+        if have_gen == self.gen {
+            return Some(Vec::new());
+        }
+        let start = self.ring.iter().position(|d| d.base_gen == have_gen)?;
+        let chain: Vec<Delta> = self.ring.iter().skip(start).cloned().collect();
+        // Sanity: contiguous and ends at the current generation.
+        let mut expect = have_gen;
+        for d in &chain {
+            if d.base_gen != expect {
+                return None;
+            }
+            expect = d.gen;
+        }
+        (expect == self.gen).then_some(chain)
     }
 
     /// Age-resolved ownership over *live* registrants, with hold-down.
-    fn resolve_owners(&mut self, _cfg: &NetworkConfig, reg: &Registry, now: u64) {
+    fn resolve_owners(&mut self, reg: &Registry, leases: &Leases, now: u64) {
         let hold_down = self.hold_down_secs;
-        let mut new_owners: BTreeMap<String, String> = BTreeMap::new();
+        let mut new_owners: BTreeMap<String, NodeId> = BTreeMap::new();
         for (cidr, regs) in reg.resolve_owners() {
             let key = cidr.to_string();
-            // Registrants that are currently online, oldest first.
-            let live: Vec<&(String, u64)> =
-                regs.iter().filter(|(n, _)| self.online.contains(n)).collect();
-            let best = live.first().map(|(n, _)| n.clone());
-            let current = self.owners.get(&key).cloned();
+            let live: Vec<NodeId> =
+                regs.iter().filter(|(n, _)| leases.is_online(*n)).map(|(n, _)| *n).collect();
+            let best = live.first().copied();
+            let current = self.owners.get(&key).copied();
             let owner = match (current, best) {
                 (Some(cur), Some(best)) if cur == best => Some(cur),
-                (Some(cur), Some(best)) if self.online.contains(&cur) => {
+                (Some(cur), Some(best)) if leases.is_online(cur) => {
                     // A better (older) registrant is back. Make it wait
                     // out hold-down so a flapping site doesn't oscillate.
-                    let since = self.online_since.get(&best).copied().unwrap_or(0);
+                    let since = leases.online_since(best).unwrap_or(0) / 1000;
                     if now.saturating_sub(since) >= hold_down {
                         Some(best)
                     } else {
                         Some(cur)
                     }
                 }
-                // Current owner died (or never existed): take the best
-                // living registrant immediately — this is site failover.
+                // Current owner died (or never existed): the best living
+                // registrant takes over immediately — site failover.
                 (_, best) => best,
             };
             if let Some(o) = owner {
@@ -202,83 +224,64 @@ impl Directory {
         self.owners = new_owners;
     }
 
-    pub fn set_online(&mut self, name: &str, online: bool, now: u64) {
-        if online {
-            if self.online.insert(name.to_string()) {
-                self.online_since.insert(name.to_string(), now);
+    /// The safe tunnel MTU for the whole network: the smallest usable
+    /// MTU any member reported, clamped to the v6 floor and to the
+    /// configured ceiling, naming the limiting member.
+    pub fn network_mtu(&self, ceiling: u16) -> NetworkMtu {
+        let mut best = ceiling;
+        let mut who = "config".to_string();
+        let mut limiting: Vec<(&NodeId, &u16)> = self.reported_mtu.iter().collect();
+        limiting.sort();
+        for (node, reported) in limiting {
+            if *reported > 0 && *reported < best {
+                best = *reported;
+                who = format!("#{node}");
             }
-        } else {
-            self.online.remove(name);
-            self.online_since.remove(name);
         }
+        NetworkMtu { mtu: best.max(MIN_TUNNEL_MTU), limited_by: who }
     }
 
-    pub fn attachment_entries(&self) -> Vec<AttachmentEntry> {
-        self.attachments
-            .iter()
-            .map(|(node_id, relay_id)| AttachmentEntry { node_id: *node_id, relay_id: *relay_id })
-            .collect()
-    }
-
-    pub fn set_attachment(&mut self, node_id: NodeId, relay_id: Option<NodeId>) -> bool {
-        let changed = match relay_id {
-            Some(r) => self.attachments.insert(node_id, r) != Some(r),
-            None => self.attachments.remove(&node_id).is_some(),
+    pub fn record_traffic(&mut self, relay: NodeId, report: nqvpn_proto::control::TrafficReport, now: u64) {
+        let (prev, prev_at) = match self.traffic.get(&relay) {
+            Some(s) => (Some(s.report.clone()), s.at),
+            None => (None, now),
         };
-        if changed {
-            self.attach_revision += 1;
-        }
-        changed
+        self.traffic.insert(relay, TrafficSample { at: now, report, prev_at, prev });
+        self.prune_traffic(now);
     }
 
-    /// Snapshot chunks for a joining session (§3.2: assembled off-path,
-    /// installed atomically).
-    pub fn snapshot_chunks(&self, chunk_size: usize) -> Vec<Vec<PeerInfo>> {
-        let all: Vec<PeerInfo> = self.peers.values().cloned().collect();
-        if all.is_empty() {
-            return vec![vec![]];
-        }
-        all.chunks(chunk_size).map(|c| c.to_vec()).collect()
+    pub fn prune_traffic(&mut self, now: u64) {
+        self.traffic.retain(|_, s| now.saturating_sub(s.at) <= TRAFFIC_RETENTION_SECS);
     }
 }
 
-/// Never go below the IPv6 minimum: a smaller MTU breaks v6 outright,
-/// so a member reporting something absurd must not drag the network
-/// under the floor.
-pub const MIN_TUNNEL_MTU: u16 = 1280;
-
-impl Directory {
-    /// The safe tunnel MTU for the whole network: the smallest usable
-    /// MTU any member reported, clamped to the v6 floor and to the
-    /// configured ceiling. Returns the limiting member too.
-    pub fn network_mtu(&self, ceiling: u16) -> nqvpn_proto::control::NetworkMtu {
-        let mut best = ceiling;
-        let mut who = "config".to_string();
-        for (name, reported) in &self.reported_mtu {
-            if *reported < best {
-                best = *reported;
-                who = name.clone();
-            }
+/// The dialable relay fleet: configured relays that have joined at least
+/// once, so their address and certificate fingerprint are known.
+pub fn relay_endpoints(cfg: &NetworkConfig, reg: &Registry) -> Vec<RelayEndpoint> {
+    let mut out = Vec::new();
+    for (name, m) in &cfg.relays {
+        let Some(rec) = reg.members.get(&m.node_id) else { continue };
+        if rec.disabled || rec.role != Role::Relay {
+            continue;
         }
-        nqvpn_proto::control::NetworkMtu {
-            mtu: best.max(MIN_TUNNEL_MTU),
-            limited_by: who,
+        if let (Some(fp), Some(addr)) = (&rec.cert_fp, &m.relay_addr) {
+            out.push(RelayEndpoint {
+                relay_id: m.node_id,
+                name: name.clone(),
+                addr: addr.clone(),
+                cert_fp: fp.clone(),
+            });
         }
     }
-
-    pub fn with_hold_down(hold_down_secs: u64) -> Self {
-        Directory { hold_down_secs, ..Default::default() }
-    }
-
-    pub fn set_hold_down(&mut self, secs: u64) {
-        self.hold_down_secs = secs;
-    }
+    out.sort_by_key(|r| r.relay_id);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::RouteReg;
+    use nqvpn_proto::control::{AttachedClient, Heartbeat};
 
     fn cfg() -> NetworkConfig {
         toml::from_str(
@@ -288,217 +291,155 @@ cidrs = ["10.99.0.0/16"]
 [pools.default]
 cidr = "10.99.1.0/24"
 [relays.old]
-secret_hash = "x"
+node_id = 1
 relay_addr = "1.2.3.4:1"
 allowed_cidrs = ["192.168.1.0/24"]
 [relays.new]
-secret_hash = "x"
+node_id = 2
 relay_addr = "5.6.7.8:1"
 allowed_cidrs = ["192.168.1.0/24"]
+[clients.c]
+node_id = 10
 "#,
         )
         .unwrap()
     }
 
-    fn registry_with_two_registrants() -> Registry {
+    fn registry() -> Registry {
         let mut reg = Registry::new();
         let cidr: IpNet = "192.168.1.0/24".parse().unwrap();
-        {
-            let r = reg.member_mut("old", 1);
+        for (id, name, age) in [(1, "old", 100), (2, "new", 200)] {
+            let r = reg.member_mut(id, name, Role::Relay, 1);
             r.pubkey = Some("PK".into());
-            r.routes.push(RouteReg { cidr, first_granted_unix: 100 });
+            r.cert_fp = Some("fp".into());
+            r.routes.push(RouteReg { cidr, first_granted_unix: age });
         }
-        {
-            let r = reg.member_mut("new", 1);
-            r.pubkey = Some("PK".into());
-            r.routes.push(RouteReg { cidr, first_granted_unix: 200 });
-        }
+        reg.member_mut(10, "c", Role::Client, 1).ip4 = Some("10.99.1.5".parse().unwrap());
         reg
     }
 
-    #[test]
-    fn network_mtu_is_the_minimum_over_all_members() {
-        let mut d = Directory::with_hold_down(0);
-        // Nobody has reported yet: the configured value stands.
-        assert_eq!(d.network_mtu(1350).mtu, 1350);
-        assert_eq!(d.network_mtu(1350).limited_by, "config");
-
-        d.reported_mtu.insert("fast".into(), 1400);
-        d.reported_mtu.insert("slow".into(), 1300);
-        let m = d.network_mtu(1350);
-        assert_eq!(m.mtu, 1300, "one small uplink limits the whole network");
-        assert_eq!(m.limited_by, "slow", "and the operator can see which");
-
-        // A member cannot raise the network above the configured ceiling.
-        d.reported_mtu.clear();
-        d.reported_mtu.insert("huge".into(), 9000);
-        assert_eq!(d.network_mtu(1350).mtu, 1350);
-
-        // Nor drag it below the IPv6 floor.
-        d.reported_mtu.insert("broken".into(), 500);
-        assert_eq!(d.network_mtu(1350).mtu, MIN_TUNNEL_MTU);
+    fn online(l: &mut Leases, ids: &[NodeId], now: u64) {
+        for id in ids {
+            l.seen(*id, now);
+        }
     }
 
     #[test]
-    fn oldest_live_registrant_owns() {
-        let (c, reg) = (cfg(), registry_with_two_registrants());
-        let mut d = Directory::with_hold_down(60);
-        d.set_online("old", true, 1000);
-        d.set_online("new", true, 1000);
-        d.recompute(&c, &reg, 1000);
-        assert_eq!(d.owners["192.168.1.0/24"], "old");
+    fn every_change_is_one_generation_and_deltas_chain() {
+        let (c, reg) = (cfg(), registry());
+        let mut l = Leases::default();
+        let mut d = Directory::new(1000, 0);
+        let d1 = d.recompute(&c, &reg, &l, &[], 1).expect("first view");
+        assert_eq!(d1.base_gen, 1000);
+        assert_eq!(d.gen, 1001);
+        assert!(d.recompute(&c, &reg, &l, &[], 2).is_none(), "no change, no generation");
+
+        online(&mut l, &[1], 10);
+        let d2 = d.recompute(&c, &reg, &l, &[], 10).expect("relay 1 came online");
+        assert_eq!((d2.base_gen, d2.gen), (1001, 1002));
+        online(&mut l, &[10], 11);
+        d.recompute(&c, &reg, &l, &[], 11).expect("client online");
+        assert_eq!(d.gen, 1003);
+
+        // A member at 1001 catches up with two deltas; at 1000 with three.
+        let chain = d.deltas_since(1001).unwrap();
+        assert_eq!(chain.len(), 2);
+        let mut copy = Snapshot { gen: 1001, ..Snapshot::default() };
+        // Reconstruct: apply d1 onto empty at 1000, then the chain.
+        let mut from_scratch = Snapshot { gen: 1000, ..Snapshot::default() };
+        from_scratch.apply(&d1).unwrap();
+        copy = from_scratch;
+        for dl in &chain {
+            copy.apply(dl).unwrap();
+        }
+        assert_eq!(copy, d.published);
+        assert_eq!(copy.digest(), d.published_digest);
+        assert!(d.deltas_since(999).is_none(), "unknown base needs a snapshot");
+        assert!(d.deltas_since(1003).unwrap().is_empty(), "current: nothing to send");
     }
 
     #[test]
-    fn death_fails_over_immediately() {
-        let (c, reg) = (cfg(), registry_with_two_registrants());
-        let mut d = Directory::with_hold_down(60);
-        d.set_online("old", true, 1000);
-        d.set_online("new", true, 1000);
-        d.recompute(&c, &reg, 1000);
-
-        d.set_online("old", false, 1100);
-        let delta = d.recompute(&c, &reg, 1100).expect("ownership moved");
-        assert_eq!(d.owners["192.168.1.0/24"], "new");
-        // The standby's PeerInfo now carries the LAN prefix.
-        let new_peer = delta.changed.iter().find(|p| p.name == "new").unwrap();
+    fn oldest_live_registrant_owns_and_death_fails_over() {
+        let (c, reg) = (cfg(), registry());
+        let mut l = Leases::default();
+        let mut d = Directory::new(1, 60);
+        online(&mut l, &[1, 2], 1000);
+        d.recompute(&c, &reg, &l, &[], 1000);
+        assert_eq!(d.owners["192.168.1.0/24"], 1);
+        l.offline(1);
+        let delta = d.recompute(&c, &reg, &l, &[], 1100).expect("ownership moved");
+        assert_eq!(d.owners["192.168.1.0/24"], 2);
+        let new_peer = delta.members_changed.iter().find(|p| p.node_id == 2).unwrap();
         assert!(new_peer.prefixes.iter().any(|p| p.to_string() == "192.168.1.0/24"));
-        // The dead owner keeps no route.
-        let old = d.peers.values().find(|p| p.name == "old").unwrap();
+        let old = d.published.member(1).unwrap();
         assert!(!old.prefixes.iter().any(|p| p.to_string() == "192.168.1.0/24"));
         assert!(!old.online);
+        // The CIDR stays reserved so members keep routing it into the tunnel.
+        assert!(d.published.reserved_prefixes.iter().any(|p| p.to_string() == "192.168.1.0/24"));
     }
 
     #[test]
     fn returning_owner_waits_out_hold_down() {
-        let (c, reg) = (cfg(), registry_with_two_registrants());
-        let mut d = Directory::with_hold_down(60);
-        d.set_online("new", true, 1000);
-        d.recompute(&c, &reg, 1000);
-        assert_eq!(d.owners["192.168.1.0/24"], "new");
-
-        // "old" comes back at t=1100; it is the older registration but
-        // must not reclaim until hold_down elapses.
-        d.set_online("old", true, 1100);
-        d.recompute(&c, &reg, 1110);
-        assert_eq!(d.owners["192.168.1.0/24"], "new", "hold-down still active");
-
-        d.recompute(&c, &reg, 1100 + 60);
-        assert_eq!(d.owners["192.168.1.0/24"], "old", "reclaimed after hold-down");
+        let (c, reg) = (cfg(), registry());
+        let mut l = Leases::default();
+        let mut d = Directory::new(1, 60);
+        online(&mut l, &[2], 1000);
+        d.recompute(&c, &reg, &l, &[], 1000);
+        assert_eq!(d.owners["192.168.1.0/24"], 2);
+        online(&mut l, &[1], 1_100_000);
+        d.recompute(&c, &reg, &l, &[], 1110);
+        assert_eq!(d.owners["192.168.1.0/24"], 2, "hold-down still active");
+        d.recompute(&c, &reg, &l, &[], 1160);
+        assert_eq!(d.owners["192.168.1.0/24"], 1, "reclaimed after hold-down");
     }
 
     #[test]
-    fn addresses_survive_death_but_routes_do_not() {
-        let c = cfg();
-        let mut reg = registry_with_two_registrants();
-        reg.member_mut("old", 1).ip4 = Some("10.99.0.1".parse().unwrap());
-        let mut d = Directory::with_hold_down(0);
-        d.set_online("old", true, 1000);
-        d.recompute(&c, &reg, 1000);
-        d.set_online("old", false, 1100);
-        d.recompute(&c, &reg, 1100);
-        let old = d.peers.values().find(|p| p.name == "old").unwrap();
-        assert!(old.prefixes.iter().any(|p| p.to_string() == "10.99.0.1/32"));
-        assert_eq!(old.prefixes.len(), 1);
+    fn disabled_members_vanish_from_the_view() {
+        let (c, mut reg) = (cfg(), registry());
+        let mut l = Leases::default();
+        online(&mut l, &[1, 10], 5);
+        l.heartbeat(1, Role::Relay, &Heartbeat { attached: vec![AttachedClient { node_id: 10, session_id: 1 }], ..Default::default() }, 5);
+        let mut d = Directory::new(1, 0);
+        d.recompute(&c, &reg, &l, &[], 5);
+        assert!(d.published.member(10).is_some());
+        assert_eq!(d.published.attachment_of(10), Some(1));
+        reg.members.get_mut(&10).unwrap().disabled = true;
+        let delta = d.recompute(&c, &reg, &l, &[], 6).unwrap();
+        assert_eq!(delta.members_removed, vec![10]);
+        assert_eq!(delta.attachments_removed, vec![10]);
+        assert!(d.published.member(10).is_none());
     }
 
     #[test]
-    fn revision_advances_only_on_change() {
-        let (c, reg) = (cfg(), registry_with_two_registrants());
-        let mut d = Directory::with_hold_down(60);
-        d.set_online("old", true, 1000);
-        assert!(d.recompute(&c, &reg, 1000).is_some());
-        let rev = d.revision;
-        assert!(d.recompute(&c, &reg, 1001).is_none(), "no change, no revision bump");
-        assert_eq!(d.revision, rev);
+    fn network_mtu_is_the_minimum_over_all_members() {
+        let mut d = Directory::new(1, 0);
+        assert_eq!(d.network_mtu(1350).mtu, 1350);
+        d.reported_mtu.insert(1, 1400);
+        d.reported_mtu.insert(2, 1300);
+        let m = d.network_mtu(1350);
+        assert_eq!(m.mtu, 1300);
+        assert_eq!(m.limited_by, "#2");
+        d.reported_mtu.insert(3, 500);
+        assert_eq!(d.network_mtu(1350).mtu, MIN_TUNNEL_MTU);
     }
 
-    fn report(peer: NodeId, tx: u64, rx: u64) -> nqvpn_proto::control::TrafficReport {
+    fn report(peer: NodeId, tx: u64) -> nqvpn_proto::control::TrafficReport {
         nqvpn_proto::control::TrafficReport {
-            links: vec![nqvpn_proto::control::LinkTraffic {
-                peer_id: peer,
-                tx_bytes: tx,
-                tx_pkts: tx / 1000,
-                rx_bytes: rx,
-                rx_pkts: rx / 1000,
-                up: true,
-            }],
-            local_bytes: 0,
-            local_pkts: 0,
-            terminated_bytes: 0,
-            terminated_pkts: 0,
+            links: vec![nqvpn_proto::control::LinkTraffic { peer_id: peer, tx_bytes: tx, tx_pkts: 0, rx_bytes: 0, rx_pkts: 0, up: true }],
+            ..Default::default()
         }
     }
 
     #[test]
-    fn rate_is_derived_from_consecutive_samples() {
-        let mut d = Directory::default();
-        d.record_traffic("r1", report(2, 1_000, 500), 100);
-        // The first sample has nothing to compare against.
-        assert_eq!(d.traffic["r1"].rate(2, true), 0);
-
-        d.record_traffic("r1", report(2, 11_000, 5_500), 110);
-        // 10_000 bytes over 10 seconds.
-        assert_eq!(d.traffic["r1"].rate(2, true), 1_000);
-        assert_eq!(d.traffic["r1"].rate(2, false), 500);
-    }
-
-    #[test]
-    fn a_relay_restart_reports_zero_not_a_spike() {
-        // Counters are cumulative since process start, so a restart makes
-        // the new value smaller. Reporting the wrapped difference would
-        // put an absurd spike on the graph forever.
-        let mut d = Directory::default();
-        d.record_traffic("r1", report(2, 9_000_000, 0), 100);
-        d.record_traffic("r1", report(2, 12_000, 0), 110);
-        assert_eq!(d.traffic["r1"].rate(2, true), 0);
-    }
-
-    #[test]
-    fn unknown_peer_and_zero_window_are_not_divisions_by_zero() {
-        let mut d = Directory::default();
-        d.record_traffic("r1", report(2, 1_000, 0), 100);
-        d.record_traffic("r1", report(2, 5_000, 0), 100); // same second
-        assert_eq!(d.traffic["r1"].rate(2, true), 0);
-        // A peer this relay never reported on has no rate, not a panic.
-        assert_eq!(d.traffic["r1"].rate(99, true), 0);
-    }
-
-    #[test]
-    fn each_relay_keeps_its_own_row() {
-        let mut d = Directory::default();
-        d.record_traffic("r1", report(2, 1_000, 0), 100);
-        d.record_traffic("r2", report(1, 7_000, 0), 100);
-        assert_eq!(d.traffic.len(), 2);
-        assert_eq!(d.traffic["r2"].report.links[0].tx_bytes, 7_000);
-    }
-
-    #[test]
-    fn a_relay_that_stops_reporting_drops_out_of_the_matrix() {
-        // cp sat in the fleet view for eight hours after being stopped
-        // and removed from config, because nothing ever expired its last
-        // sample.
-        let mut d = Directory::default();
-        d.record_traffic("cp", report(2, 1_000, 0), 100);
-        assert!(d.traffic.contains_key("cp"));
-
-        // Still present while merely quiet for a short while.
-        d.prune_traffic(100 + TRAFFIC_RETENTION_SECS);
-        assert!(d.traffic.contains_key("cp"), "must survive a brief silence");
-
-        // Gone once the silence is long enough to mean "decommissioned".
-        d.prune_traffic(100 + TRAFFIC_RETENTION_SECS + 1);
-        assert!(!d.traffic.contains_key("cp"));
-    }
-
-    #[test]
-    fn pruning_keeps_relays_that_are_still_reporting() {
-        let mut d = Directory::default();
-        d.record_traffic("gone", report(2, 1, 0), 100);
-        // A live relay reporting much later must not be swept away with
-        // the dead one — and its own arrival is what triggers the prune.
-        d.record_traffic("live", report(2, 1, 0), 100 + TRAFFIC_RETENTION_SECS + 50);
-        assert!(d.traffic.contains_key("live"));
-        assert!(!d.traffic.contains_key("gone"));
+    fn rates_derive_from_samples_and_stale_rows_are_pruned() {
+        let mut d = Directory::new(1, 0);
+        d.record_traffic(1, report(2, 1_000), 100);
+        assert_eq!(d.traffic[&1].rate(2, true), 0);
+        d.record_traffic(1, report(2, 11_000), 110);
+        assert_eq!(d.traffic[&1].rate(2, true), 1_000);
+        d.record_traffic(1, report(2, 12), 120);
+        assert_eq!(d.traffic[&1].rate(2, true), 0, "restart reads as zero");
+        d.prune_traffic(120 + TRAFFIC_RETENTION_SECS + 1);
+        assert!(d.traffic.is_empty());
     }
 }

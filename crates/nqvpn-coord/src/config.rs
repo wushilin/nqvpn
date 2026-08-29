@@ -2,12 +2,17 @@
 //! The operator's TOML is the plan of record; validation failures are
 //! planning bugs and fail startup (or leave the old config running on
 //! reload).
+//!
+//! A member is a **node id + secret**. The id is chosen by the operator
+//! here; the secret is either written here or minted into the managed
+//! store (which wins when both exist). Nothing else authenticates.
 
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use nqvpn_proto::lpm::overlaps;
+use nqvpn_proto::types::{NodeId, Role};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -15,6 +20,9 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct CoordConfig {
     pub listen: ListenCfg,
+    /// A real certificate for the HTTPS API and QUIC control port. Unset
+    /// means a self-signed one is generated into the state dir on first
+    /// start — members accept it by default (`trust_any_cert = true`).
     #[serde(default)]
     pub tls: Option<TlsCfg>,
     pub state: StateCfg,
@@ -27,9 +35,16 @@ pub struct CoordConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenCfg {
+    /// HTTPS: `/api/v1/*` and `/ui`.
     pub api: String,
-    #[serde(default)]
-    pub quic: Option<String>,
+    /// QUIC control plane. Members dial the API host on this port, so
+    /// it is published in the join response; nothing else configures it.
+    #[serde(default = "d_quic")]
+    pub quic: String,
+}
+
+fn d_quic() -> String {
+    "0.0.0.0:14433".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,19 +63,10 @@ pub struct StateCfg {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminCfg {
-    /// name -> argon2 hash (UI sessions; Phase 6).
-    #[serde(default)]
-    pub users: BTreeMap<String, String>,
     #[serde(default)]
     pub bearer_token: Option<String>,
     #[serde(default)]
     pub bearer_token_file: Option<String>,
-    #[serde(default = "default_session_ttl")]
-    pub session_ttl_mins: u64,
-}
-
-fn default_session_ttl() -> u64 {
-    720
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,7 +83,7 @@ impl Default for LimitsCfg {
 }
 
 fn default_join_rate() -> u32 {
-    10
+    30
 }
 
 // ---- per-network ----
@@ -108,8 +114,11 @@ pub struct PoolCfg {
 pub struct SettingsCfg {
     #[serde(default = "d_ttl")]
     pub credential_ttl_mins: u64,
-    #[serde(default = "d_keepalive")]
-    pub keepalive_secs: u16,
+    /// Seconds between member heartbeats. Convergence after a lost push
+    /// is bounded by this.
+    #[serde(default = "d_heartbeat")]
+    pub heartbeat_secs: u16,
+    /// Missed heartbeats before a member is offline.
     #[serde(default = "d_offline_after")]
     pub offline_after: u32,
     #[serde(default = "d_hold_down")]
@@ -117,50 +126,47 @@ pub struct SettingsCfg {
     #[serde(default = "d_mtu")]
     pub mtu: u16,
     /// What to do when a joining relay's advertised address cannot be
-    /// dialed from the coordinator (§3.2):
-    ///   "off"   - do not probe at all
-    ///   "warn"  - probe, record, log loudly, allow the join (default)
-    ///   "deny"  - refuse the join with `relay_unreachable`
-    /// Denial is opt-in because the probe is advisory: the coordinator's
-    /// vantage point is not every peer's, and a source-specific firewall
-    /// could reject us while the fleet reaches the relay fine.
+    /// dialed from the coordinator (§3.2): "off" | "warn" | "deny".
     #[serde(default = "d_reach_policy")]
     pub relay_reachability: String,
-    /// How tunneled packets cross QUIC: "datagram" (default) or
-    /// "stream". A network-wide setting so every member agrees without
-    /// negotiating; flip it and restart members to A/B the two.
+    /// "datagram" or "stream".
     #[serde(default = "d_transport")]
     pub transport: String,
-    /// Parallel streams the stream transport spreads flows across (§5).
-    ///
-    /// One stream means one stalled segment blocks every tunneled flow
-    /// behind it. Endpoints hash the inner 5-tuple to pick a lane, so a
-    /// flow stays on one ordered pipe while unrelated flows stop waiting
-    /// on each other. Ignored in datagram mode, which has no streams.
     #[serde(default = "d_lanes")]
     pub lanes: u8,
+    /// Default per-client bandwidth cap applied by relays; 0 = none.
+    #[serde(default)]
+    pub max_session_mbps: u32,
 }
 
 impl Default for SettingsCfg {
     fn default() -> Self {
         SettingsCfg {
             credential_ttl_mins: d_ttl(),
-            keepalive_secs: d_keepalive(),
+            heartbeat_secs: d_heartbeat(),
             offline_after: d_offline_after(),
             hold_down_secs: d_hold_down(),
             mtu: d_mtu(),
             relay_reachability: d_reach_policy(),
             transport: d_transport(),
             lanes: d_lanes(),
+            max_session_mbps: 0,
         }
+    }
+}
+
+impl SettingsCfg {
+    /// Seconds without a heartbeat before a member is offline.
+    pub fn liveness_window_secs(&self) -> u64 {
+        (self.heartbeat_secs.max(1) as u64) * (self.offline_after.max(1) as u64)
     }
 }
 
 fn d_ttl() -> u64 {
     15
 }
-fn d_keepalive() -> u16 {
-    15
+fn d_heartbeat() -> u16 {
+    5
 }
 fn d_offline_after() -> u32 {
     3
@@ -175,36 +181,23 @@ fn d_reach_policy() -> String {
     "warn".to_string()
 }
 fn d_lanes() -> u8 {
-    // One lane by default — not because lanes are wrong, but because
-    // their benefit is unproven on the paths measured so far and their
-    // cost is not: each lane is a stream, a task, and a share of the
-    // send queue, paid per connection, and a relay pays it for every
-    // session it carries.
-    //
-    // Lanes remove head-of-line blocking between flows, so they should
-    // pay where a single flow *cannot* fill the pipe and loss is the
-    // limiter — long-haul or multipath links. On links a single flow
-    // already saturates there is no blocking to recover and the extra
-    // streams only add contention. Raise it per network where the
-    // former describes the path, and measure.
-    //
-    // Only stream mode uses this; datagram mode has no streams.
     1
 }
 fn d_transport() -> String {
-    // Measured, not assumed: on a real consumer uplink streams reached
-    // 87 Mbit/s against datagrams' 54, because QUIC repairs loss beneath
-    // the inner TCP instead of making it recover across an RTT. The
-    // design argued for datagrams on head-of-line-blocking grounds, and
-    // that still wins for many parallel flows over a clean backbone —
-    // hence the per-network setting rather than a single answer.
     "stream".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberCfg {
-    pub secret_hash: String,
+    /// The member's identity on the wire. Operator-chosen, unique within
+    /// the network, never 0.
+    pub node_id: NodeId,
+    /// The member's secret. Optional here: a secret minted into the
+    /// managed store (admin API / UI) takes precedence, and a member with
+    /// neither cannot join.
+    #[serde(default)]
+    pub secret: Option<String>,
     /// Relays only: public address the fleet and clients dial.
     #[serde(default)]
     pub relay_addr: Option<String>,
@@ -222,23 +215,33 @@ pub struct MemberCfg {
     pub want_vpn_ip: Option<bool>,
     #[serde(default)]
     pub max_session_mbps: Option<u32>,
-    /// Pre-provisioned TOFU pin (base64 x25519 pubkey).
-    ///
-    /// Setting this removes trust-on-first-use for the member entirely:
-    /// the very first join must present this key, so claiming a name you
-    /// do not hold the key for fails immediately rather than succeeding
-    /// once and locking the real member out.
-    #[serde(default)]
-    pub pinned_pubkey: Option<String>,
-    /// Operator-assigned node id. Left unset the coordinator allocates
-    /// one monotonically; set, it is authoritative for this member.
-    ///
-    /// The id is the data-plane identity — it is what peers address in
-    /// frames — so it is only honoured when the member is first created.
-    /// Renumbering a live member would strand every cached route and
-    /// session that already refers to the old id.
-    #[serde(default)]
-    pub node_id: Option<nqvpn_proto::types::NodeId>,
+}
+
+impl NetworkConfig {
+    /// Look a member up by its wire identity.
+    pub fn member_by_id(&self, id: NodeId) -> Option<(&str, &MemberCfg, Role)> {
+        self.clients
+            .iter()
+            .find(|(_, m)| m.node_id == id)
+            .map(|(n, m)| (n.as_str(), m, Role::Client))
+            .or_else(|| {
+                self.relays
+                    .iter()
+                    .find(|(_, m)| m.node_id == id)
+                    .map(|(n, m)| (n.as_str(), m, Role::Relay))
+            })
+    }
+
+    pub fn member_by_name(&self, name: &str) -> Option<(&MemberCfg, Role)> {
+        self.clients
+            .get(name)
+            .map(|m| (m, Role::Client))
+            .or_else(|| self.relays.get(name).map(|m| (m, Role::Relay)))
+    }
+
+    pub fn name_of(&self, id: NodeId) -> Option<&str> {
+        self.member_by_id(id).map(|(n, _, _)| n)
+    }
 }
 
 pub fn load_coord_config(path: &Path) -> Result<CoordConfig> {
@@ -285,59 +288,30 @@ pub fn load_networks(dir: &Path) -> Result<Vec<NetworkConfig>> {
 }
 
 pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
-    if !matches!(cfg.settings.relay_reachability.as_str(), "off" | "warn" | "deny") {
+    let s = &cfg.settings;
+    if !matches!(s.relay_reachability.as_str(), "off" | "warn" | "deny") {
         bail!(
             "network {}: relay_reachability must be \"off\", \"warn\", or \"deny\" (got {:?})",
             cfg.network_id,
-            cfg.settings.relay_reachability
+            s.relay_reachability
         );
     }
-    if !matches!(cfg.settings.transport.as_str(), "datagram" | "stream") {
-        bail!(
-            "network {}: transport must be \"datagram\" or \"stream\" (got {:?})",
-            cfg.network_id,
-            cfg.settings.transport
-        );
+    if !matches!(s.transport.as_str(), "datagram" | "stream") {
+        bail!("network {}: transport must be \"datagram\" or \"stream\"", cfg.network_id);
     }
-    if cfg.settings.lanes == 0
-        || cfg.settings.lanes > nqvpn_proto::transport::MAX_LANES
-    {
+    if s.lanes == 0 || s.lanes > nqvpn_proto::transport::MAX_LANES {
         bail!(
             "network {}: lanes must be between 1 and {} (got {})",
             cfg.network_id,
             nqvpn_proto::transport::MAX_LANES,
-            cfg.settings.lanes
+            s.lanes
         );
     }
-    // A node id is the wire identity. Two members sharing one would make
-    // frames for either deliverable to the other, so this has to be an
-    // error at load rather than something discovered on the data plane.
-    let mut seen_ids: std::collections::HashMap<nqvpn_proto::types::NodeId, &str> =
-        std::collections::HashMap::new();
-    // Likewise a shared pinned key: it would let one member authenticate
-    // as the other, which is exactly what pinning is meant to prevent.
-    let mut seen_keys: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for (name, m) in cfg.clients.iter().chain(cfg.relays.iter()) {
-        if let Some(id) = m.node_id {
-            if id == 0 {
-                bail!("network {}: member {name}: node_id must not be 0", cfg.network_id);
-            }
-            if let Some(other) = seen_ids.insert(id, name) {
-                bail!(
-                    "network {}: node_id {id} is assigned to both {other} and {name}",
-                    cfg.network_id
-                );
-            }
-        }
-        if let Some(k) = m.pinned_pubkey.as_deref() {
-            if let Some(other) = seen_keys.insert(k, name) {
-                bail!(
-                    "network {}: members {other} and {name} share a pinned_pubkey, so either \
-                     could authenticate as the other",
-                    cfg.network_id
-                );
-            }
-        }
+    if s.credential_ttl_mins == 0 || s.heartbeat_secs == 0 || s.offline_after == 0 {
+        bail!("network {}: credential_ttl_mins, heartbeat_secs and offline_after must be > 0", cfg.network_id);
+    }
+    if s.mtu < 1280 || s.mtu > 9000 {
+        bail!("network {}: mtu {} is outside 1280..=9000", cfg.network_id, s.mtu);
     }
     if cfg.cidrs.is_empty() {
         bail!("network {}: cidrs must not be empty", cfg.network_id);
@@ -345,7 +319,6 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
     if !cfg.cidrs.iter().any(|c| matches!(c, IpNet::V4(_))) {
         bail!("network {}: at least one IPv4 tunnel cidr is required", cfg.network_id);
     }
-    // Network cidrs must not overlap each other.
     for (i, a) in cfg.cidrs.iter().enumerate() {
         for b in cfg.cidrs.iter().skip(i + 1) {
             if overlaps(a, b) {
@@ -353,10 +326,11 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
             }
         }
     }
-    // Pools: inside a network cidr, pairwise disjoint.
+    // Pools: inside a network cidr (the whole pool, not just its first
+    // address), pairwise disjoint.
     let pools: Vec<(&String, &PoolCfg)> = cfg.pools.iter().collect();
     for (name, p) in &pools {
-        if !cfg.cidrs.iter().any(|c| c.contains(&p.cidr.network()) && overlaps(c, &p.cidr)) {
+        if !cfg.cidrs.iter().any(|c| c.contains(&p.cidr)) {
             bail!("pool {name}: {} is not inside any network cidr", p.cidr);
         }
     }
@@ -367,12 +341,12 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
             }
         }
     }
-    // Member namespace is shared between clients and relays.
     for name in cfg.clients.keys() {
         if cfg.relays.contains_key(name) {
             bail!("member {name} defined as both client and relay");
         }
     }
+    let mut seen_ids: HashMap<NodeId, &str> = HashMap::new();
     let mut seen4: BTreeMap<Ipv4Addr, String> = BTreeMap::new();
     let mut seen6: BTreeMap<Ipv6Addr, String> = BTreeMap::new();
     for (name, m, is_relay) in cfg
@@ -381,6 +355,21 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
         .map(|(n, m)| (n, m, false))
         .chain(cfg.relays.iter().map(|(n, m)| (n, m, true)))
     {
+        if m.node_id == 0 {
+            bail!("network {}: member {name}: node_id must not be 0", cfg.network_id);
+        }
+        if let Some(other) = seen_ids.insert(m.node_id, name) {
+            bail!(
+                "network {}: node_id {} is assigned to both {other} and {name}",
+                cfg.network_id,
+                m.node_id
+            );
+        }
+        if let Some(s) = &m.secret {
+            if s.trim().is_empty() {
+                bail!("member {name}: secret must not be empty");
+            }
+        }
         if !is_relay {
             if m.relay_addr.is_some() || !m.allowed_cidrs.is_empty() {
                 bail!("client {name}: relay_addr/allowed_cidrs are relay-only fields");
@@ -430,33 +419,55 @@ fn check_in_cidrs(cidrs: &[IpNet], ip: IpAddr) -> Result<()> {
     }
 }
 
-/// Endpoint validation (§3.2 / decision record): reject loopback,
-/// unspecified, multicast, link-local, and anything inside VPN-routed
-/// space. Hostnames are allowed (resolved by dialers, not here).
+fn unroutable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Endpoint validation (§3.2): reject loopback, unspecified, multicast,
+/// link-local, and anything inside VPN-routed space. Hostnames are
+/// resolved here as well, so a name pointing at tunnel space is caught
+/// at load rather than when every dialer loops into its own TUN.
 fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()> {
     let (host, port) = addr
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("relay {name}: relay_addr {addr:?} must be host:port"))?;
-    port.parse::<u16>()
+    let port: u16 = port
+        .parse()
         .map_err(|_| anyhow::anyhow!("relay {name}: bad port in relay_addr {addr:?}"))?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let bad = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
+    let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            use std::net::ToSocketAddrs;
+            match (host, port).to_socket_addrs() {
+                Ok(it) => it.map(|s| s.ip()).collect(),
+                // Unresolvable now is not a planning bug (DNS may be
+                // down at boot); dialers will report it.
+                Err(_) => Vec::new(),
             }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-        if bad {
-            bail!("relay {name}: relay_addr {addr:?} uses an unroutable address class");
+        }
+    };
+    for ip in ips {
+        if unroutable(ip) {
+            bail!("relay {name}: relay_addr {addr:?} resolves to an unroutable address {ip}");
         }
         if cfg.cidrs.iter().any(|c| c.contains(&ip)) {
-            bail!("relay {name}: relay_addr {addr:?} lies inside tunnel space");
+            bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside tunnel space");
         }
         let in_lan = cfg
             .relays
@@ -465,7 +476,7 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
             .flat_map(|m| m.allowed_cidrs.iter())
             .any(|c| c.contains(&ip));
         if in_lan {
-            bail!("relay {name}: relay_addr {addr:?} lies inside a routed LAN prefix");
+            bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside a routed LAN prefix");
         }
     }
     Ok(())
@@ -493,12 +504,14 @@ cidrs = ["10.99.0.0/16", "fd99::/64"]
 [pools.default]
 cidr = "10.99.1.0/24"
 [relays.r1]
-secret_hash = "$argon2id$x"
+node_id = 1
+secret = "s"
 relay_addr = "1.2.3.4:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 [clients.c1]
-secret_hash = "$argon2id$x"
+node_id = 10
+secret = "s"
 pool = "default"
 "#
         .to_string()
@@ -509,28 +522,22 @@ pool = "default"
     }
 
     #[test]
-    fn valid_config_passes() {
-        validate_network(&parse(&base())).unwrap();
+    fn valid_config_passes_and_indexes_by_id() {
+        let cfg = parse(&base());
+        validate_network(&cfg).unwrap();
+        assert_eq!(cfg.member_by_id(10).unwrap().0, "c1");
+        assert_eq!(cfg.member_by_id(1).unwrap().2, Role::Relay);
+        assert!(cfg.member_by_id(99).is_none());
+        assert_eq!(cfg.settings.liveness_window_secs(), 15);
     }
 
     #[test]
-    fn reachability_policy_is_validated() {
-        let mut s = base();
-        s.push_str("[settings]\nrelay_reachability = \"nonsense\"\n");
-        assert!(validate_network(&parse(&s)).is_err());
-        for ok in ["off", "warn", "deny"] {
-            let mut s = base();
-            s.push_str(&format!("[settings]\nrelay_reachability = \"{ok}\"\n"));
-            validate_network(&parse(&s)).unwrap();
-        }
-        // Default is the advisory one.
-        assert_eq!(parse(&base()).settings.relay_reachability, "warn");
-    }
-
-    #[test]
-    fn pool_outside_cidrs_fails() {
-        let cfg = parse(&base().replace("10.99.1.0/24", "10.200.0.0/24"));
-        assert!(validate_network(&cfg).is_err());
+    fn pool_must_be_entirely_inside_a_cidr() {
+        assert!(validate_network(&parse(&base().replace("10.99.1.0/24", "10.200.0.0/24"))).is_err());
+        // Larger than its network: the old check only looked at the
+        // first address and let the allocator hand out tunnel-space
+        // addresses that were outside every route.
+        assert!(validate_network(&parse(&base().replace("10.99.1.0/24", "10.0.0.0/8"))).is_err());
     }
 
     #[test]
@@ -543,106 +550,63 @@ pool = "default"
     #[test]
     fn client_with_relay_fields_fails() {
         let mut s = base();
-        s.push_str("[clients.c2]\nsecret_hash = \"x\"\nrelay_addr = \"1.1.1.1:1\"\n");
+        s.push_str("[clients.c2]\nnode_id = 11\nrelay_addr = \"1.1.1.1:1\"\n");
         assert!(validate_network(&parse(&s)).is_err());
     }
 
     #[test]
     fn relay_without_addr_fails() {
         let mut s = base();
-        s.push_str("[relays.r2]\nsecret_hash = \"x\"\n");
+        s.push_str("[relays.r2]\nnode_id = 2\n");
         assert!(validate_network(&parse(&s)).is_err());
     }
 
     #[test]
-    fn relay_addr_in_tunnel_space_fails() {
-        let cfg = parse(&base().replace("1.2.3.4:4444", "10.99.0.7:4444"));
-        assert!(validate_network(&cfg).is_err());
+    fn relay_addr_in_tunnel_space_or_loopback_fails() {
+        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "10.99.0.7:4444"))).is_err());
+        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "127.0.0.1:4444"))).is_err());
+        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "localhost:4444"))).is_err(), "names resolve too");
     }
 
     #[test]
-    fn relay_addr_loopback_fails() {
-        let cfg = parse(&base().replace("1.2.3.4:4444", "127.0.0.1:4444"));
-        assert!(validate_network(&cfg).is_err());
-    }
-
-    #[test]
-    fn duplicate_preferred_ip_fails() {
+    fn duplicate_preferred_ip_and_node_id_fail() {
         let mut s = base();
-        s.push_str("[clients.c9]\nsecret_hash = \"x\"\npreferred_ip4 = \"10.99.0.1\"\n");
+        s.push_str("[clients.c9]\nnode_id = 9\npreferred_ip4 = \"10.99.0.1\"\n");
         assert!(validate_network(&parse(&s)).is_err());
+        let mut d = base();
+        d.push_str("[clients.c9]\nnode_id = 10\n");
+        let err = validate_network(&parse(&d)).unwrap_err();
+        assert!(format!("{err}").contains("node_id 10"), "{err}");
+        let z = base().replace("node_id = 10", "node_id = 0");
+        assert!(validate_network(&parse(&z)).is_err());
     }
 
     #[test]
     fn allowed_cidr_overlapping_tunnel_fails() {
-        let cfg = parse(&base().replace("192.168.1.0/24", "10.99.5.0/24"));
-        assert!(validate_network(&cfg).is_err());
-    }
-
-    #[test]
-    fn unknown_pool_fails() {
-        let cfg = parse(&base().replace("pool = \"default\"", "pool = \"nope\""));
-        assert!(validate_network(&cfg).is_err());
+        assert!(validate_network(&parse(&base().replace("192.168.1.0/24", "10.99.5.0/24"))).is_err());
     }
 
     #[test]
     fn overlapping_allowed_cidrs_across_relays_ok_for_failover() {
         let mut s = base();
-        s.push_str(
-            "[relays.r2]\nsecret_hash = \"x\"\nrelay_addr = \"5.6.7.8:4444\"\nallowed_cidrs = [\"192.168.1.0/24\"]\n",
-        );
+        s.push_str("[relays.r2]\nnode_id = 2\nrelay_addr = \"5.6.7.8:4444\"\nallowed_cidrs = [\"192.168.1.0/24\"]\n");
         validate_network(&parse(&s)).unwrap();
     }
 
     #[test]
-    fn duplicate_node_id_is_rejected() {
-        // Two members sharing a wire identity would make frames for
-        // either deliverable to the other — a load-time error, not
-        // something to discover on the data plane.
-        let mut s = base();
-        s = s.replace("[clients.c1]", "node_id = 7\n[clients.c1]");
-        s.push_str("node_id = 7\n");
-        let err = validate_network(&parse(&s)).expect_err("duplicate node_id must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("node_id 7"), "{msg}");
-        assert!(msg.contains("r1") && msg.contains("c1"), "must name both: {msg}");
+    fn a_secret_is_optional_but_not_empty() {
+        let s = base().replace("secret = \"s\"\npool", "pool");
+        validate_network(&parse(&s)).expect("managed store may hold it");
+        assert!(validate_network(&parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
     }
 
     #[test]
-    fn distinct_node_ids_pass_and_zero_is_rejected() {
+    fn settings_are_bounds_checked() {
         let mut s = base();
-        s = s.replace("[clients.c1]", "node_id = 7\n[clients.c1]");
-        s.push_str("node_id = 8\n");
-        validate_network(&parse(&s)).expect("distinct ids are fine");
-
-        let mut z = base();
-        z = z.replace("[clients.c1]", "node_id = 0\n[clients.c1]");
-        assert!(validate_network(&parse(&z)).is_err(), "0 is not a valid node id");
-    }
-
-    #[test]
-    fn node_id_is_optional() {
-        // Unset must stay the default, or every existing config breaks.
-        let cfg = parse(&base());
-        assert!(cfg.relays["r1"].node_id.is_none());
-        assert!(cfg.clients["c1"].node_id.is_none());
-        validate_network(&cfg).unwrap();
-    }
-
-    #[test]
-    fn a_shared_pinned_pubkey_is_rejected() {
-        // Pinning exists to bind a name to a key. Two names on one key
-        // means either can authenticate as the other, which defeats it.
+        s.push_str("[settings]\ncredential_ttl_mins = 0\n");
+        assert!(validate_network(&parse(&s)).is_err());
         let mut s = base();
-        s = s.replace("[clients.c1]", "pinned_pubkey = \"AAAA\"\n[clients.c1]");
-        s.push_str("pinned_pubkey = \"AAAA\"\n");
-        let err = validate_network(&parse(&s)).expect_err("shared pin must fail");
-        assert!(format!("{err}").contains("pinned_pubkey"), "{err}");
-
-        // Distinct pins are the normal, correct case.
-        let mut ok = base();
-        ok = ok.replace("[clients.c1]", "pinned_pubkey = \"AAAA\"\n[clients.c1]");
-        ok.push_str("pinned_pubkey = \"BBBB\"\n");
-        validate_network(&parse(&ok)).expect("distinct pins are fine");
+        s.push_str("[settings]\nmtu = 100\n");
+        assert!(validate_network(&parse(&s)).is_err());
     }
 }

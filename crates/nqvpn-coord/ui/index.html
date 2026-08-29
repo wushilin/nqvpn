@@ -7,10 +7,12 @@
 <style>
 :root{--bg:#fbfbfd;--fg:#1d1d22;--muted:#6b6b78;--line:#e3e3ea;--card:#fff;--sunk:#f5f5f8;
       --ok:#0a7a44;--okbg:#e6f5ed;--off:#8a8a96;--offbg:#f0f0f3;--warn:#a4571a;--warnbg:#fdf1e3;
+      --bad:#b3261e;--badbg:#fbe9e7;
       --accent:#2b5fd9;--accent2:#7d3fd1;--heat:43,95,217;--shadow:0 1px 3px rgba(0,0,0,.07),0 8px 24px rgba(0,0,0,.06);}
 @media (prefers-color-scheme:dark){
 :root{--bg:#131317;--fg:#ececf1;--muted:#9a9aa6;--line:#2a2a33;--card:#1b1b21;--sunk:#16161b;
       --ok:#54d19a;--okbg:#14301f;--off:#8a8a96;--offbg:#232329;--warn:#e0a35c;--warnbg:#33240f;
+      --bad:#ff7b72;--badbg:#3a1a17;
       --accent:#7ea2ff;--accent2:#b48cff;--heat:126,162,255;--shadow:0 1px 3px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
@@ -19,19 +21,21 @@ header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
        padding:14px 24px;border-bottom:1px solid var(--line);background:var(--card)}
 h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
 .sub{color:var(--muted);font-size:13px}
-main{padding:20px 24px 60px;max-width:1240px;margin:0 auto}
+main{padding:20px 24px 60px;max-width:1320px;margin:0 auto}
 .cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:118px}
 .card .n{font-size:24px;font-weight:640;letter-spacing:-.02em}
 .card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
-   margin:26px 0 10px;font-weight:600}
+   margin:26px 0 10px;font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 h2:first-child{margin-top:4px}
+h2 .gen{font-weight:700;color:var(--accent);text-transform:none;letter-spacing:0}
+h2 .uuid{font-weight:400;text-transform:none;letter-spacing:0;font-family:ui-monospace,Menlo,monospace;font-size:11px}
 .wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;
    letter-spacing:.04em;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
 tr:last-child td{border-bottom:none}
 code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600}
@@ -39,18 +43,27 @@ code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .offl{background:var(--offbg);color:var(--off)}
 .dis{background:var(--warnbg);color:var(--warn)}
 .warnpill{background:var(--warnbg);color:var(--warn)}
+.badpill{background:var(--badbg);color:var(--bad)}
 button{font:inherit;font-size:13px;padding:5px 11px;border:1px solid var(--line);
        border-radius:7px;background:var(--card);color:var(--fg);cursor:pointer}
 button:hover{border-color:var(--accent);color:var(--accent)}
 button:disabled{opacity:.5;cursor:default}
+button.danger{border-color:var(--warn);color:var(--warn)}
+button.primary{border-color:var(--accent);color:var(--accent);font-weight:600}
 .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 .msg{font-size:13px;color:var(--muted)}
 .err{color:var(--warn)}
 input{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
       border-radius:7px;background:var(--card);color:var(--fg);min-width:240px}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
 .muted{color:var(--muted)}
 .tiny{font-size:12px}
-.note{color:var(--muted);font-size:13px;margin:-4px 0 12px;max-width:70ch}
+.note{color:var(--muted);font-size:13px;margin:-4px 0 12px;max-width:74ch}
+.subline{display:block;font-size:11.5px;color:var(--muted);margin-top:2px}
+.subline.warn{color:var(--warn)}
+.name{cursor:pointer;font-weight:560}
+.name:hover{color:var(--accent)}
+.actions button{margin-right:6px}
 
 /* ---- tabs ---- */
 .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:20px}
@@ -97,12 +110,12 @@ input{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
          justify-content:center;padding:24px;z-index:50;backdrop-filter:blur(2px)}
 .overlay[hidden]{display:none}
 .modal{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);
-       max-width:620px;width:100%;max-height:82vh;overflow:auto}
+       max-width:640px;width:100%;max-height:82vh;overflow:auto}
 .modal header{border-radius:14px 14px 0 0;position:sticky;top:0}
 .modal .body{padding:18px 22px 22px}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;font-size:13px;margin-bottom:18px}
 .kv dt{color:var(--muted)}
-.kv dd{margin:0;font-family:ui-monospace,Menlo,monospace}
+.kv dd{margin:0;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
 .clist{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .clist li{display:flex;align-items:center;gap:10px;padding:9px 13px;border-bottom:1px solid var(--line);font-size:13px}
 .clist li:last-child{border-bottom:none}
@@ -111,53 +124,7 @@ input{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
 .empty{color:var(--muted);font-size:13px;padding:14px;text-align:center;
        border:1px dashed var(--line);border-radius:9px}
 
-/* ---- page furniture ---- */
-.page-head{margin-bottom:20px}
-.page-head h3{font-size:20px;margin:0 0 4px;font-weight:650;letter-spacing:-.02em}
-.page-head p{margin:0;color:var(--muted);font-size:13px;max-width:74ch;line-height:1.55}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:20px}
-.panel-head{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;
-            align-items:center;gap:10px;flex-wrap:wrap}
-.panel-head h4{margin:0;font-size:14px;font-weight:620}
-.panel-head .hint{color:var(--muted);font-size:12px}
-.panel-body{padding:18px}
-.panel .wrap{border:none;border-radius:0;background:none}
-
-/* ---- form ---- */
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{font-size:12px;font-weight:600;color:var(--muted);
-             text-transform:uppercase;letter-spacing:.04em}
-.field .help{font-size:12px;color:var(--muted);line-height:1.45}
-.form-grid{display:grid;grid-template-columns:minmax(200px,1.2fr) minmax(180px,1fr);
-           gap:18px;align-items:start}
-@media (max-width:720px){.form-grid{grid-template-columns:1fr}}
-select{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);
-       border-radius:7px;background:var(--card);color:var(--fg)}
-input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
-
-/* ---- segmented kind picker ---- */
-.seg{display:flex;gap:8px;flex-wrap:wrap}
-.seg .opt{flex:1;min-width:150px;border:1px solid var(--line);border-radius:9px;
-          padding:10px 12px;cursor:pointer;background:var(--card);text-align:left}
-.seg .opt:hover{border-color:var(--accent)}
-.seg .opt[aria-pressed="true"]{border-color:var(--accent);
-          box-shadow:inset 0 0 0 1px var(--accent);background:var(--sunk)}
-.seg .opt .t{display:block;font-weight:620;font-size:13px;margin-bottom:2px}
-.seg .opt .d{display:block;color:var(--muted);font-size:11.5px;line-height:1.4}
-
-/* ---- toolbar + badges ---- */
-.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
-         padding:12px 18px;border-bottom:1px solid var(--line)}
-.toolbar input{min-width:220px}
-.count{color:var(--muted);font-size:12px;margin-left:auto}
-.badge{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;
-       font-weight:650;letter-spacing:.02em}
-.b-admin{background:var(--warnbg);color:var(--warn)}
-.b-relay{background:rgba(var(--heat),.16);color:var(--accent)}
-.b-client{background:var(--okbg);color:var(--ok)}
-.b-fallback{background:var(--offbg);color:var(--off)}
-
-/* ---- the one-time secret ---- */
+/* ---- the secret ---- */
 .secret-box{border:1px solid var(--accent);border-radius:10px;background:var(--sunk);
             padding:16px;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
             word-break:break-all;user-select:all}
@@ -165,6 +132,7 @@ input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;bor
          background:var(--warnbg);color:var(--warn);font-size:13px;line-height:1.5;
          margin-bottom:14px}
 .warnbar b{font-weight:680}
+.cfg{padding:14px;font:12.5px/1.6 ui-monospace,Menlo,monospace;white-space:pre;overflow-x:auto;user-select:all}
 </style>
 </head>
 <body>
@@ -185,22 +153,18 @@ input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;bor
   <div class="cards" id="cards"></div>
 
   <div class="tabs" role="tablist">
-    <button role="tab" data-tab="members" aria-selected="true">Members</button>
-    <button role="tab" data-tab="routing" aria-selected="false">Routing</button>
-    <button role="tab" data-tab="stats" aria-selected="false">Stats</button>
+    <button role="tab" data-tab="status" aria-selected="true">Status</button>
     <button role="tab" data-tab="topology" aria-selected="false">Topology</button>
-    <button role="tab" data-tab="secrets" aria-selected="false">Secrets</button>
+    <button role="tab" data-tab="stats" aria-selected="false">Stats</button>
   </div>
 
-  <div class="pane" id="pane-members"></div>
-  <div class="pane" id="pane-routing" hidden></div>
-  <div class="pane" id="pane-stats" hidden></div>
+  <div class="pane" id="pane-status"></div>
   <div class="pane" id="pane-topology" hidden></div>
-  <div class="pane" id="pane-secrets" hidden></div>
+  <div class="pane" id="pane-stats" hidden></div>
 </main>
 
 <div class="overlay" id="overlay" hidden>
-  <div class="modal" role="dialog" aria-modal="true">
+  <div class="modal" id="confirmModal" role="dialog" aria-modal="true">
     <header>
       <h1 id="modal-title">node</h1>
       <span class="sub" id="modal-sub"></span>
@@ -217,14 +181,14 @@ const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.classN
   if (txt !== undefined) e.textContent = txt; return e; };
 const svgEl = (t, attrs = {}) => { const e = document.createElementNS('http://www.w3.org/2000/svg', t);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
+const enc = encodeURIComponent;
 
-let token = sessionStorage.getItem('nqvpn_token') || '';
-$('#token').value = token;
-let activeTab = sessionStorage.getItem('nqvpn_tab') || 'members';
-/** Last payload, so the modal can render without another round trip. */
+/// The admin token lives in this variable and nowhere else: it is never
+/// written to storage, so closing the tab forgets it.
+let token = '';
+let activeTab = 'status';
+/** Last payload, so modals can render without another round trip. */
 let snapshot = null;
-/// Network ids, kept so the secrets tab can render without a refetch.
-let knownNetworks = [];
 
 function msg(text, isErr) { const m = $('#msg'); m.textContent = text; m.className = isErr ? 'msg err' : 'msg'; }
 
@@ -237,6 +201,8 @@ async function api(path, opts = {}) {
   }
   return r.json();
 }
+
+const memberPath = (net, m) => `/api/v1/networks/${enc(net)}/members/${enc(m.node_id)}`;
 
 /* ---------- formatting ---------- */
 
@@ -262,12 +228,54 @@ function fmtPkts(n) {
   if (n < 1e9) return (n/1e6).toFixed(1) + 'M';
   return (n/1e9).toFixed(2) + 'G';
 }
+const nowUnix = () => Math.floor(Date.now() / 1000);
+function fmtAge(unix) {
+  if (!unix) return '—';
+  const s = Math.max(0, nowUnix() - unix);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+  return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
+}
+const fmtTime = unix => unix ? new Date(unix * 1000).toLocaleString() : '—';
+const addrOf = m => [m.ip4, m.ip6].filter(Boolean).join('  ');
 
 /* ---------- shared bits ---------- */
 
 function pill(m) {
   if (m.disabled) return el('span', 'pill dis', 'disabled');
   return m.online ? el('span', 'pill on', 'online') : el('span', 'pill offl', 'offline');
+}
+
+/// How the member's view of the network compares with the coordinator's.
+/// A member reports the generation it applied plus a digest of it; a
+/// matching generation with a wrong digest means it holds a different
+/// table than the one the coordinator handed out.
+function viewState(st, m) {
+  if (m.reported_gen === undefined || m.reported_gen === null) {
+    return { cls: 'muted', label: 'no report', title: 'This member has not reported which generation it applied yet.' };
+  }
+  const g = m.reported_gen, cur = st.gen;
+  if (g === cur && m.digest_ok) {
+    return { cls: 'pill on', label: 'OK · gen ' + g, title: 'Applied the current generation and its digest matches.' };
+  }
+  if (g < cur) {
+    return { cls: 'pill warnpill', label: `behind · ${g} / ${cur}`,
+             title: `Applied generation ${g}; the network is at ${cur}. It should catch up on its next heartbeat.` };
+  }
+  if (g > cur) {
+    return { cls: 'pill badpill', label: `mismatch · ${g} > ${cur}`,
+             title: `Reports generation ${g}, newer than the coordinator's ${cur}. Usually a coordinator restart; the next push fixes it.` };
+  }
+  return { cls: 'pill badpill', label: 'mismatch · gen ' + g,
+           title: 'Generation matches but the digest does not: the member holds a different table than this coordinator sent.' };
+}
+
+function viewCell(st, m) {
+  const v = viewState(st, m);
+  const s = el('span', v.cls, v.label);
+  s.title = v.title;
+  return s;
 }
 
 function table(headers, rows) {
@@ -281,90 +289,234 @@ function table(headers, rows) {
   return wrap;
 }
 
-function memberRow(net, m) {
+function netHeading(st, label) {
+  const h = el('h2');
+  h.append(el('span', null, label ? `${label} · ${st.network_id}` : st.network_id));
+  h.append(el('span', 'gen', 'gen ' + st.gen));
+  if (!label) h.append(el('span', 'uuid', st.network_uuid));
+  return h;
+}
+
+/* ---------- members ---------- */
+
+function memberRow(st, m) {
+  const net = st.network_id;
   const tr = el('tr');
-  tr.append(el('td', null, m.name));
+
+  const nm = el('td'); const nl = el('span', 'name', m.name);
+  nl.onclick = () => (m.role === 'relay' ? showRelay(st, m) : showMember(st, m));
+  nm.append(nl); tr.append(nm);
+
   const idc = el('td'); idc.append(el('code', null, '#' + m.node_id)); tr.append(idc);
   tr.append(el('td', 'muted', m.role));
-  const st = el('td'); st.append(pill(m)); tr.append(st);
-  const ip = el('td'); ip.append(el('code', null, [m.ip4, m.ip6].filter(Boolean).join('  ') || '—')); tr.append(ip);
+  const state = el('td'); state.append(pill(m)); tr.append(state);
+  const ip = el('td'); ip.append(el('code', null, addrOf(m) || '—')); tr.append(ip);
   const cidrs = el('td'); cidrs.append(el('code', null, (m.registered_cidrs||[]).join(' ') || '—')); tr.append(cidrs);
-  tr.append(el('td', 'muted', m.attached_relay || '—'));
-  const keyc = el('td');
-  const rotating = (m.pins || []).filter(p => p.retires_unix);
-  if (!m.pinned) {
-    keyc.append(el('span', 'pill dis', 'unpinned'));
-    keyc.title = 'No key is pinned yet. The next join will pin whatever key it presents, ' +
-                 'so this member is claimable by anyone holding its secret.';
-  } else if (rotating.length) {
-    keyc.append(el('span', 'pill warnpill', 'rotating'));
-    const until = Math.min(...rotating.map(p => p.retires_unix));
-    keyc.title = 'A rotation is in flight: a new identity is registered and the previous one ' +
-                 'still works until ' + new Date(until * 1000).toLocaleString() +
-                 '. Both authenticate until then, so a restart mid-rotation is safe.';
-  } else {
-    keyc.append(el('span', 'muted', 'pinned'));
-  }
-  keyc.onclick = () => showPins(m);
-  keyc.style.cursor = 'pointer';
-  tr.append(keyc);
-  const reach = el('td');
-  if (m.advertised_reachable === 'unreachable') {
-    reach.append(el('span', 'pill dis', 'unreachable'));
-    reach.title = 'The coordinator cannot dial this relay\'s advertised address. ' +
-                  'Other relays will fail to mesh with it — check the firewall and relay_addr.';
-  } else if (m.advertised_reachable === 'reachable') {
-    reach.append(el('span', 'pill on', 'reachable'));
-  } else {
-    reach.append(el('span', 'muted', m.role === 'relay' ? '—' : ''));
-  }
-  tr.append(reach);
 
-  const act = el('td');
+  // Relays have no attached relay; the useful fact about them is whether
+  // the coordinator can dial the address they advertise.
+  const relay = el('td');
+  if (m.role === 'relay') {
+    if (m.advertised_reachable === 'unreachable') {
+      relay.append(el('span', 'pill dis', 'unreachable'));
+      relay.title = 'The coordinator cannot dial this relay\'s advertised address. ' +
+                    'Other relays will fail to mesh with it — check the firewall and relay_addr.';
+    } else if (m.advertised_reachable === 'reachable') {
+      relay.append(el('span', 'pill on', 'reachable'));
+    } else {
+      relay.append(el('span', 'muted', 'not probed'));
+    }
+  } else {
+    relay.append(el('span', m.attached_relay ? '' : 'muted', m.attached_relay || '—'));
+  }
+  tr.append(relay);
+
+  const hb = el('td');
+  if (m.last_heartbeat_unix) {
+    hb.append(el('span', null, fmtAge(m.last_heartbeat_unix) + ' ago'));
+    hb.title = fmtTime(m.last_heartbeat_unix);
+  } else hb.append(el('span', 'muted', '—'));
+  tr.append(hb);
+
+  const view = el('td'); view.append(viewCell(st, m)); tr.append(view);
+
+  const join = el('td');
+  if (m.last_join_unix) {
+    join.append(el('span', null, m.last_join_from || 'unknown source'));
+    join.append(el('span', 'subline', fmtTime(m.last_join_unix) + ' · login gen ' + m.login_gen));
+  } else {
+    join.append(el('span', 'muted', 'never'));
+  }
+  if (m.replaced_unix) {
+    const rep = el('span', 'subline warn',
+      'replaced from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix));
+    rep.title = 'A newer session for this node id took over and the earlier one was closed. ' +
+                'Two machines with the same node id and secret will keep displacing each other.';
+    join.append(rep);
+  }
+  tr.append(join);
+
+  const act = el('td', 'actions');
+  const sec = el('button', null, 'Show secret');
+  sec.onclick = () => showSecret(net, m);
   const toggle = el('button', null, m.disabled ? 'Enable' : 'Disable');
   toggle.onclick = async () => {
     toggle.disabled = true;
     try {
-      await api(`/api/v1/networks/${net}/clients/${m.name}/${m.disabled ? 'enable' : 'disable'}`, { method: 'POST' });
-      msg(`${m.disabled ? 'Enabled' : 'Disabled'} ${m.name}`); refresh();
+      const r = await api(memberPath(net, m) + `/${m.disabled ? 'enable' : 'disable'}`, { method: 'POST' });
+      msg(`${r.disabled ? 'Disabled' : 'Enabled'} ${m.name}`); refresh();
     } catch (e) { msg('' + e.message, true); toggle.disabled = false; }
   };
-  const reset = el('button', null, 'Reset pin');
-  reset.style.marginLeft = '6px';
-  reset.onclick = async () => {
-    if (!confirm(`Reset the TOFU key pin for ${m.name}?\n\nIt will be re-pinned on its next join. A member that is currently online is removed from the relay fleet until it re-joins.`)) return;
-    reset.disabled = true;
-    try { await api(`/api/v1/networks/${net}/clients/${m.name}/reset-pin`, { method: 'POST' });
-          msg(`Pin reset for ${m.name}`); refresh(); }
-    catch (e) { msg('' + e.message, true); reset.disabled = false; }
-  };
-  const del = el('button', null, 'Delete');
-  del.style.cssText = 'margin-left:6px;border-color:var(--warn);color:var(--warn)';
+  const del = el('button', 'danger', 'Delete');
   del.onclick = () => confirmModal({
     title: 'Delete ' + m.name + '?',
-    sub: net,
-    lead: 'This forgets the member. It does not ban it — if the member is still in the ' +
-          'network config it can join again, and having no pins it would be re-pinned by ' +
-          'trust-on-first-use. Use Disable if the intent is to keep it out.',
+    sub: net + ' · #' + m.node_id,
+    lead: 'This forgets the member and everything the coordinator holds for it. It does not ' +
+          'ban it: if node id #' + m.node_id + ' is still listed in the network config with a ' +
+          'secret, it can join again. Use Disable if the intent is to keep it out.',
     details: [
-      'Its VPN address (' + ([m.ip4, m.ip6].filter(Boolean).join(', ') || 'none') +
-        ') is released back to the pool',
-      'Its pinned key and certificate are forgotten',
+      'Its VPN address (' + (addrOf(m) || 'none') + ') is released back to the pool',
+      'Any managed secret for it is deleted; only a config secret, if one exists, would still admit it',
       'Any routes it owns are withdrawn; the next-oldest registrant takes over',
-      'Any managed secret for it is deleted',
       m.online ? 'It is currently ONLINE and its session will be closed' : 'It is offline',
     ],
     danger: 'Delete member',
     onConfirm: async () => {
-      const r = await api(`/api/v1/networks/${net}/clients/${m.name}`, { method: 'DELETE' });
+      const r = await api(memberPath(net, m), { method: 'DELETE' });
+      const freed = [r.freed_ip4, r.freed_ip6].filter(Boolean).join(', ');
       msg(`Deleted ${m.name}` +
+          (freed ? ` — freed ${freed}` : '') +
+          (r.secret_removed ? ' — managed secret removed' : '') +
           (r.still_in_config ? ' — still in the network config, so it can re-join' : ''));
       refresh();
     },
   });
-  act.append(toggle, reset, del);
+  act.append(sec, toggle, del);
   tr.append(act);
   return tr;
+}
+
+/* ---------- secret modal ---------- */
+
+async function showSecret(net, m) {
+  const body = openModal(m.name, `secret · #${m.node_id} · ${net}`);
+  body.append(el('div', 'empty', 'Loading…'));
+  let r;
+  try { r = await api(memberPath(net, m) + '/secret'); }
+  catch (e) { body.replaceChildren(el('div', 'empty', 'Could not load the secret: ' + e.message)); return; }
+  paintSecret(body, net, m, r, false);
+}
+
+/// `fresh` is true right after a Regenerate, when the operator needs to
+/// be told the old value is already dead.
+function paintSecret(body, net, m, r, fresh) {
+  body.replaceChildren();
+
+  if (fresh) {
+    const warn = el('div', 'warnbar');
+    warn.append(el('span', null, '⚠'));
+    const wt = el('div');
+    wt.append(el('b', null, 'New secret issued. '));
+    wt.append(document.createTextNode(
+      'The previous secret stops working immediately. ' + m.name + ' keeps its current session, ' +
+      'but the next time it joins it is refused until its config carries this value.'));
+    warn.append(wt);
+    body.append(warn);
+  }
+
+  const managed = r.source === 'managed';
+  body.append(kv([
+    ['Node id', '#' + r.node_id],
+    ['Source', managed ? 'managed — issued from this console' : 'network config'],
+    ['Disabled', r.disabled ? 'yes' : 'no'],
+  ]));
+
+  if (r.secret) {
+    const box = el('div', 'secret-box', r.secret);
+    body.append(box);
+    const bar = el('div', 'bar');
+    bar.style.margin = '14px 0 4px';
+    const copy = el('button', 'primary', 'Copy secret');
+    const done = el('span', 'msg');
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(r.secret);
+        done.textContent = 'Copied to clipboard';
+      } catch {
+        // Clipboard access needs a secure context, which plain HTTP is not.
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(box);
+        sel.removeAllRanges(); sel.addRange(range);
+        done.textContent = 'Selected — copy with ' +
+          (navigator.platform.includes('Mac') ? '⌘C' : 'Ctrl+C');
+      }
+    };
+    bar.append(copy, done);
+    body.append(bar);
+
+    body.append(el('h2', null, 'Member configuration'));
+    const cfg = el('div', 'wrap');
+    cfg.append(el('div', 'cfg',
+      `network_id = "${net}"\n` +
+      `node_id = ${r.node_id}\n` +
+      `secret = "${r.secret}"`));
+    body.append(cfg);
+    body.append(el('p', 'note',
+      'A member is its node id plus this secret; both are needed to join. Prefer a secret file ' +
+      'in production so the value is not kept in the config itself.'));
+  } else {
+    body.append(el('div', 'empty', managed
+      ? 'No secret is stored for this member.'
+      : 'This member authenticates with the secret from the network config, which is not readable here. ' +
+        'Regenerate to give it a managed secret instead.'));
+  }
+
+  body.append(el('h2', null, 'Actions'));
+  const acts = el('div', 'bar');
+  const regen = el('button', 'primary', 'Regenerate');
+  regen.onclick = () => confirmModal({
+    title: 'Regenerate the secret for ' + m.name + '?',
+    sub: net + ' · #' + m.node_id,
+    lead: 'A new secret is issued and shown here. This is also how a lost secret is recovered.',
+    details: [
+      'The current secret stops working immediately',
+      m.online
+        ? m.name + ' is ONLINE — it keeps running until it next joins, then is refused until updated'
+        : m.name + ' cannot join until its config carries the new secret',
+      managed ? 'The managed secret is replaced' : 'The config secret is no longer accepted once a managed one exists',
+    ],
+    danger: 'Regenerate',
+    onConfirm: async () => {
+      const n = await api(memberPath(net, m) + '/secret', { method: 'POST' });
+      const b = openModal(m.name, `secret · #${m.node_id} · ${net}`);
+      paintSecret(b, net, m, { node_id: n.node_id, secret: n.secret, source: 'managed', disabled: r.disabled }, true);
+      return true; // keep the modal open with the new secret in it
+    },
+  });
+  acts.append(regen);
+  if (managed) {
+    const rm = el('button', 'danger', 'Remove managed secret');
+    rm.onclick = () => confirmModal({
+      title: 'Remove the managed secret for ' + m.name + '?',
+      sub: net + ' · #' + m.node_id,
+      lead: 'The managed secret is deleted. This is not the same as disabling the member: it ' +
+            'falls back to the secret in its network config, if it has one.',
+      details: [
+        'If ' + m.name + ' has a config secret it can still join with it',
+        'If it has none, it cannot join at all until a secret is issued again',
+        'Disable instead if the intent is to keep it out',
+      ],
+      danger: 'Remove managed secret',
+      onConfirm: async () => {
+        await api(memberPath(net, m) + '/secret', { method: 'DELETE' });
+        msg('Removed the managed secret for ' + m.name);
+        refresh();
+      },
+    });
+    acts.append(rm);
+  }
+  body.append(acts);
 }
 
 /* ---------- stats: the N x N traffic matrix ---------- */
@@ -378,7 +530,7 @@ function trafficIndex(st) {
   const rows = new Map(), links = new Map();
   for (const r of (st.relay_traffic || [])) {
     rows.set(r.relay, r);
-    for (const l of r.links) links.set(r.relay + ' ' + l.peer, l);
+    for (const l of r.links) links.set(r.relay + ' ' + l.peer, l);
   }
   return { rows, links };
 }
@@ -386,7 +538,7 @@ function trafficIndex(st) {
 function matrixPane(st) {
   const pane = el('div');
   const relays = relaysOf(st);
-  pane.append(el('h2', null, `Fleet traffic · ${st.network_id}`));
+  pane.append(netHeading(st, 'Fleet traffic'));
 
   if (!relays.length) { pane.append(el('div', 'empty', 'No relays in this network.')); return pane; }
 
@@ -460,7 +612,7 @@ function matrixPane(st) {
         tr.append(td);
         continue;
       }
-      const link = idx.links.get(src.name + ' ' + dst.name);
+      const link = idx.links.get(src.name + ' ' + dst.name);
       if (!link || (!link.tx_bytes && !link.rx_bytes)) {
         td.append(el('span', 'zero', link ? '0' : '—'));
         td.title = link ? 'Link exists, nothing sent yet' : 'No mesh link reported between these relays';
@@ -477,7 +629,7 @@ function matrixPane(st) {
                     link.rx_bps && '↓' + fmtRate(link.rx_bps)].filter(Boolean).join('  ');
       if (rate) c.append(el('div', 'rate', rate));
       td.append(c);
-      td.title = `${src.name} → ${dst.name}\n` +
+      td.title = `${src.name} → ${dst.name} (#${link.peer_node_id})\n` +
                  `sent ${fmtBytes(link.tx_bytes)} (${fmtPkts(link.tx_pkts)} pkts)\n` +
                  `received ${fmtBytes(link.rx_bytes)} (${fmtPkts(link.rx_pkts)} pkts)\n` +
                  (link.up ? 'link up' : 'link DOWN — these are historical totals');
@@ -536,7 +688,7 @@ function shade(alpha) {
 
 function topologyPane(st) {
   const pane = el('div');
-  pane.append(el('h2', null, `Topology · ${st.network_id}`));
+  pane.append(netHeading(st, 'Topology'));
   const relays = relaysOf(st);
   if (!relays.length) { pane.append(el('div', 'empty', 'No relays in this network.')); return pane; }
 
@@ -569,11 +721,11 @@ function topologyPane(st) {
   const drawn = new Set();
   for (const a of relays) for (const b of relays) {
     if (a.node_id >= b.node_id) continue;
-    const key = a.name + ' ' + b.name;
+    const key = a.name + ' ' + b.name;
     if (drawn.has(key)) continue;
     drawn.add(key);
-    const ab = idx.links.get(a.name + ' ' + b.name);
-    const ba = idx.links.get(b.name + ' ' + a.name);
+    const ab = idx.links.get(a.name + ' ' + b.name);
+    const ba = idx.links.get(b.name + ' ' + a.name);
     if (!ab && !ba) continue;
     const vol = (ab ? ab.tx_bytes + ab.rx_bytes : 0) + (ba ? ba.tx_bytes + ba.rx_bytes : 0);
     const up = (ab && ab.up) || (ba && ba.up);
@@ -590,7 +742,7 @@ function topologyPane(st) {
     svg.append(line);
   }
 
-  // Clients, drawn on a short arc pointing away from the circle centre.
+  // Clients, drawn on a short arc away from the circle centre.
   relays.forEach(r => {
     const p = pos.get(r.name);
     const kids = byRelay.get(r.name) || [];
@@ -615,7 +767,7 @@ function topologyPane(st) {
       lbl.textContent = c.name.length > 14 ? c.name.slice(0, 13) + '…' : c.name;
       g.append(lbl);
       const t = svgEl('title');
-      t.textContent = `${c.name}\n${[c.ip4, c.ip6].filter(Boolean).join('  ') || 'no address'}`;
+      t.textContent = `${c.name} (#${c.node_id})\n${addrOf(c) || 'no address'}`;
       g.append(t);
       g.onclick = () => showMember(st, c);
       svg.append(g);
@@ -655,13 +807,30 @@ function topologyPane(st) {
   const map = el('div', 'map'); map.append(svg);
   pane.append(map);
 
+  // Attachment list: the same facts as the picture, in a form that can be
+  // scanned and copied.
+  const clients = st.members.filter(m => m.role !== 'relay');
+  if (clients.length) {
+    pane.append(el('h2', null, 'Attachments'));
+    pane.append(table(['Member','Node','State','Attached relay','VPN address','Heartbeat'], clients.map(m => {
+      const tr = el('tr');
+      tr.append(el('td', null, m.name));
+      const c = el('td'); c.append(el('code', null, '#' + m.node_id)); tr.append(c);
+      const s = el('td'); s.append(pill(m)); tr.append(s);
+      tr.append(el('td', m.attached_relay ? '' : 'muted', m.attached_relay || '—'));
+      const ip = el('td'); ip.append(el('code', null, addrOf(m) || '—')); tr.append(ip);
+      tr.append(el('td', 'muted tiny', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago' : '—'));
+      return tr;
+    })));
+  }
+
   if (unattached.length) {
     pane.append(el('h2', null, 'Online but attached to no relay'));
     pane.append(table(['Member','Node','VPN address'], unattached.map(m => {
       const tr = el('tr');
       tr.append(el('td', null, m.name));
       const c = el('td'); c.append(el('code', null, '#' + m.node_id)); tr.append(c);
-      const ip = el('td'); ip.append(el('code', null, [m.ip4, m.ip6].filter(Boolean).join('  ') || '—'));
+      const ip = el('td'); ip.append(el('code', null, addrOf(m) || '—'));
       tr.append(ip);
       return tr;
     })));
@@ -684,7 +853,9 @@ $('#overlay').onclick = e => { if (e.target === $('#overlay')) closeModal(); };
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
 /// Ask before something irreversible. `details` is a list of consequences
-/// the operator should see *before* deciding, not after.
+/// the operator should see *before* deciding, not after. If `onConfirm`
+/// resolves to true it has put something else in the modal and the modal
+/// stays open.
 function confirmModal({ title, sub, lead, details, danger, onConfirm }) {
   const body = openModal(title, sub);
   body.append(el('p', 'note', lead));
@@ -695,12 +866,12 @@ function confirmModal({ title, sub, lead, details, danger, onConfirm }) {
   }
   const bar = el('div', 'bar');
   bar.style.marginTop = '18px';
-  const go = el('button', null, danger || 'Confirm');
-  go.style.cssText = 'border-color:var(--warn);color:var(--warn);font-weight:600';
+  const go = el('button', 'danger', danger || 'Confirm');
+  go.style.fontWeight = '600';
   const cancel = el('button', null, 'Cancel');
   go.onclick = async () => {
     go.disabled = true; cancel.disabled = true;
-    try { await onConfirm(); closeModal(); }
+    try { const keep = await onConfirm(); if (!keep) closeModal(); }
     catch (e) { msg('' + e.message, true); closeModal(); }
   };
   cancel.onclick = closeModal;
@@ -717,6 +888,21 @@ function kv(pairs) {
   return d;
 }
 
+function commonRows(st, m) {
+  const v = viewState(st, m);
+  return [
+    ['Node id', '#' + m.node_id],
+    ['VPN address', addrOf(m) || '—'],
+    ['Routed CIDRs', (m.registered_cidrs || []).join(' ') || '—'],
+    ['Disabled', m.disabled ? 'yes' : 'no'],
+    ['View', v.label + (m.reported_gen === undefined ? '' : ` (network gen ${st.gen}, digest ${m.digest_ok ? 'ok' : 'MISMATCH'})`)],
+    ['Heartbeat', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago · ' + fmtTime(m.last_heartbeat_unix) : '—'],
+    ['Last join', m.last_join_unix ? fmtTime(m.last_join_unix) + ' from ' + (m.last_join_from || 'unknown') : 'never'],
+    ['Login gen', m.login_gen],
+    ['Replaced', m.replaced_unix ? 'from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix) : undefined],
+  ];
+}
+
 function showRelay(st, r) {
   const body = openModal(r.name, `relay · #${r.node_id} · ${r.online ? 'online' : 'offline'}`);
   const idx = trafficIndex(st);
@@ -725,10 +911,8 @@ function showRelay(st, r) {
   const online = kids.filter(k => k.online);
 
   body.append(kv([
-    ['VPN address', [r.ip4, r.ip6].filter(Boolean).join('  ') || '—'],
-    ['Routed CIDRs', (r.registered_cidrs || []).join(' ') || '—'],
+    ...commonRows(st, r),
     ['Dialable', r.advertised_reachable || 'unknown'],
-    ['Key', r.pinned ? 'pinned' : 'unpinned'],
     ['Mesh sent', row ? fmtBytes(row.links.reduce((a, l) => a + l.tx_bytes, 0)) : '—'],
     ['Mesh received', row ? fmtBytes(row.links.reduce((a, l) => a + l.rx_bytes, 0)) : '—'],
     ['Switched locally', row ? fmtBytes(row.local_bytes) : '—'],
@@ -744,7 +928,7 @@ function showRelay(st, r) {
       const li = el('li');
       li.append(el('span', 'nm', c.name));
       li.append(el('code', 'tiny muted', '#' + c.node_id));
-      li.append(el('span', 'ips', [c.ip4, c.ip6].filter(Boolean).join('  ') || 'no address'));
+      li.append(el('span', 'ips', addrOf(c) || 'no address'));
       ul.append(li);
     }
     body.append(ul);
@@ -757,7 +941,7 @@ function showRelay(st, r) {
     for (const c of offline) {
       const li = el('li');
       li.append(el('span', 'nm muted', c.name));
-      li.append(el('span', 'ips', [c.ip4, c.ip6].filter(Boolean).join('  ') || '—'));
+      li.append(el('span', 'ips', addrOf(c) || '—'));
       ul.append(li);
     }
     body.append(ul);
@@ -767,7 +951,7 @@ function showRelay(st, r) {
     body.append(el('h2', null, 'Mesh links'));
     body.append(table(['Peer','Sent','Received','Rate now','State'], row.links.map(l => {
       const tr = el('tr');
-      tr.append(el('td', null, l.peer));
+      const p = el('td'); p.append(document.createTextNode(l.peer + ' '), el('code', 'tiny muted', '#' + l.peer_node_id)); tr.append(p);
       tr.append(el('td', null, fmtBytes(l.tx_bytes)));
       tr.append(el('td', null, fmtBytes(l.rx_bytes)));
       tr.append(el('td', 'muted', [fmtRate(l.tx_bps), fmtRate(l.rx_bps)].filter(Boolean).join(' / ') || '—'));
@@ -778,476 +962,64 @@ function showRelay(st, r) {
   }
 }
 
-function showPins(m) {
-  const body = openModal(m.name, 'pinned identities');
-  const pins = m.pins || [];
-  if (!pins.length) {
-    body.append(el('div', 'empty',
-      'No pins yet — the next join will pin whatever key it presents.'));
-    return;
-  }
-  body.append(el('p', 'note',
-    'Every unexpired pin authenticates this member. More than one means a rotation is in ' +
-    'flight: the new identity is registered while the previous one keeps working, so a ' +
-    'member that restarts before switching is not locked out.'));
-  body.append(table(['Kind', 'Key', 'State'], pins.map(p => {
-    const tr = el('tr');
-    tr.append(el('td', 'muted', p.kind));
-    const k = el('td'); k.append(el('code', null, p.key + '…')); tr.append(k);
-    const st = el('td');
-    if (p.retires_unix) {
-      st.append(el('span', 'pill warnpill', 'retires ' + new Date(p.retires_unix * 1000).toLocaleString()));
-    } else {
-      st.append(el('span', 'pill on', 'current'));
-    }
-    tr.append(st);
-    return tr;
-  })));
-}
-
 function showMember(st, m) {
   const body = openModal(m.name, `${m.role} · #${m.node_id} · ${m.online ? 'online' : 'offline'}`);
   body.append(kv([
-    ['VPN address', [m.ip4, m.ip6].filter(Boolean).join('  ') || '—'],
+    ...commonRows(st, m),
     ['Attached relay', m.attached_relay || '—'],
-    ['Routed CIDRs', (m.registered_cidrs || []).join(' ') || '—'],
-    ['Key', m.pinned ? 'pinned' : 'unpinned'],
-    ['Disabled', m.disabled ? 'yes' : 'no'],
-    ['Last join', m.last_join_unix ? new Date(m.last_join_unix * 1000).toLocaleString() : '—'],
   ]));
+  const bar = el('div', 'bar');
   if (m.attached_relay) {
     const relay = st.members.find(r => r.name === m.attached_relay);
     if (relay) {
       const b = el('button', null, `Open ${relay.name}`);
       b.onclick = () => showRelay(st, relay);
-      body.append(b);
+      bar.append(b);
     }
   }
-}
-
-/* ---------- secrets ---------- */
-
-let secretFilter = '';
-let mintKind = 'client';
-/// Members already warned about in this session, so the confirm appears
-/// once rather than on every attempt.
-const mintWarned = new Set();
-
-const KINDS = [
-  { id: 'client', title: 'Client',
-    desc: 'Joins as a member. Cannot register routes or advertise an address.' },
-  { id: 'relay',  title: 'Relay',
-    desc: 'Forwards traffic and may register the routes its config permits.' },
-  { id: 'admin',  title: 'Admin',
-    desc: 'Signs in to this console. Can never be used to join a network.' },
-];
-
-async function secretsPane(networks) {
-  const pane = el('div');
-
-  const head = el('div', 'page-head');
-  head.append(el('h3', null, 'Credentials'));
-  head.append(el('p', null,
-    'Each credential is minted here and shown exactly once — only its argon2 hash is stored, ' +
-    'so it cannot be retrieved later. The kind determines what it can do: a client credential ' +
-    'cannot join as a relay, and an admin credential cannot join a network at all. Members ' +
-    'without a managed credential fall back to the secret_hash in their network config, so a ' +
-    'deployment can be migrated one member at a time.'));
-  pane.append(head);
-
-  let data;
-  try { data = await api('/api/v1/secrets'); }
-  catch (e) {
-    pane.append(el('div', 'empty', 'Could not load credentials: ' + e.message));
-    return pane;
-  }
-  const managed = data.secrets || [];
-
-  // Cross-reference members so the page can show what is still on the
-  // config fallback — that is the migration status, and the reason a
-  // deployment ends up with one secret shared by everyone.
-  const byKey = new Map(managed.map(s => [(s.network || '-') + '/' + s.client_id, s]));
-  const fallback = [];
-  for (const st of (snapshot || [])) {
-    for (const m of st.members) {
-      if (!byKey.has(st.network_id + '/' + m.name)) {
-        fallback.push({ client_id: m.name, network: st.network_id, role: m.role });
-      }
-    }
-  }
-
-  pane.append(summaryCards(managed, fallback));
-  pane.append(mintPanel(networks));
-  pane.append(credentialTable(managed, fallback));
-  return pane;
-}
-
-function summaryCards(managed, fallback) {
-  const cards = el('div', 'cards');
-  const n = k => managed.filter(s => s.kind === k && !s.disabled).length;
-  const add = (num, label, title) => {
-    const c = el('div', 'card');
-    c.append(el('div', 'n', String(num)), el('div', 'l', label));
-    if (title) c.title = title;
-    cards.append(c);
-  };
-  add(managed.filter(s => !s.disabled).length, 'Managed');
-  add(fallback.length, 'On config fallback',
-      'Members with no managed credential. They authenticate with the secret_hash in the ' +
-      'network config — often the same secret shared by every member.');
-  add(n('relay'), 'Relay');
-  add(n('client'), 'Client');
-  add(n('admin'), 'Admin');
-  const revoked = managed.filter(s => s.disabled).length;
-  if (revoked) add(revoked, 'Revoked');
-  return cards;
-}
-
-function mintPanel(networks) {
-  const panel = el('div', 'panel');
-  const ph = el('div', 'panel-head');
-  ph.append(el('h4', null, 'Issue a credential'));
-  ph.append(el('span', 'hint', 'Shown once — copy it before closing'));
-  panel.append(ph);
-
-  const body = el('div', 'panel-body');
-
-  // Kind first: it decides what the rest of the form means.
-  const kindField = el('div', 'field');
-  kindField.append(el('label', null, 'Kind'));
-  const seg = el('div', 'seg');
-  const netField = el('div', 'field');
-  const netSel = el('select');
-  const idIn = el('input');
-
-  const paintKind = () => {
-    seg.replaceChildren();
-    KINDS.forEach(k => {
-      const b = el('button', 'opt');
-      b.type = 'button';
-      b.setAttribute('aria-pressed', String(k.id === mintKind));
-      b.append(el('span', 't', k.title), el('span', 'd', k.desc));
-      b.onclick = () => { mintKind = k.id; paintKind(); syncNet(); };
-      seg.append(b);
-    });
-  };
-  const syncNet = () => {
-    const isAdmin = mintKind === 'admin';
-    netSel.disabled = isAdmin;
-    netSel.value = isAdmin ? '-' : (networks[0] || '-');
-    netHelp.textContent = isAdmin
-      ? 'Admin credentials belong to no network.'
-      : 'The network this member joins.';
-  };
-  paintKind();
-  kindField.append(seg);
-
-  const idField = el('div', 'field');
-  idField.append(el('label', null, 'Member ID'));
-  idIn.placeholder = 'e.g. laptop-5';
-  idIn.autocomplete = 'off';
-  idField.append(idIn);
-  idField.append(el('div', 'help',
-    'Must match the client_id the member presents. Issuing again for an existing ' +
-    'member replaces its credential, and the previous one stops working immediately.'));
-
-  netField.append(el('label', null, 'Network'));
-  netSel.append(new Option('—', '-'));
-  networks.forEach(n => netSel.append(new Option(n, n)));
-  netField.append(netSel);
-  const netHelp = el('div', 'help', '');
-  netField.append(netHelp);
-  syncNet();
-
-  const grid = el('div', 'form-grid');
-  grid.append(idField, netField);
-
-  const actions = el('div', 'bar');
-  actions.style.marginTop = '18px';
-  const mint = el('button', null, 'Issue credential');
-  mint.style.cssText = 'border-color:var(--accent);color:var(--accent);font-weight:600';
-  const status = el('span', 'msg');
-  const doMint = async () => {
-    const id = idIn.value.trim();
-    if (!id) { status.textContent = 'A member ID is required.'; status.className = 'msg err'; idIn.focus(); return; }
-    // Issuing to a member that is connected right now cuts it off the
-    // moment it next re-joins: the store refuses rather than falling back
-    // to its config secret. That is correct, and it is also how a live
-    // relay gets taken off the mesh by an operator who did not expect it.
-    const live = (snapshot || []).flatMap(st => st.members)
-      .find(m => m.name === id && m.online);
-    if (live && !mintWarned.has(id)) {
-      mintWarned.add(id);
-      confirmModal({
-        title: id + ' is online right now',
-        sub: live.role,
-        lead: 'Issuing a credential replaces whatever ' + id + ' authenticates with today. It ' +
-              'keeps running on its current session, but the next time it re-joins it will be ' +
-              'refused until it is given the new credential.',
-        details: [
-          live.role === 'relay'
-            ? 'This is a relay — refusing it takes its site off the mesh'
-            : 'This member will not be able to re-join until updated',
-          'Its network config secret_hash stops being accepted once a managed credential exists',
-        ],
-        danger: 'Issue anyway',
-        onConfirm: doMint,
-      });
-      return;
-    }
-    mint.disabled = true; status.textContent = 'Issuing…'; status.className = 'msg';
-    try {
-      const net = mintKind === 'admin' ? '-' : netSel.value;
-      const r = await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(id)}/mint`,
-        { method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ kind: mintKind }) });
-      idIn.value = '';
-      showMintedSecret(r, net);
-      renderSecrets();
-    } catch (e) { status.textContent = '' + e.message; status.className = 'msg err'; }
-    finally { mint.disabled = false; }
-  };
-  mint.onclick = doMint;
-  // Enter in the ID field is the obvious gesture; not honouring it is the
-  // kind of small thing that makes a console feel unfinished.
-  idIn.onkeydown = e => { if (e.key === 'Enter') doMint(); };
-  actions.append(mint, status);
-
-  body.append(kindField, el('div', null, ' '), grid, actions);
-  panel.append(body);
-  return panel;
-}
-
-function credentialTable(managed, fallback) {
-  const panel = el('div', 'panel');
-  const ph = el('div', 'panel-head');
-  ph.append(el('h4', null, 'Issued credentials'));
-  panel.append(ph);
-
-  const bar = el('div', 'toolbar');
-  const search = el('input');
-  search.placeholder = 'Filter by member or network…';
-  search.value = secretFilter;
-  search.oninput = () => { secretFilter = search.value; paint(); };
-  const showFallback = el('button', null, 'Show config fallback');
-  let withFallback = true;
-  showFallback.setAttribute('aria-pressed', 'true');
-  showFallback.onclick = () => {
-    withFallback = !withFallback;
-    showFallback.setAttribute('aria-pressed', String(withFallback));
-    showFallback.style.color = withFallback ? 'var(--accent)' : '';
-    paint();
-  };
-  showFallback.style.color = 'var(--accent)';
-  const count = el('span', 'count');
-  bar.append(search, showFallback, count);
-  panel.append(bar);
-
-  const host = el('div');
-  panel.append(host);
-
-  function paint() {
-    const q = secretFilter.trim().toLowerCase();
-    const hit = r => !q || r.client_id.toLowerCase().includes(q) ||
-                     (r.network || '').toLowerCase().includes(q);
-    const rowsManaged = managed.filter(hit);
-    const rowsFallback = withFallback ? fallback.filter(hit) : [];
-    count.textContent = `${rowsManaged.length} managed` +
-      (withFallback ? ` · ${rowsFallback.length} on config fallback` : '');
-
-    if (!rowsManaged.length && !rowsFallback.length) {
-      host.replaceChildren(el('div', 'empty', q
-        ? `Nothing matches “${secretFilter}”.`
-        : 'No credentials issued yet — every member is authenticating with its network config secret_hash.'));
-      return;
-    }
-    const rows = [
-      ...rowsManaged.map(managedRow),
-      ...rowsFallback.map(fallbackRow),
-    ];
-    const t = table(['Member', 'Kind', 'Network', 'Source', 'Issued', 'State', ''], rows);
-    host.replaceChildren(t);
-  }
-
-  function managedRow(sec) {
-    const net = sec.network || '-';
-    const tr = el('tr');
-    tr.append(el('td', null, sec.client_id));
-    const k = el('td'); k.append(el('span', 'badge b-' + sec.kind, sec.kind)); tr.append(k);
-    tr.append(el('td', 'muted', sec.network || '—'));
-    tr.append(el('td', 'muted tiny', 'managed'));
-    tr.append(el('td', 'muted tiny',
-      sec.created_unix ? new Date(sec.created_unix * 1000).toLocaleDateString() : '—'));
-    const st = el('td');
-    st.append(el('span', 'pill ' + (sec.disabled ? 'dis' : 'on'), sec.disabled ? 'revoked' : 'active'));
-    tr.append(st);
-
-    const act = el('td');
-    const rot = el('button', null, 'Reissue');
-    rot.onclick = () => confirmModal({
-      title: 'Reissue the credential for ' + sec.client_id + '?',
-      sub: net === '-' ? 'admin' : net,
-      lead: 'A new credential is generated and shown once. This is also how you recover a ' +
-            'lost credential, because the existing one cannot be read back.',
-      details: [
-        'The current credential stops working immediately',
-        sec.kind === 'admin'
-          ? 'Any console session using it must sign in again'
-          : sec.client_id + ' cannot re-join until it is given the new credential',
-      ],
-      danger: 'Reissue',
-      onConfirm: async () => {
-        const r = await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}/mint`,
-          { method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ kind: sec.kind }) });
-        showMintedSecret(r, net); renderSecrets();
-      },
-    });
-    const rev = el('button', null, sec.disabled ? 'Restore' : 'Revoke');
-    rev.style.marginLeft = '6px';
-    rev.onclick = async () => {
-      try {
-        await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}/revoke`,
-          { method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ disabled: !sec.disabled }) });
-        msg((sec.disabled ? 'Restored ' : 'Revoked ') + sec.client_id);
-        renderSecrets();
-      } catch (e) { msg('' + e.message, true); }
-    };
-    const del = el('button', null, 'Remove');
-    del.style.cssText = 'margin-left:6px;border-color:var(--warn);color:var(--warn)';
-    del.onclick = () => confirmModal({
-      title: 'Remove the managed credential for ' + sec.client_id + '?',
-      sub: net === '-' ? 'admin' : net,
-      lead: 'The credential is deleted. This is not the same as revoking it: the member ' +
-            'falls back to the secret_hash in its network config, if it has one.',
-      details: [
-        sec.kind === 'admin'
-          ? 'An admin with no credential cannot sign in at all'
-          : 'If ' + sec.client_id + ' has a config secret_hash it can still join with it',
-        'Revoke instead if the intent is to keep it out',
-      ],
-      danger: 'Remove credential',
-      onConfirm: async () => {
-        await api(`/api/v1/secrets/${encodeURIComponent(net)}/${encodeURIComponent(sec.client_id)}`,
-          { method: 'DELETE' });
-        msg('Removed the credential for ' + sec.client_id);
-        renderSecrets();
-      },
-    });
-    act.append(rot, rev, del);
-    tr.append(act);
-    return tr;
-  }
-
-  function fallbackRow(m) {
-    const tr = el('tr');
-    tr.append(el('td', 'muted', m.client_id));
-    const k = el('td'); k.append(el('span', 'badge b-' + m.role, m.role)); tr.append(k);
-    tr.append(el('td', 'muted', m.network));
-    const src = el('td');
-    src.append(el('span', 'badge b-fallback', 'config'));
-    src.title = 'Authenticates with the secret_hash in the network config — commonly the ' +
-                'same secret shared by every member. Issue a credential to give it its own.';
-    tr.append(src);
-    tr.append(el('td', 'muted tiny', '—'));
-    tr.append(el('td', 'muted tiny', '—'));
-    const act = el('td');
-    const give = el('button', null, 'Issue');
-    give.onclick = async () => {
-      try {
-        const kind = m.role === 'relay' ? 'relay' : 'client';
-        const r = await api(`/api/v1/secrets/${encodeURIComponent(m.network)}/${encodeURIComponent(m.client_id)}/mint`,
-          { method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ kind }) });
-        showMintedSecret(r, m.network); renderSecrets();
-      } catch (e) { msg('' + e.message, true); }
-    };
-    act.append(give);
-    tr.append(act);
-    return tr;
-  }
-
-  paint();
-  return panel;
-}
-
-/// The one moment the plaintext exists. There is no way to see it again,
-/// so this screen has to be unmissable and easy to act on.
-function showMintedSecret(r, network) {
-  const body = openModal(r.client_id, `${r.kind} credential`);
-
-  const warn = el('div', 'warnbar');
-  warn.append(el('span', null, '⚠'));
-  const wt = el('div');
-  wt.append(el('b', null, 'This is the only time this credential is shown. '));
-  wt.append(document.createTextNode(
-    'Only its hash is stored, so it cannot be retrieved. If it is lost, reissue to ' +
-    'generate a replacement.'));
-  warn.append(wt);
-  body.append(warn);
-
-  const box = el('div', 'secret-box', r.secret);
-  body.append(box);
-
-  const bar = el('div', 'bar');
-  bar.style.margin = '14px 0 4px';
-  const copy = el('button', null, 'Copy credential');
-  copy.style.cssText = 'border-color:var(--accent);color:var(--accent);font-weight:600';
-  const done = el('span', 'msg');
-  copy.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(r.secret);
-      done.textContent = 'Copied to clipboard';
-    } catch {
-      // Clipboard access needs a secure context, which plain HTTP is not.
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(box);
-      sel.removeAllRanges(); sel.addRange(range);
-      done.textContent = 'Selected — copy with ' +
-        (navigator.platform.includes('Mac') ? '\u2318C' : 'Ctrl+C');
-    }
-  };
-  bar.append(copy, done);
+  const sec = el('button', null, 'Show secret');
+  sec.onclick = () => showSecret(st.network_id, m);
+  bar.append(sec);
   body.append(bar);
-
-  if (r.kind !== 'admin') {
-    body.append(el('h2', null, 'Member configuration'));
-    const cfg = el('div', 'wrap');
-    const pre = el('div');
-    pre.style.cssText = 'padding:14px;font:12.5px/1.6 ui-monospace,Menlo,monospace;' +
-                        'white-space:pre;overflow-x:auto;user-select:all';
-    pre.textContent =
-      `network_id = "${network}"\n` +
-      `client_id = "${r.client_id}"\n` +
-      `client_secret = "${r.secret}"`;
-    cfg.append(pre);
-    body.append(cfg);
-    body.append(el('p', 'note',
-      'Paste into the member\u2019s config. Prefer client_secret_file in production so the ' +
-      'credential is not stored in the config file itself.'));
-  }
 }
 
 /* ---------- tabs + refresh ---------- */
 
-async function renderSecrets() {
-  const pane = $('#pane-secrets');
-  pane.replaceChildren(await secretsPane(knownNetworks));
-}
-
 function selectTab(name) {
   activeTab = name;
-  sessionStorage.setItem('nqvpn_tab', name);
   document.querySelectorAll('.tabs button').forEach(b =>
     b.setAttribute('aria-selected', b.dataset.tab === name ? 'true' : 'false'));
-  ['members','routing','stats','topology','secrets'].forEach(t =>
+  ['status','topology','stats'].forEach(t =>
     $('#pane-' + t).hidden = (t !== name));
-  if (name === 'secrets') renderSecrets();
 }
 document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => selectTab(b.dataset.tab));
 selectTab(activeTab);
+
+function statusPane(st) {
+  const pane = el('div');
+  pane.append(netHeading(st));
+  pane.append(el('p', 'note',
+    'A member is a node id plus a secret. "View" is the generation of the network table the member ' +
+    'last reported applying, checked against the coordinator\'s current gen ' + st.gen + '.'));
+  pane.append(table(
+    ['Member','Node','Role','State','VPN address','Routes','Relay','Heartbeat','View','Last join','Actions'],
+    st.members.map(m => memberRow(st, m))));
+
+  pane.append(netHeading(st, 'Prefix ownership'));
+  const prefixes = st.prefix_table || [];
+  if (!prefixes.length) {
+    pane.append(el('div', 'empty', 'No prefixes are registered in this network.'));
+  } else {
+    pane.append(table(['Prefix','Owner','Standby (age order)'], prefixes.map(p => {
+      const tr = el('tr');
+      const c = el('td'); c.append(el('code', null, p.cidr)); tr.append(c);
+      const o = el('td'); o.append(document.createTextNode(p.owner + ' '), el('code', 'tiny muted', '#' + p.owner_node_id)); tr.append(o);
+      tr.append(el('td', 'muted tiny', (p.standby || []).join(', ') || '—'));
+      return tr;
+    })));
+  }
+  return pane;
+}
 
 async function refresh() {
   if (!token) { msg('Enter the admin token to connect.'); return; }
@@ -1257,7 +1029,7 @@ async function refresh() {
       m: a.m + n.members_total, o: a.o + n.members_online, r: a.r + n.relays_total }), {m:0,o:0,r:0});
 
     const statuses = [];
-    for (const n of global.networks) statuses.push(await api(`/api/v1/networks/${n.network_id}/status`));
+    for (const n of global.networks) statuses.push(await api(`/api/v1/networks/${enc(n.network_id)}/status`));
     snapshot = statuses;
 
     let fleetBytes = 0;
@@ -1279,53 +1051,37 @@ async function refresh() {
     // the per-network fetches would blank the cards on every refresh.
     $('#cards').replaceChildren(...cards.children);
 
-    const members = $('#pane-members'); members.replaceChildren();
-    const routing = $('#pane-routing'); routing.replaceChildren();
-    const stats = $('#pane-stats'); stats.replaceChildren();
-    const topo = $('#pane-topology'); topo.replaceChildren();
-
+    const status = el('div'), stats = el('div'), topo = el('div');
     for (const st of statuses) {
-      members.append(el('h2', null, `${st.network_id} · ${st.network_uuid}`));
-      members.append(table(
-        ['Member','Node','Role','State','VPN address','Routed CIDRs','Attached relay','Key','Dialable','Actions'],
-        st.members.map(m => memberRow(st.network_id, m))));
-
-      routing.append(el('h2', null, `Prefix ownership · ${st.network_id}`));
-      routing.append(table(['Prefix','Owner','Standby (age order)'], (st.prefix_table || []).map(p => {
-        const tr = el('tr');
-        const c = el('td'); c.append(el('code', null, p.cidr)); tr.append(c);
-        tr.append(el('td', null, p.owner));
-        tr.append(el('td', 'muted tiny', (p.standby || []).join(', ') || '—'));
-        return tr;
-      })));
-
+      status.append(statusPane(st));
       stats.append(matrixPane(st));
       topo.append(topologyPane(st));
     }
+    if (!statuses.length) status.append(el('div', 'empty', 'No networks are configured.'));
+    $('#pane-status').replaceChildren(...status.children);
+    $('#pane-stats').replaceChildren(...stats.children);
+    $('#pane-topology').replaceChildren(...topo.children);
 
-    // Deliberately NOT rebuilt here. The periodic refresh would replace
-    // the mint form mid-typing and discard whatever had been entered,
-    // which made the tab impossible to use. It is rebuilt on tab
-    // selection and after an action instead.
-    knownNetworks = statuses.map(s => s.network_id);
     msg('Updated ' + new Date().toLocaleTimeString());
   } catch (e) { msg('' + e.message, true); }
 }
 
-$('#save').onclick = () => { token = $('#token').value.trim();
-  sessionStorage.setItem('nqvpn_token', token); refresh(); };
+$('#save').onclick = () => { token = $('#token').value.trim(); refresh(); };
+$('#token').onkeydown = e => { if (e.key === 'Enter') $('#save').click(); };
 $('#reload').onclick = async () => {
   try { const r = await api('/api/v1/reload', { method: 'POST' });
-    msg(`Reloaded: ${r.reloaded.join(', ') || 'none'}` + (r.warnings?.length ? ` — ${r.warnings.length} warning(s)` : ''));
-    if (r.warnings?.length) console.warn(r.warnings);
+    let t = `Reloaded: ${(r.reloaded || []).join(', ') || 'none'}`;
+    if (r.ignored_new_networks?.length) t += ` — ignored new network(s): ${r.ignored_new_networks.join(', ')}`;
+    if (r.warnings?.length) { t += ` — ${r.warnings.length} warning(s)`; console.warn(r.warnings); }
+    msg(t);
     refresh();
   } catch (e) { msg('' + e.message, true); }
 };
 setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString(); }, 1000);
-// Refreshing while a modal is open would replace the data underneath it.
 setInterval(() => {
-  // Refreshing under an open modal, or while someone is typing, throws
-  // away what they were doing. Neither is worth five seconds of freshness.
+  // Refreshing under an open modal, or while someone is entering text,
+  // throws away what they were doing. Neither is worth five seconds of
+  // freshness.
   const busy = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
   if ($('#overlay').hidden && !busy) refresh();
 }, 5000);

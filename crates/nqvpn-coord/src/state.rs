@@ -3,24 +3,30 @@
 //! One serialized owner per network: every mutation for a network runs
 //! under its mutex, and the registry is durably committed *before* the
 //! credential is returned (durability precedes visibility).
+//!
+//! A join is the member's whole declaration. The coordinator replaces
+//! what it recorded before, keeps only identity (node id, address, the
+//! ages of routes that stay continuously declared), and — when a
+//! different machine took over the id — bumps `login_gen` so every
+//! acceptor closes the previous instance.
 
-use argon2::password_hash::PasswordHash;
-use argon2::{Argon2, PasswordVerifier};
 use ipnet::IpNet;
 use nqvpn_proto::api::{JoinRequest, JoinResponse, RelayEntry};
+use nqvpn_proto::control::KeyInfo;
 use nqvpn_proto::credential::{self, Claims, AUD};
-use nqvpn_proto::lpm::overlaps;
-use nqvpn_proto::types::Role;
+use nqvpn_proto::types::{NodeId, Role};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{CoordConfig, MemberCfg, NetworkConfig};
-use crate::control::{broadcast, Push, Session};
+use crate::control::{self, Push, Session};
 use crate::directory::Directory;
 use crate::error::ApiError;
+use crate::leases::Leases;
 use crate::registry::{Registry, RouteReg};
+use crate::secrets::{constant_time_eq, SecretStore, Verdict};
 use crate::signer::Keyring;
 
 pub const ISS: &str = "nqvpn-coord";
@@ -29,39 +35,88 @@ pub struct NetState {
     pub cfg: NetworkConfig,
     pub registry: Registry,
     pub registry_path: PathBuf,
-    /// Derived, revisioned view pushed to members (§3.2).
     pub directory: Directory,
-    /// Live control sessions by member name.
-    pub sessions: HashMap<String, Session>,
-    /// Last application-level keepalive per member.
-    pub last_seen: HashMap<String, u64>,
-    /// Last relay fleet pushed, so we only publish real changes.
-    pub published_relays: Option<Vec<nqvpn_proto::control::RelayEndpoint>>,
+    pub leases: Leases,
+    /// Live control sessions by node id.
+    pub sessions: HashMap<NodeId, Session>,
+    /// When this process started serving the network; snapshots are
+    /// withheld for a short grace after it, so a coordinator restart
+    /// first hears everyone's declarations before publishing a view.
+    pub started_at: u64,
 }
 
 impl NetState {
-    /// Recompute the directory. Split-borrow helper: `directory`,
-    /// `cfg`, and `registry` are disjoint fields, but the borrow checker
-    /// needs that spelled out.
-    pub fn refresh_directory(
-        &mut self,
-        now: u64,
-    ) -> Option<nqvpn_proto::control::MembershipDelta> {
-        let NetState { cfg, registry, directory, .. } = self;
-        directory.recompute(cfg, registry, now)
-    }
-
     pub fn new(cfg: NetworkConfig, registry: Registry, registry_path: PathBuf) -> Self {
-        let directory = Directory::with_hold_down(cfg.settings.hold_down_secs);
+        let now = now_unix();
+        let gen0 = registry.initial_gen(now_ms());
+        let hold = cfg.settings.hold_down_secs;
         NetState {
             cfg,
             registry,
             registry_path,
-            directory,
+            directory: Directory::new(gen0, hold),
+            leases: Leases::default(),
             sessions: HashMap::new(),
-            last_seen: HashMap::new(),
-            published_relays: None,
+            started_at: now,
         }
+    }
+
+    /// Collecting before publishing: members that reconnect after a
+    /// coordinator restart keep their last view until the fleet has had
+    /// two heartbeats to re-declare what it holds.
+    pub fn in_grace(&self, now: u64) -> bool {
+        now < self.started_at + 2 * self.cfg.settings.heartbeat_secs.max(1) as u64
+    }
+
+    /// Recompute the view and, if it changed, push the delta to every
+    /// synced session. The one place generations are minted.
+    pub fn publish(&mut self, keys: &[KeyInfo], now: u64) {
+        let NetState { cfg, registry, directory, leases, .. } = self;
+        let Some(delta) = directory.recompute(cfg, registry, leases, keys, now) else {
+            return;
+        };
+        if registry.note_gen(directory.gen) {
+            if let Err(e) = registry.commit(&self.registry_path) {
+                tracing::error!(network = %cfg.network_id, "persisting generation mark: {e:#}");
+            }
+        }
+        control::broadcast_delta(self, delta);
+    }
+
+    /// Commit the registry, mapping failure to an API error.
+    pub fn commit(&self) -> Result<(), ApiError> {
+        self.registry
+            .commit(&self.registry_path)
+            .map_err(|e| ApiError::internal(format!("registry commit failed: {e:#}")))
+    }
+
+    /// Close a member's control session, if any.
+    pub fn close_session(&mut self, node: NodeId, reason: &str) {
+        if let Some(s) = self.sessions.remove(&node) {
+            let _ = s.tx.try_send(Push::Close(reason.to_string()));
+            s.conn.close(control::CLOSE_EVICTED.into(), reason.as_bytes());
+        }
+    }
+}
+
+/// Fixed-window per-(member, ip) limiter, pruned as it goes.
+#[derive(Default)]
+pub struct RateLimiter {
+    map: HashMap<(String, String), (u64, u32)>,
+}
+
+impl RateLimiter {
+    pub fn check(&mut self, key: String, ip: String, limit: u32, now: u64) -> bool {
+        let window = now / 60;
+        if self.map.len() > 4096 {
+            self.map.retain(|_, (w, _)| *w == window);
+        }
+        let entry = self.map.entry((key, ip)).or_insert((window, 0));
+        if entry.0 != window {
+            *entry = (window, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= limit
     }
 }
 
@@ -70,121 +125,85 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub networks: HashMap<String, Mutex<NetState>>,
     pub keyring: Keyring,
-    /// (client_id@network, ip) -> fixed-window join counter.
-    pub join_rate: Mutex<HashMap<(String, String), (u64, u32)>>,
+    pub join_rate: Mutex<RateLimiter>,
     /// Where `networks.d/` lives, for `POST /api/v1/reload`.
     pub networks_dir: Option<PathBuf>,
-    /// Coordinator-managed secrets, consulted before the network config.
-    pub secrets: Mutex<crate::secrets::SecretStore>,
+    pub secrets: Mutex<SecretStore>,
     pub secrets_path: PathBuf,
+    /// Published in join responses: the QUIC control port.
+    pub control_port: u16,
 }
 
 pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn valid_pubkey(b64: &str) -> bool {
+    nqvpn_proto::seal::decode_pubkey(b64).is_some()
+}
+
+fn valid_fingerprint(fp: &str) -> bool {
+    fp.strip_prefix("sha256:")
+        .map(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or(false)
+}
+
 impl AppState {
-    pub fn member_cfg<'a>(
-        cfg: &'a NetworkConfig,
-        name: &str,
-    ) -> Option<(&'a MemberCfg, Role)> {
-        if let Some(m) = cfg.clients.get(name) {
-            return Some((m, Role::Client));
-        }
-        if let Some(m) = cfg.relays.get(name) {
-            return Some((m, Role::Relay));
-        }
-        None
-    }
-
-    /// Fixed-window per-(member, ip) rate limit for /join and admin login.
-    pub fn check_rate(&self, key: String, ip: String) -> Result<(), ApiError> {
+    fn check_rate(&self, key: String, ip: String) -> Result<(), ApiError> {
         let limit = self.coord.limits.join_rate_per_min;
-        let now = now_unix();
-        let window = now / 60;
-        let mut map = self.join_rate.lock().unwrap();
-        let entry = map.entry((key, ip)).or_insert((window, 0));
-        if entry.0 != window {
-            *entry = (window, 0);
+        if self.join_rate.lock().unwrap().check(key, ip, limit, now_unix()) {
+            Ok(())
+        } else {
+            Err(ApiError::rate_limited())
         }
-        entry.1 += 1;
-        if entry.1 > limit {
-            return Err(ApiError::rate_limited());
-        }
-        Ok(())
     }
 
-    /// The whole join transaction. Secret verification (argon2, slow)
-    /// happens before the network lock is taken.
+    /// The whole join transaction.
     pub fn join(&self, req: &JoinRequest, peer_ip: &str) -> Result<JoinResponse, ApiError> {
-        self.check_rate(format!("{}@{}", req.client_id, req.network_id), peer_ip.to_string())?;
+        self.check_rate(format!("{}@{}", req.node_id, req.network_id), peer_ip.to_string())?;
 
         let net = self
             .networks
             .get(&req.network_id)
             .ok_or_else(ApiError::bad_credentials)?; // unknown network == unknown member
 
-        // ---- phase 1: checks that need only immutable config ----
-        let (member_cfg, role) = {
+        // ---- phase 1: authenticate against immutable config ----
+        let (name, member_cfg, role): (String, MemberCfg, Role) = {
             let ns = net.lock().unwrap();
-            match Self::member_cfg(&ns.cfg, &req.client_id) {
-                Some((m, r)) => (m.clone(), r),
+            match ns.cfg.member_by_id(req.node_id) {
+                Some((n, m, r)) => (n.to_string(), m.clone(), r),
                 None => return Err(ApiError::bad_credentials()),
             }
         };
+        let verdict = self.secrets.lock().unwrap().verify(&req.network_id, req.node_id, &req.secret);
+        match verdict {
+            Verdict::Match => {}
+            Verdict::Mismatch | Verdict::Disabled => return Err(ApiError::bad_credentials()),
+            Verdict::Unknown => match &member_cfg.secret {
+                Some(s) if constant_time_eq(s.trim(), req.secret.trim()) => {}
+                _ => return Err(ApiError::bad_credentials()),
+            },
+        }
         if role != req.role {
             return Err(ApiError::bad_request(format!(
-                "member is configured as {role}, joined as {}",
-                req.role
+                "node {} is configured as {role}, joined as {}",
+                req.node_id, req.role
             )));
         }
-        // Authenticate against the managed store first. A refusal there
-        // is final: falling through to the config on a *wrong* secret
-        // would let a member the operator believes they re-keyed carry on
-        // using a stale shared one.
-        let want_kind = match role {
-            Role::Relay => crate::secrets::SecretKind::Relay,
-            Role::Client => crate::secrets::SecretKind::Client,
-        };
-        let store_verdict = {
-            let store = self.secrets.lock().unwrap();
-            store.verify(
-                &req.client_id,
-                &req.client_secret,
-                Some(&req.network_id),
-                want_kind,
-            )
-        };
-        match store_verdict {
-            Ok(true) => {}
-            Err(e) => {
-                tracing::warn!(
-                    member = %req.client_id, network = %req.network_id,
-                    "join refused by the secret store: {e}"
-                );
-                return Err(ApiError::bad_credentials());
-            }
-            // No managed secret for this identity: the network config is
-            // still authoritative, so an existing deployment keeps working
-            // and migrates one member at a time.
-            Ok(false) => {
-                let parsed = PasswordHash::new(&member_cfg.secret_hash)
-                    .map_err(|_| ApiError::bad_credentials())?;
-                Argon2::default()
-                    .verify_password(req.client_secret.as_bytes(), &parsed)
-                    .map_err(|_| ApiError::bad_credentials())?;
-            }
+        if !valid_pubkey(&req.pubkey) {
+            return Err(ApiError::bad_request("pubkey must be a base64 32-byte X25519 key"));
         }
-
+        if !valid_fingerprint(&req.cert_fingerprint) {
+            return Err(ApiError::bad_request("cert_fingerprint must be sha256:<64 hex>"));
+        }
         if role == Role::Client && (!req.local_cidrs.is_empty() || req.relay_addr.is_some()) {
-            return Err(ApiError::bad_request(
-                "clients cannot register routes or a relay address",
-            ));
+            return Err(ApiError::bad_request("clients cannot register routes or a relay address"));
         }
         if role == Role::Relay {
-            // The coordinator config is the plan of record: a relay must
-            // advertise exactly the address the fleet was told to dial,
-            // or peers silently dial the wrong place (§3.2).
             let configured = member_cfg.relay_addr.as_deref().unwrap_or_default();
             match req.relay_addr.as_deref() {
                 Some(a) if a == configured => {}
@@ -193,26 +212,18 @@ impl AppState {
                         "relay_addr {a:?} does not match the configured {configured:?}"
                     )))
                 }
-                None => {
-                    return Err(ApiError::bad_request(
-                        "relays must present relay_addr".to_string(),
-                    ))
-                }
+                None => return Err(ApiError::bad_request("relays must present relay_addr")),
             }
             for c in &req.local_cidrs {
-                let allowed = member_cfg.allowed_cidrs.iter().any(|a| {
-                    a.contains(&c.network()) && a.prefix_len() <= c.prefix_len()
-                });
+                let allowed = member_cfg
+                    .allowed_cidrs
+                    .iter()
+                    .any(|a| a.contains(&c.network()) && a.prefix_len() <= c.prefix_len());
                 if !allowed {
                     return Err(ApiError::prefix_conflict(format!(
                         "cidr {c} is not within this relay's allowed_cidrs"
                     )));
                 }
-            }
-        }
-        if let Some(pin) = &member_cfg.pinned_pubkey {
-            if pin != &req.pubkey {
-                return Err(ApiError::pin_mismatch());
             }
         }
 
@@ -221,51 +232,32 @@ impl AppState {
         let now = now_unix();
         let ttl_secs = ns.cfg.settings.credential_ttl_mins * 60;
 
-        let rec = ns.registry.members.get(&req.client_id);
-        if let Some(rec) = rec {
+        let existing = ns.registry.members.get(&req.node_id).cloned();
+        if let Some(rec) = &existing {
             if rec.disabled {
                 return Err(ApiError::client_disabled());
             }
-            // TOFU: after first join, key and cert must match a *live*
-            // pin. Any unexpired pin counts, which is what lets a member
-            // mid-rotation join with either the new key or the old one —
-            // and a retired pin does not, so the window really closes.
-            if !rec.pubkeys.is_empty() && !rec.pubkeys.accepts(&req.pubkey, now) {
-                return Err(ApiError::pin_mismatch());
-            }
-            if !rec.cert_fps.is_empty()
-                && !rec.cert_fps.accepts(&req.cert_fingerprint, now)
-            {
-                return Err(ApiError::pin_mismatch());
-            }
         }
 
-        // Address allocation (sticky: reuse existing assignment).
+        // Addresses are identity: sticky, unless this join asks for
+        // something else (a new preferred address, or none at all).
         let (ip4, ip6) = if req.want_vpn_ip {
-            let existing = ns.registry.members.get(&req.client_id);
-            let (have4, have6) = existing.map(|r| (r.ip4, r.ip6)).unwrap_or((None, None));
-            // A preferred request that contradicts a sticky assignment
-            // is a config-change request — reject it explicitly.
-            if let (Some(want), Some(have)) = (req.preferred_ip4, have4) {
-                if want != have {
-                    return Err(ApiError::address_in_use(format!(
-                        "member already holds {have}; release it first (admin)"
-                    )));
-                }
-            }
-            if have4.is_some() {
+            let (have4, have6) = existing.as_ref().map(|r| (r.ip4, r.ip6)).unwrap_or((None, None));
+            let want4 = req.preferred_ip4.or(member_cfg.preferred_ip4);
+            let want6 = req.preferred_ip6.or(member_cfg.preferred_ip6);
+            let keep4 = have4.is_some() && (want4.is_none() || want4 == have4);
+            let keep6 = have6.is_some() && (want6.is_none() || want6 == have6);
+            if keep4 && (keep6 || have6.is_none() && want6.is_none()) {
                 (have4, have6)
             } else {
-                // Split borrow: cfg is read, registry is mutated (the
-                // allocator advances the pool cursor).
                 let NetState { cfg, registry, .. } = &mut *ns;
                 let granted = crate::ipam::allocate(
                     cfg,
                     registry,
-                    &req.client_id,
+                    req.node_id,
                     req.pool.as_deref(),
-                    req.preferred_ip4,
-                    req.preferred_ip6,
+                    want4.or(have4),
+                    want6.or(have6),
                 )?;
                 (granted.ip4, granted.ip6)
             }
@@ -273,13 +265,9 @@ impl AppState {
             (None, None)
         };
 
-        // Route registrations: keep existing first-grant ages, add new.
-        let mut routes: Vec<RouteReg> = ns
-            .registry
-            .members
-            .get(&req.client_id)
-            .map(|r| r.routes.clone())
-            .unwrap_or_default();
+        // Routes: exactly what this join declares; ages survive for
+        // CIDRs that stay continuously declared.
+        let mut routes: Vec<RouteReg> = existing.as_ref().map(|r| r.routes.clone()).unwrap_or_default();
         routes.retain(|r| req.local_cidrs.iter().any(|c| c.trunc() == r.cidr));
         for c in &req.local_cidrs {
             let c = c.trunc();
@@ -288,41 +276,51 @@ impl AppState {
             }
         }
 
-        // Mutate the record.
-        let rec = ns.registry.member_mut_with_id(&req.client_id, now, member_cfg.node_id);
-        let node_id = rec.node_id;
-        if rec.pubkeys.is_empty() {
-            rec.pubkeys.pin_first(req.pubkey.clone());
-        } else {
-            // Joining with a key that is already pinned confirms it. If
-            // that is the post-rotation key, the predecessor retires now
-            // rather than lingering for the rest of the overlap.
-            rec.pubkeys.confirm(&req.pubkey);
+        // A different machine: previous keys recorded, and this join
+        // presents different ones.
+        let replaced = existing
+            .as_ref()
+            .map(|r| {
+                r.pubkey.is_some()
+                    && (r.pubkey.as_deref() != Some(req.pubkey.as_str())
+                        || r.cert_fp.as_deref() != Some(req.cert_fingerprint.as_str()))
+            })
+            .unwrap_or(false);
+
+        let rec = ns.registry.member_mut(req.node_id, &name, role, now);
+        if replaced {
+            rec.login_gen += 1;
+            rec.replaced_unix = Some(now);
+            rec.replaced_from = rec.last_join_from.clone();
         }
-        if rec.cert_fps.is_empty() {
-            rec.cert_fps.pin_first(req.cert_fingerprint.clone());
-        } else {
-            rec.cert_fps.confirm(&req.cert_fingerprint);
-        }
-        rec.pubkeys.prune(now);
-        rec.cert_fps.prune(now);
-        rec.mirror_legacy_pins();
+        rec.pubkey = Some(req.pubkey.clone());
+        rec.cert_fp = Some(req.cert_fingerprint.clone());
         rec.ip4 = ip4;
         rec.ip6 = ip6;
         rec.routes = routes.clone();
         rec.last_join_unix = Some(now);
+        rec.last_join_from = Some(peer_ip.to_string());
+        let login_gen = rec.login_gen;
+        let node_id = rec.node_id;
 
         // Durability precedes visibility.
-        ns.registry
-            .commit(&ns.registry_path)
-            .map_err(|e| ApiError::internal(format!("registry commit failed: {e:#}")))?;
+        ns.commit()?;
 
-        // Publish the resulting membership change to live sessions.
-        if let Some(d) = ns.refresh_directory(now) {
-            broadcast(&ns, Push::Membership(d));
+        if replaced {
+            tracing::info!(
+                network = %req.network_id, member = %name, node_id, from = peer_ip, login_gen,
+                "a different machine joined as this node; the previous instance is being replaced"
+            );
+            // Its control session is stale now; data sessions follow
+            // once relays see the new login_gen in the snapshot.
+            let stale = ns.sessions.get(&node_id).map(|s| s.login_gen < login_gen).unwrap_or(false);
+            if stale {
+                ns.close_session(node_id, "replaced by a newer join");
+            }
         }
-        // A first-time relay join makes the fleet dialable: tell everyone.
-        crate::control::publish_relays_if_changed(&mut ns);
+
+        let keys = self.keyring.key_infos();
+        ns.publish(&keys, now);
 
         // ---- phase 3: build credential + response ----
         let mut prefixes: Vec<String> = Vec::new();
@@ -335,94 +333,81 @@ impl AppState {
         for r in &routes {
             prefixes.push(r.cidr.to_string());
         }
-
         let claims = Claims {
             iss: ISS.into(),
             aud: AUD.into(),
             network_id: ns.cfg.network_id.clone(),
             network_uuid: ns.registry.network_uuid.to_string(),
             node_id,
-            sub: req.client_id.clone(),
+            sub: name.clone(),
             role,
             pubkey: req.pubkey.clone(),
             cert_fp: req.cert_fingerprint.clone(),
             prefixes,
+            login_gen,
             iat: now,
             exp: now + ttl_secs,
         };
         let (kid, sk) = self.keyring.active();
         let token = credential::sign(&claims, kid, sk);
 
-        let relays = relay_entries(&ns);
         let subnet4 = ns.cfg.cidrs.iter().find(|c| matches!(c, IpNet::V4(_))).cloned();
         let subnet6 = ns.cfg.cidrs.iter().find(|c| matches!(c, IpNet::V6(_))).cloned();
 
         Ok(JoinResponse {
             credential: token,
             network_uuid: ns.registry.network_uuid.to_string(),
-            coordinator_signing_keys: self.keyring.key_infos(),
+            coordinator_signing_keys: keys,
             node_id,
+            name,
+            login_gen,
             ip4,
             subnet4: if ip4.is_some() { subnet4 } else { None },
             ip6,
             subnet6: if ip6.is_some() { subnet6 } else { None },
             granted_cidrs: routes.iter().map(|r| r.cidr).collect(),
-            relays,
+            relays: relay_entries(&ns),
             mtu: ns.cfg.settings.mtu,
-            keepalive_secs: ns.cfg.settings.keepalive_secs,
+            keepalive_secs: ns.cfg.settings.heartbeat_secs,
             transport: ns.cfg.settings.transport.clone(),
             lanes: ns.cfg.settings.lanes,
+            control_port: self.control_port,
+            heartbeat_secs: ns.cfg.settings.heartbeat_secs,
         })
     }
-}
 
-/// Relays a joiner can attach to: only those that have joined at least
-/// once (their cert_fp is pinned, so dialers can verify them).
-pub fn relay_entries(ns: &NetState) -> Vec<RelayEntry> {
-    let mut out = Vec::new();
-    for (name, m) in &ns.cfg.relays {
-        if let (Some(rec), Some(addr)) = (ns.registry.members.get(name), m.relay_addr.clone()) {
-            if let Some(fp) = &rec.cert_fp {
-                out.push(RelayEntry {
-                    relay_id: rec.node_id,
-                    name: name.clone(),
-                    addr,
-                    cert_fp: fp.clone(),
-                });
-            }
-        }
+    /// Recompute and push for one network (admin actions, sweeps).
+    pub fn publish(&self, ns: &mut NetState) {
+        let keys = self.keyring.key_infos();
+        ns.publish(&keys, now_unix());
     }
-    out
 }
 
-/// Sanity check used by reload: a config change may not silently steal a
-/// currently-registered prefix for a member that no longer may hold it.
+/// Relays a joiner can attach to.
+pub fn relay_entries(ns: &NetState) -> Vec<RelayEntry> {
+    crate::directory::relay_endpoints(&ns.cfg, &ns.registry)
+        .into_iter()
+        .map(|r| RelayEntry { relay_id: r.relay_id, name: r.name, addr: r.addr, cert_fp: r.cert_fp })
+        .collect()
+}
+
+/// Sanity check used by reload: a config change may not silently keep a
+/// registration a member is no longer allowed to hold.
 pub fn config_matches_registry(cfg: &NetworkConfig, reg: &Registry) -> Vec<String> {
     let mut warnings = Vec::new();
-    for (name, rec) in &reg.members {
-        // A configured id only applies at creation, so a later change is
-        // silently ineffective unless we say so.
-        if let Some((m, _)) = AppState::member_cfg(cfg, name) {
-            if let Some(want) = m.node_id {
-                if want != rec.node_id {
-                    warnings.push(format!(
-                        "member {name} is configured with node_id {want} but was registered as \
-                         {}; the id is fixed at first join and was not changed (remove the \
-                         member from the registry to renumber it)",
-                        rec.node_id
-                    ));
-                }
-            }
-        }
-        let allowed: Vec<IpNet> = AppState::member_cfg(cfg, name)
-            .map(|(m, _)| m.allowed_cidrs.clone())
-            .unwrap_or_default();
+    for (id, rec) in &reg.members {
+        let Some((name, m, _)) = cfg.member_by_id(*id) else {
+            warnings.push(format!(
+                "node {id} ({}) is in the registry but no longer in config; it cannot join until re-added or deleted",
+                rec.name
+            ));
+            continue;
+        };
         for r in &rec.routes {
-            let ok = allowed.iter().any(|a| a.contains(&r.cidr.network()) && overlaps(a, &r.cidr));
+            let ok = m.allowed_cidrs.iter().any(|a| a.contains(&r.cidr.network()) && a.prefix_len() <= r.cidr.prefix_len());
             if !ok {
                 warnings.push(format!(
-                    "member {name} holds registration {} no longer allowed by config \
-                     (kept until it re-joins; renewal will drop it)",
+                    "member {name} holds registration {} no longer allowed by config (dropped at its next join)",
                     r.cidr
                 ));
             }

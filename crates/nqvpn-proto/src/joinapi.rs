@@ -92,9 +92,8 @@ pub fn parse_url(url: &str) -> Result<(String, u16), JoinError> {
     } else if host_port.matches(':').count() == 1 {
         let (h, p) = host_port.split_once(':').expect("one colon");
         (h.to_string(), p.parse().map_err(|_| JoinError::BadUrl(url.to_string()))?)
-    } else if host_port.contains(':') {
-        (host_port.to_string(), 443) // bare IPv6 literal
     } else {
+        // A bare hostname, or a bare IPv6 literal: default port.
         (host_port.to_string(), 443)
     };
     Ok((host, port))

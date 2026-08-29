@@ -4,6 +4,7 @@
 
 use ipnet::IpNet;
 use std::collections::BTreeSet;
+use nqvpn_proto::types::NodeId;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::config::NetworkConfig;
@@ -21,17 +22,13 @@ pub struct Granted {
 pub fn allocate(
     cfg: &NetworkConfig,
     reg: &mut Registry,
-    member: &str,
+    member: NodeId,
     pool: Option<&str>,
     preferred4: Option<Ipv4Addr>,
     preferred6: Option<Ipv6Addr>,
 ) -> Result<Granted, ApiError> {
     // Pool pin from config must be honored by the request.
-    let member_cfg = cfg
-        .clients
-        .get(member)
-        .or_else(|| cfg.relays.get(member))
-        .expect("caller verified membership");
+    let (_, member_cfg, _) = cfg.member_by_id(member).expect("caller verified membership");
     let effective_pool = match (pool, member_cfg.pool.as_deref()) {
         (Some(req), Some(pinned)) if req != pinned => {
             return Err(ApiError::bad_request(format!(
@@ -51,8 +48,8 @@ pub fn allocate(
     // config-preferred address of OTHER members.
     let mut taken4: BTreeSet<Ipv4Addr> = reg.assigned4().collect();
     let mut taken6: BTreeSet<Ipv6Addr> = reg.assigned6().collect();
-    for (name, m) in cfg.clients.iter().chain(cfg.relays.iter()) {
-        if name == member {
+    for m in cfg.clients.values().chain(cfg.relays.values()) {
+        if m.node_id == member {
             continue;
         }
         if let Some(ip) = m.preferred_ip4 {
@@ -63,7 +60,7 @@ pub fn allocate(
         }
     }
     // The member's own current assignment never conflicts with itself.
-    if let Some(rec) = reg.members.get(member) {
+    if let Some(rec) = reg.members.get(&member) {
         if let Some(ip) = rec.ip4 {
             taken4.remove(&ip);
         }
@@ -111,26 +108,40 @@ fn check_in_network(cfg: &NetworkConfig, ip: IpAddr) -> Result<(), ApiError> {
     }
 }
 
-/// Scan a pool starting at its cursor and wrapping, so addresses cycle
-/// forward instead of the lowest free one being reissued immediately.
-fn scan_from_cursor<T: Copy + Ord>(
-    hosts: Vec<T>,
+/// Scan a pool of `n` addresses starting at its cursor and wrapping, so
+/// addresses cycle forward instead of the lowest free one being reissued
+/// immediately. `at(i)` maps an index to the address, so no pool is ever
+/// materialised.
+fn scan_from_cursor<T: Ord>(
+    n: u64,
+    at: impl Fn(u64) -> T,
     taken: &BTreeSet<T>,
     cursor: u64,
 ) -> Option<(T, u64)> {
-    if hosts.is_empty() {
+    if n == 0 {
         return None;
     }
-    let n = hosts.len() as u64;
     let start = cursor % n;
     for step in 0..n {
-        let idx = ((start + step) % n) as usize;
-        if !taken.contains(&hosts[idx]) {
-            // Next allocation resumes after this one, wrapping naturally.
-            return Some((hosts[idx], (idx as u64 + 1) % n));
+        let idx = (start + step) % n;
+        let cand = at(idx);
+        if !taken.contains(&cand) {
+            return Some((cand, (idx + 1) % n));
         }
     }
     None
+}
+
+/// Usable hosts of a v4 pool: everything but network and broadcast,
+/// except for /31 and /32 where every address is a host.
+fn v4_hosts(net: &ipnet::Ipv4Net) -> (u64, u32) {
+    let first = u32::from(net.network());
+    let last = u32::from(net.broadcast());
+    if net.prefix_len() >= 31 {
+        ((last - first) as u64 + 1, first)
+    } else {
+        ((last - first).saturating_sub(1) as u64, first + 1)
+    }
 }
 
 fn alloc_v4(
@@ -156,9 +167,10 @@ fn alloc_v4(
     }
     for (name, net) in &candidates {
         if let IpNet::V4(v4net) = net {
-            let hosts: Vec<Ipv4Addr> = v4net.hosts().collect();
+            let (n, first) = v4_hosts(v4net);
             let cursor = reg.alloc_cursor.get(name.as_str()).copied().unwrap_or(0);
-            if let Some((ip, next)) = scan_from_cursor(hosts, taken, cursor) {
+            let at = |i: u64| Ipv4Addr::from(first + i as u32);
+            if let Some((ip, next)) = scan_from_cursor(n, at, taken, cursor) {
                 reg.alloc_cursor.insert((*name).clone(), next);
                 return Ok(Some(ip));
             }
@@ -169,6 +181,9 @@ fn alloc_v4(
         None => "all IPv4 pools are exhausted".to_string(),
     }))
 }
+
+/// v6 pools are effectively unbounded; scan at most this many addresses.
+const V6_SCAN_CAP: u64 = 100_000;
 
 fn alloc_v6(
     cfg: &NetworkConfig,
@@ -183,26 +198,24 @@ fn alloc_v6(
         .map(|(n, p)| (n, &p.cidr))
         .collect();
     if let Some(want) = pool {
-        // Pools are per-family, so a pin only constrains its own family:
-        // a member pinned to a v4 pool still gets v6 from any v6 pool
-        // rather than silently losing dual-stack.
+        // Pools are per-family, so a pin only constrains its own family.
         if candidates.iter().any(|(n, _)| n.as_str() == want) {
             candidates.retain(|(n, _)| n.as_str() == want);
         }
     }
     for (name, net) in &candidates {
         if let IpNet::V6(v6net) = net {
-            // hosts() on a big v6 net is an enormous iterator; cap the
-            // scan. Unlike v4 it also yields the network address, which
-            // is reserved for subnet-router anycast.
-            let hosts: Vec<Ipv6Addr> = v6net
-                .hosts()
-                .take(100_000)
-                .filter(|ip| *ip != v6net.network())
-                .collect();
+            // Skip the network address (subnet-router anycast).
+            let first = u128::from(v6net.network()) + 1;
+            let last = u128::from(v6net.broadcast());
+            if last < first {
+                continue;
+            }
+            let n = ((last - first + 1) as u64).min(V6_SCAN_CAP);
             let key = format!("{name}/v6");
             let cursor = reg.alloc_cursor.get(&key).copied().unwrap_or(0);
-            if let Some((ip, next)) = scan_from_cursor(hosts, taken, cursor) {
+            let at = |i: u64| Ipv6Addr::from(first + i as u128);
+            if let Some((ip, next)) = scan_from_cursor(n, at, taken, cursor) {
                 reg.alloc_cursor.insert(key, next);
                 return Ok(Some(ip));
             }
@@ -215,6 +228,7 @@ fn alloc_v6(
 mod tests {
     use super::*;
     use crate::registry::Registry;
+    use nqvpn_proto::types::Role;
 
     fn cfg() -> NetworkConfig {
         toml::from_str(
@@ -228,14 +242,14 @@ cidr = "10.99.2.0/24"
 [pools.v6]
 cidr = "fd99::1:0/126"
 [clients.c1]
-secret_hash = "x"
+node_id = 1
 [clients.c2]
-secret_hash = "x"
+node_id = 2
 [clients.pinned]
-secret_hash = "x"
+node_id = 3
 pool = "servers"
 [relays.r1]
-secret_hash = "x"
+node_id = 4
 relay_addr = "1.2.3.4:1"
 preferred_ip4 = "10.99.0.1"
 "#,
@@ -247,7 +261,7 @@ preferred_ip4 = "10.99.0.1"
     fn sequential_pool_allocation() {
         let c = cfg();
         let mut reg = Registry::new();
-        let g = allocate(&c, &mut reg, "c1", Some("default"), None, None).unwrap();
+        let g = allocate(&c, &mut reg, 1, Some("default"), None, None).unwrap();
         assert_eq!(g.ip4, Some("10.99.1.1".parse().unwrap()));
     }
 
@@ -256,9 +270,9 @@ preferred_ip4 = "10.99.0.1"
         let c = cfg();
         let mut reg = Registry::new();
         // /30 has hosts .1 and .2
-        reg.member_mut("a", 1).ip4 = Some("10.99.1.1".parse().unwrap());
-        reg.member_mut("b", 1).ip4 = Some("10.99.1.2".parse().unwrap());
-        let err = allocate(&c, &mut reg, "c1", Some("default"), None, None).unwrap_err();
+        reg.member_mut(101, "a", Role::Client, 1).ip4 = Some("10.99.1.1".parse().unwrap());
+        reg.member_mut(102, "b", Role::Client, 1).ip4 = Some("10.99.1.2".parse().unwrap());
+        let err = allocate(&c, &mut reg, 1, Some("default"), None, None).unwrap_err();
         assert_eq!(err.code.as_str(), "pool_exhausted");
     }
 
@@ -266,10 +280,10 @@ preferred_ip4 = "10.99.0.1"
     fn any_pool_when_unspecified() {
         let c = cfg();
         let mut reg = Registry::new();
-        reg.member_mut("a", 1).ip4 = Some("10.99.1.1".parse().unwrap());
-        reg.member_mut("b", 1).ip4 = Some("10.99.1.2".parse().unwrap());
+        reg.member_mut(101, "a", Role::Client, 1).ip4 = Some("10.99.1.1".parse().unwrap());
+        reg.member_mut(102, "b", Role::Client, 1).ip4 = Some("10.99.1.2".parse().unwrap());
         // default is full; falls over to servers pool
-        let g = allocate(&c, &mut reg, "c1", None, None, None).unwrap();
+        let g = allocate(&c, &mut reg, 1, None, None, None).unwrap();
         assert_eq!(g.ip4, Some("10.99.2.1".parse().unwrap()));
     }
 
@@ -278,7 +292,7 @@ preferred_ip4 = "10.99.0.1"
         let c = cfg();
         let mut reg = Registry::new();
         let g =
-            allocate(&c, &mut reg, "c1", None, Some("10.99.50.7".parse().unwrap()), None).unwrap();
+            allocate(&c, &mut reg, 1, None, Some("10.99.50.7".parse().unwrap()), None).unwrap();
         assert_eq!(g.ip4, Some("10.99.50.7".parse().unwrap()));
     }
 
@@ -286,8 +300,8 @@ preferred_ip4 = "10.99.0.1"
     fn preferred_conflict_rejected() {
         let c = cfg();
         let mut reg = Registry::new();
-        reg.member_mut("other", 1).ip4 = Some("10.99.50.7".parse().unwrap());
-        let err = allocate(&c, &mut reg, "c1", None, Some("10.99.50.7".parse().unwrap()), None)
+        reg.member_mut(103, "other", Role::Client, 1).ip4 = Some("10.99.50.7".parse().unwrap());
+        let err = allocate(&c, &mut reg, 1, None, Some("10.99.50.7".parse().unwrap()), None)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "address_in_use");
     }
@@ -297,7 +311,7 @@ preferred_ip4 = "10.99.0.1"
         let c = cfg();
         let mut reg = Registry::new();
         // r1's config reserves 10.99.0.1 even though r1 never joined.
-        let err = allocate(&c, &mut reg, "c1", None, Some("10.99.0.1".parse().unwrap()), None)
+        let err = allocate(&c, &mut reg, 1, None, Some("10.99.0.1".parse().unwrap()), None)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "address_in_use");
     }
@@ -306,9 +320,9 @@ preferred_ip4 = "10.99.0.1"
     fn pinned_pool_mismatch_rejected() {
         let c = cfg();
         let mut reg = Registry::new();
-        let err = allocate(&c, &mut reg, "pinned", Some("default"), None, None).unwrap_err();
+        let err = allocate(&c, &mut reg, 3, Some("default"), None, None).unwrap_err();
         assert_eq!(err.code.as_str(), "bad_request");
-        let ok = allocate(&c, &mut reg, "pinned", None, None, None).unwrap();
+        let ok = allocate(&c, &mut reg, 3, None, None, None).unwrap();
         assert_eq!(ok.ip4, Some("10.99.2.1".parse().unwrap()));
     }
 
@@ -320,18 +334,18 @@ preferred_ip4 = "10.99.0.1"
         let c = cfg();
         let mut reg = Registry::new();
         // Fill the whole /30 pool: hosts .1 and .2.
-        let a = allocate(&c, &mut reg, "c1", Some("default"), None, None).unwrap();
-        reg.member_mut("c1", 1).ip4 = a.ip4;
-        let b = allocate(&c, &mut reg, "c2", Some("default"), None, None).unwrap();
-        reg.member_mut("c2", 1).ip4 = b.ip4;
+        let a = allocate(&c, &mut reg, 1, Some("default"), None, None).unwrap();
+        reg.member_mut(1, "c1", Role::Client, 1).ip4 = a.ip4;
+        let b = allocate(&c, &mut reg, 2, Some("default"), None, None).unwrap();
+        reg.member_mut(2, "c2", Role::Client, 1).ip4 = b.ip4;
         assert_ne!(a.ip4, b.ip4);
         assert_eq!(a.ip4, Some("10.99.1.1".parse().unwrap()));
         assert_eq!(b.ip4, Some("10.99.1.2".parse().unwrap()));
 
         // An admin removes the FIRST member, freeing .1 — the lowest
         // free address. A naive allocator would hand it straight over.
-        reg.members.remove("c1");
-        let next = allocate(&c, &mut reg, "c1", Some("default"), None, None).unwrap();
+        reg.members.remove(&1);
+        let next = allocate(&c, &mut reg, 1, Some("default"), None, None).unwrap();
         assert_eq!(
             next.ip4,
             Some("10.99.1.1".parse().unwrap()),
@@ -347,22 +361,22 @@ cidrs = ["10.99.0.0/16"]
 [pools.default]
 cidr = "10.99.1.0/28"
 [clients.x]
-secret_hash = "x"
+node_id = 1
 "#,
         )
         .unwrap();
         let mut r2 = Registry::new();
         let mut seen = Vec::new();
         for i in 0..4 {
-            let g = allocate(&wide, &mut r2, "x", None, None, None).unwrap();
+            let g = allocate(&wide, &mut r2, 1, None, None, None).unwrap();
             let ip = g.ip4.unwrap();
             seen.push(ip);
-            r2.member_mut(&format!("m{i}"), 1).ip4 = Some(ip);
+            r2.member_mut(50 + i, &format!("m{i}"), Role::Client, 1).ip4 = Some(ip);
         }
         // Free the first one, then allocate again: the cursor has moved
         // past it, so the new member gets a fresh address.
-        r2.members.remove("m0");
-        let after = allocate(&wide, &mut r2, "x", None, None, None).unwrap().ip4.unwrap();
+        r2.members.remove(&50);
+        let after = allocate(&wide, &mut r2, 1, None, None, None).unwrap().ip4.unwrap();
         assert_ne!(after, seen[0], "the just-freed address was reissued immediately");
         assert!(!seen.contains(&after), "allocator moved forward to unused space");
     }
@@ -371,7 +385,7 @@ secret_hash = "x"
     fn cursor_survives_a_coordinator_restart() {
         let c = cfg();
         let mut reg = Registry::new();
-        allocate(&c, &mut reg, "c1", Some("default"), None, None).unwrap();
+        allocate(&c, &mut reg, 1, Some("default"), None, None).unwrap();
         let cursor = reg.alloc_cursor.clone();
         assert!(!cursor.is_empty(), "allocation advanced a cursor");
 
@@ -391,7 +405,7 @@ secret_hash = "x"
         let mut reg = Registry::new();
         // "pinned" is pinned to the v4-only pool "servers"; it must still
         // receive an IPv6 address from the v6 pool.
-        let g = allocate(&c, &mut reg, "pinned", None, None, None).unwrap();
+        let g = allocate(&c, &mut reg, 3, None, None, None).unwrap();
         assert_eq!(g.ip4, Some("10.99.2.1".parse().unwrap()));
         assert_eq!(g.ip6, Some("fd99::1:1".parse().unwrap()));
     }
@@ -400,7 +414,7 @@ secret_hash = "x"
     fn unknown_pool_rejected() {
         let c = cfg();
         let mut reg = Registry::new();
-        let err = allocate(&c, &mut reg, "c1", Some("nope"), None, None).unwrap_err();
+        let err = allocate(&c, &mut reg, 1, Some("nope"), None, None).unwrap_err();
         assert_eq!(err.code.as_str(), "unknown_pool");
     }
 
@@ -408,7 +422,7 @@ secret_hash = "x"
     fn preferred_outside_network_rejected() {
         let c = cfg();
         let mut reg = Registry::new();
-        let err = allocate(&c, &mut reg, "c1", None, Some("192.168.9.9".parse().unwrap()), None)
+        let err = allocate(&c, &mut reg, 1, None, Some("192.168.9.9".parse().unwrap()), None)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "bad_request");
     }
@@ -417,7 +431,7 @@ secret_hash = "x"
     fn v6_allocated_alongside_v4() {
         let c = cfg();
         let mut reg = Registry::new();
-        let g = allocate(&c, &mut reg, "c1", None, None, None).unwrap();
+        let g = allocate(&c, &mut reg, 1, None, None, None).unwrap();
         assert!(g.ip4.is_some());
         assert_eq!(g.ip6, Some("fd99::1:1".parse().unwrap()));
     }

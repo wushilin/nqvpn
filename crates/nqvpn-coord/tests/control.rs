@@ -1,22 +1,22 @@
 //! Integration tests for the QUIC control plane (§3.2): authenticated
-//! sessions, revisioned push, attachment registry, liveness-bound route
-//! withdrawal, and Refresh identity continuity.
+//! sessions, the generation-numbered view, heartbeat leases, catch-up
+//! by delta or snapshot, replacement, and liveness-bound routes.
 
 use anyhow::Result;
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-use argon2::Argon2;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use nqvpn_coord::config::{CoordConfig, NetworkConfig};
 use nqvpn_coord::control;
 use nqvpn_coord::registry::Registry;
 use nqvpn_coord::signer::Keyring;
 use nqvpn_coord::state::{now_unix, AppState, NetState};
+use nqvpn_proto::api::JoinRequest;
 use nqvpn_proto::control::*;
-use nqvpn_proto::envelope::Kind;
+use nqvpn_proto::envelope::{decode_payload, Kind};
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::quic::client_config;
 use nqvpn_proto::stream::{read_envelope, write_msg};
-use nqvpn_proto::api::JoinRequest;
-use nqvpn_proto::types::Role;
+use nqvpn_proto::types::{NodeId, Role};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -24,13 +24,7 @@ use std::time::Duration;
 
 const SECRET: &str = "s3cret";
 
-fn hash(s: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default().hash_password(s.as_bytes(), &salt).unwrap().to_string()
-}
-
 fn net_toml() -> String {
-    let h = hash(SECRET);
     format!(
         r#"
 network_id = "n1"
@@ -38,19 +32,25 @@ cidrs = ["10.99.0.0/16"]
 [pools.default]
 cidr = "10.99.1.0/24"
 [settings]
-keepalive_secs = 1
+heartbeat_secs = 1
 offline_after = 3
 hold_down_secs = 0
 [relays.r1]
-secret_hash = '{h}'
+node_id = 1
+secret = "{SECRET}"
 relay_addr = "1.2.3.4:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 [relays.r2]
-secret_hash = '{h}'
+node_id = 2
+secret = "{SECRET}"
 relay_addr = "5.6.7.8:4444"
 allowed_cidrs = ["192.168.1.0/24"]
 [clients.c1]
-secret_hash = '{h}'
+node_id = 10
+secret = "{SECRET}"
+[clients.c2]
+node_id = 11
+secret = "{SECRET}"
 "#
     )
 }
@@ -58,7 +58,6 @@ secret_hash = '{h}'
 struct Env {
     state: Arc<AppState>,
     addr: SocketAddr,
-    server_fp: String,
     _dir: tempfile::TempDir,
 }
 
@@ -68,58 +67,55 @@ async fn setup() -> Env {
         toml::from_str("[listen]\napi = \"127.0.0.1:0\"\n[state]\ndir = \"x\"\n").unwrap();
     let cfg: NetworkConfig = toml::from_str(&net_toml()).unwrap();
     let registry_path = dir.path().join("reg.json");
+    let mut ns = NetState::new(cfg, Registry::load_or_create(&registry_path).unwrap(), registry_path);
+    // Tests are not a restart: skip the collect-before-publish grace.
+    ns.started_at = 0;
     let mut networks = HashMap::new();
-    networks.insert(
-        "n1".to_string(),
-        Mutex::new(NetState::new(cfg, Registry::load_or_create(&registry_path).unwrap(), registry_path)),
-    );
+    networks.insert("n1".to_string(), Mutex::new(ns));
     let state = Arc::new(AppState {
         coord,
         admin_token: Some("tok".into()),
         networks,
         keyring: Keyring::load_or_create(&dir.path().join("signing.json"), now_unix()).unwrap(),
-        join_rate: Mutex::new(HashMap::new()),
+        join_rate: Mutex::new(Default::default()),
         networks_dir: None,
         secrets: Mutex::new(nqvpn_coord::secrets::SecretStore::default()),
-        secrets_path: std::path::PathBuf::from("/nonexistent/secrets.toml"),
+        secrets_path: dir.path().join("secrets.toml"),
+        control_port: 0,
     });
     let id = TlsIdentity::generate("coord").unwrap();
-    let server_fp = id.fingerprint();
     let endpoint = control::bind("127.0.0.1:0".parse().unwrap(), &id).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let s = state.clone();
     tokio::spawn(async move {
         let _ = control::serve(s, endpoint).await;
     });
-    Env { state, addr, server_fp, _dir: dir }
+    Env { state, addr, _dir: dir }
 }
 
-/// A minimal member-side control client — the shape `nqvpn-relay` and
-/// `nqvpn-client` will use in later phases.
+/// A minimal member-side control client.
 struct Member {
     tx: quinn::SendStream,
     rx: quinn::RecvStream,
     _conn: quinn::Connection,
-    id: TlsIdentity,
+    _ep: quinn::Endpoint,
 }
 
 impl Member {
-    async fn connect(env: &Env, credential: &str, id: TlsIdentity) -> Result<Member> {
+    async fn connect(env: &Env, credential: &str, id: &TlsIdentity, have_gen: u64) -> Result<Member> {
         let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
-        ep.set_default_client_config(client_config(&id, Some(env.server_fp.clone()), 5).unwrap());
+        ep.set_default_client_config(client_config(id, None, 5).unwrap());
         let conn = ep.connect(env.addr, "coord")?.await?;
         let (mut tx, rx) = conn.open_bi().await?;
-        write_msg(&mut tx, Kind::Hello, &Hello { credential: credential.to_string() }).await?;
-        Ok(Member { tx, rx, _conn: conn, id })
+        write_msg(&mut tx, Kind::Hello, &Hello { credential: credential.to_string(), have_gen }).await?;
+        Ok(Member { tx, rx, _conn: conn, _ep: ep })
     }
 
     async fn next(&mut self) -> Result<(u16, Vec<u8>)> {
-        let env = tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut self.rx))
-            .await??;
+        let env = tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut self.rx)).await??;
         Ok((env.kind, env.payload))
     }
 
-    /// Read until a message of `kind` arrives (skipping others).
     async fn wait_for(&mut self, kind: Kind) -> Result<Vec<u8>> {
         loop {
             let (k, payload) = self.next().await?;
@@ -129,10 +125,33 @@ impl Member {
         }
     }
 
-    /// The server must tear this session down. Queued pushes may still
-    /// arrive first, so drain until the stream errors.
+    async fn snapshot(&mut self) -> Result<Snapshot> {
+        Ok(decode_payload(&self.wait_for(Kind::Snapshot).await?)?)
+    }
+
+    /// Apply pushes until `pred` holds on the tracked view.
+    async fn until(&mut self, view: &mut Snapshot, pred: impl Fn(&Snapshot) -> bool) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pred(view) {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "condition never held; view = {view:?}");
+            let (k, payload) = self.next().await?;
+            if k == Kind::Snapshot as u16 {
+                *view = decode_payload(&payload)?;
+            } else if k == Kind::Delta as u16 {
+                let d: Delta = decode_payload(&payload)?;
+                view.apply(&d)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn heartbeat(&mut self, hb: &Heartbeat) -> Result<()> {
+        write_msg(&mut self.tx, Kind::Heartbeat, hb).await?;
+        Ok(())
+    }
+
     async fn expect_closed(&mut self) {
-        for _ in 0..20 {
+        for _ in 0..30 {
             if self.next().await.is_err() {
                 return;
             }
@@ -141,20 +160,24 @@ impl Member {
     }
 }
 
-fn join(env: &Env, name: &str, role: Role, id: &TlsIdentity, cidrs: Vec<&str>) -> (String, u32) {
+fn hb_of(view: &Snapshot) -> Heartbeat {
+    Heartbeat { gen: view.gen, digest: view.digest(), ..Default::default() }
+}
+
+fn join_as(env: &Env, node_id: NodeId, role: Role, id: &TlsIdentity, cidrs: Vec<&str>) -> (String, u32) {
     let req = JoinRequest {
         network_id: "n1".into(),
-        client_id: name.into(),
-        client_secret: SECRET.into(),
-        pubkey: format!("PK-{name}"),
+        node_id,
+        secret: SECRET.into(),
+        pubkey: B64.encode([node_id as u8; 32]),
         role,
         want_vpn_ip: true,
         pool: None,
         preferred_ip4: None,
         preferred_ip6: None,
         local_cidrs: cidrs.iter().map(|c| c.parse().unwrap()).collect(),
-        relay_addr: match (role, name) {
-            (Role::Relay, "r2") => Some("5.6.7.8:4444".to_string()),
+        relay_addr: match (role, node_id) {
+            (Role::Relay, 2) => Some("5.6.7.8:4444".to_string()),
             (Role::Relay, _) => Some("1.2.3.4:4444".to_string()),
             _ => None,
         },
@@ -164,26 +187,26 @@ fn join(env: &Env, name: &str, role: Role, id: &TlsIdentity, cidrs: Vec<&str>) -
     (r.credential, r.node_id)
 }
 
+fn attached(pairs: &[(NodeId, u64)]) -> Vec<AttachedClient> {
+    pairs.iter().map(|(n, s)| AttachedClient { node_id: *n, session_id: *s }).collect()
+}
+
 #[tokio::test]
-async fn hello_gets_ack_keyset_and_snapshot() -> Result<()> {
+async fn hello_gets_ack_and_a_snapshot_that_matches_the_digest() -> Result<()> {
     let env = setup().await;
     let id = TlsIdentity::generate("c1")?;
-    let (cred, node_id) = join(&env, "c1", Role::Client, &id, vec![]);
-
-    let mut m = Member::connect(&env, &cred, id).await?;
-    let ack: HelloAck = nqvpn_proto::envelope::decode_payload(&m.wait_for(Kind::HelloAck).await?)?;
-    assert!(ack.revision > 0);
-
-    let keys: KeySet = nqvpn_proto::envelope::decode_payload(&m.wait_for(Kind::KeySet).await?)?;
-    assert_eq!(keys.keys.len(), 1);
-    assert_eq!(keys.keys[0].state, "active");
-
-    let snap: MembershipSnapshot =
-        nqvpn_proto::envelope::decode_payload(&m.wait_for(Kind::MembershipSnapshot).await?)?;
-    assert_eq!(snap.chunk_n, 1);
-    let me = snap.peers.iter().find(|p| p.node_id == node_id).expect("I am in the snapshot");
-    assert!(me.online, "my own session marks me online");
+    let (cred, node) = join_as(&env, 10, Role::Client, &id, vec![]);
+    let mut m = Member::connect(&env, &cred, &id, 0).await?;
+    let ack: HelloAck = decode_payload(&m.wait_for(Kind::HelloAck).await?)?;
+    let snap = m.snapshot().await?;
+    assert_eq!(snap.gen, ack.gen);
+    let me = snap.member(node).expect("I am in the snapshot");
+    assert!(me.online);
     assert!(me.prefixes.iter().any(|p| p.to_string().ends_with("/32")));
+    assert_eq!(snap.keys.len(), 1);
+    assert_eq!(snap.mtu.mtu, 1350);
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert_eq!(snap.digest(), ns.directory.published_digest, "member and coordinator agree bit for bit");
     Ok(())
 }
 
@@ -191,169 +214,183 @@ async fn hello_gets_ack_keyset_and_snapshot() -> Result<()> {
 async fn bad_credential_and_wrong_cert_are_rejected() -> Result<()> {
     let env = setup().await;
     let id = TlsIdentity::generate("c1")?;
-    let (cred, _) = join(&env, "c1", Role::Client, &id, vec![]);
-
-    // Garbage credential.
-    let mut m = Member::connect(&env, "not-a-token", TlsIdentity::generate("x")?).await?;
+    let (cred, _) = join_as(&env, 10, Role::Client, &id, vec![]);
+    let mut m = Member::connect(&env, "not-a-token", &TlsIdentity::generate("x")?, 0).await?;
     m.expect_closed().await;
-
-    // Valid credential presented with a *different* TLS identity: the
-    // possession proof fails (this is the stolen-bearer-token case).
-    let stolen = TlsIdentity::generate("thief")?;
-    let mut m2 = Member::connect(&env, &cred, stolen).await?;
+    // Valid credential, different TLS key: the possession proof fails.
+    let mut m2 = Member::connect(&env, &cred, &TlsIdentity::generate("thief")?, 0).await?;
     m2.expect_closed().await;
     Ok(())
 }
 
 #[tokio::test]
-async fn membership_delta_is_pushed_when_a_peer_joins() -> Result<()> {
+async fn a_change_is_pushed_as_a_delta_that_applies_cleanly() -> Result<()> {
     let env = setup().await;
     let rid = TlsIdentity::generate("r1")?;
-    let (rcred, _) = join(&env, "r1", Role::Relay, &rid, vec!["192.168.1.0/24"]);
-    let mut relay = Member::connect(&env, &rcred, rid).await?;
-    relay.wait_for(Kind::MembershipSnapshot).await?;
-
-    // A client joins over HTTP; the live relay session must be told.
-    let cid = TlsIdentity::generate("c1")?;
-    let (_, c_node) = join(&env, "c1", Role::Client, &cid, vec![]);
-
-    // The relay's own online-transition delta may be queued ahead of the
-    // one we care about; read until c1 shows up.
-    loop {
-        let delta: MembershipDelta =
-            nqvpn_proto::envelope::decode_payload(&relay.wait_for(Kind::MembershipDelta).await?)?;
-        assert!(delta.new_rev > delta.base_rev);
-        if delta.changed.iter().any(|p| p.node_id == c_node) {
-            return Ok(());
-        }
-    }
-}
-
-#[tokio::test]
-async fn attach_is_relayed_to_relays_only() -> Result<()> {
-    let env = setup().await;
-    let r1id = TlsIdentity::generate("r1")?;
-    let (r1cred, r1_node) = join(&env, "r1", Role::Relay, &r1id, vec![]);
-    let mut r1 = Member::connect(&env, &r1cred, r1id).await?;
-    r1.wait_for(Kind::AttachmentSnapshot).await?;
-
-    let r2id = TlsIdentity::generate("r2")?;
-    let (r2cred, _) = join(&env, "r2", Role::Relay, &r2id, vec![]);
-    let mut r2 = Member::connect(&env, &r2cred, r2id).await?;
-    r2.wait_for(Kind::AttachmentSnapshot).await?;
+    let (rcred, _) = join_as(&env, 1, Role::Relay, &rid, vec!["192.168.1.0/24"]);
+    let mut relay = Member::connect(&env, &rcred, &rid, 0).await?;
+    let mut view = relay.snapshot().await?;
 
     let cid = TlsIdentity::generate("c1")?;
-    let (_, c_node) = join(&env, "c1", Role::Client, &cid, vec![]);
-
-    // r1 reports that c1 attached to it.
-    write_msg(&mut r1.tx, Kind::Attach, &Attach { node_id: c_node, attached: true }).await?;
-
-    // r2 (a relay) learns the attachment.
-    let d: AttachmentDelta =
-        nqvpn_proto::envelope::decode_payload(&r2.wait_for(Kind::AttachmentDelta).await?)?;
-    assert_eq!(d.changed, vec![AttachmentEntry { node_id: c_node, relay_id: r1_node }]);
+    let (_, c_node) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    relay.until(&mut view, |v| v.member(c_node).is_some()).await?;
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert_eq!(view.gen, ns.directory.gen);
+    assert_eq!(view.digest(), ns.directory.published_digest, "deltas reproduce the coordinator's view exactly");
     Ok(())
 }
 
 #[tokio::test]
-async fn client_may_not_send_attach() -> Result<()> {
+async fn a_relay_declares_attachments_as_a_set_and_moves_win_by_recency() -> Result<()> {
+    let env = setup().await;
+    let r1id = TlsIdentity::generate("r1")?;
+    let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec![]);
+    let mut r1 = Member::connect(&env, &r1cred, &r1id, 0).await?;
+    let mut v1 = r1.snapshot().await?;
+    let r2id = TlsIdentity::generate("r2")?;
+    let (r2cred, _) = join_as(&env, 2, Role::Relay, &r2id, vec![]);
+    let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
+    let mut v2 = r2.snapshot().await?;
+    let cid = TlsIdentity::generate("c1")?;
+    let (ccred, c) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut client = Member::connect(&env, &ccred, &cid, 0).await?;
+    let _ = client.snapshot().await?;
+
+    // r1 holds the client.
+    let mut h = hb_of(&v1);
+    h.attached = attached(&[(c, 1)]);
+    r1.heartbeat(&h).await?;
+    r2.until(&mut v2, |v| v.attachment_of(c) == Some(1)).await?;
+
+    // The client moves to r2; r1's stale session still lists it.
+    let mut h2 = hb_of(&v2);
+    h2.attached = attached(&[(c, 7)]);
+    r2.heartbeat(&h2).await?;
+    r1.until(&mut v1, |v| v.attachment_of(c) == Some(2)).await?;
+    let mut h = hb_of(&v1);
+    h.attached = attached(&[(c, 1)]);
+    r1.heartbeat(&h).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert_eq!(ns.directory.published.attachment_of(c), Some(2), "a repeated stale declaration does not win");
+    drop(ns);
+
+    // r1's stale session ends: it simply stops declaring. Nothing to detach.
+    let mut h = hb_of(&v1);
+    h.attached = vec![];
+    r1.heartbeat(&h).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert_eq!(ns.directory.published.attachment_of(c), Some(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_heartbeat_cannot_declare_attachments() -> Result<()> {
     let env = setup().await;
     let cid = TlsIdentity::generate("c1")?;
-    let (cred, node) = join(&env, "c1", Role::Client, &cid, vec![]);
-    let mut c = Member::connect(&env, &cred, cid).await?;
-    c.wait_for(Kind::MembershipSnapshot).await?;
-    write_msg(&mut c.tx, Kind::Attach, &Attach { node_id: node, attached: true }).await?;
-    c.expect_closed().await;
+    let (cred, node) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut c = Member::connect(&env, &cred, &cid, 0).await?;
+    let view = c.snapshot().await?;
+    let mut h = hb_of(&view);
+    h.attached = attached(&[(node, 1)]);
+    c.heartbeat(&h).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert!(ns.directory.published.attachments.is_empty(), "only relays hold clients");
+    assert!(ns.sessions.contains_key(&node), "and it is not fatal");
     Ok(())
 }
 
 #[tokio::test]
 async fn death_withdraws_routes_and_fails_over() -> Result<()> {
     let env = setup().await;
-    // r1 registers the LAN first, so it owns it.
     let r1id = TlsIdentity::generate("r1")?;
-    let (r1cred, _) = join(&env, "r1", Role::Relay, &r1id, vec!["192.168.1.0/24"]);
-    let mut r1 = Member::connect(&env, &r1cred, r1id).await?;
-    r1.wait_for(Kind::MembershipSnapshot).await?;
-
-    // r2 registers the same LAN: standby.
+    let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec!["192.168.1.0/24"]);
+    let r1 = Member::connect(&env, &r1cred, &r1id, 0).await?;
     let r2id = TlsIdentity::generate("r2")?;
-    let (r2cred, r2_node) = join(&env, "r2", Role::Relay, &r2id, vec!["192.168.1.0/24"]);
-    let mut r2 = Member::connect(&env, &r2cred, r2id).await?;
-    r2.wait_for(Kind::MembershipSnapshot).await?;
-
+    let (r2cred, r2_node) = join_as(&env, 2, Role::Relay, &r2id, vec!["192.168.1.0/24"]);
+    let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
+    let mut view = r2.snapshot().await?;
     {
         let ns = env.state.networks["n1"].lock().unwrap();
-        assert_eq!(ns.directory.owners["192.168.1.0/24"], "r1", "oldest live registrant owns");
+        assert_eq!(ns.directory.owners["192.168.1.0/24"], 1, "oldest live registrant owns");
     }
-
-    // r1 dies.
     drop(r1);
-
-    // r2's PeerInfo gains the LAN prefix — automatic site failover.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let d: MembershipDelta =
-            nqvpn_proto::envelope::decode_payload(&r2.wait_for(Kind::MembershipDelta).await?)?;
-        let took_over = d
-            .changed
-            .iter()
-            .any(|p| p.node_id == r2_node && p.prefixes.iter().any(|x| x.to_string() == "192.168.1.0/24"));
-        if took_over {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "failover never happened");
-    }
+    r2.until(&mut view, |v| {
+        v.member(r2_node).map(|p| p.prefixes.iter().any(|x| x.to_string() == "192.168.1.0/24")).unwrap_or(false)
+    })
+    .await?;
     let ns = env.state.networks["n1"].lock().unwrap();
-    assert_eq!(ns.directory.owners["192.168.1.0/24"], "r2");
+    assert_eq!(ns.directory.owners["192.168.1.0/24"], 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn refresh_requires_identity_continuity() -> Result<()> {
+async fn a_relay_losing_its_control_link_keeps_its_attachments() -> Result<()> {
     let env = setup().await;
-    let c1id = TlsIdentity::generate("c1")?;
-    let (c1cred, _) = join(&env, "c1", Role::Client, &c1id, vec![]);
+    tokio::spawn(control::liveness_sweep(env.state.clone()));
     let r1id = TlsIdentity::generate("r1")?;
-    let (r1cred, _) = join(&env, "r1", Role::Relay, &r1id, vec![]);
+    let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec![]);
+    let mut r1 = Member::connect(&env, &r1cred, &r1id, 0).await?;
+    let v1 = r1.snapshot().await?;
+    let r2id = TlsIdentity::generate("r2")?;
+    let (r2cred, _) = join_as(&env, 2, Role::Relay, &r2id, vec![]);
+    let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
+    let mut v2 = r2.snapshot().await?;
+    let cid = TlsIdentity::generate("c1")?;
+    let (ccred, c) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut client = Member::connect(&env, &ccred, &cid, 0).await?;
+    let mut cv = client.snapshot().await?;
 
-    let mut c1 = Member::connect(&env, &c1cred, c1id).await?;
-    c1.wait_for(Kind::MembershipSnapshot).await?;
+    let mut h = hb_of(&v1);
+    h.attached = attached(&[(c, 1)]);
+    r1.heartbeat(&h).await?;
+    r2.until(&mut v2, |v| v.attachment_of(c) == Some(1)).await?;
 
-    // Refreshing with my own credential is fine.
-    write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: c1cred.clone() }).await?;
-    write_msg(&mut c1.tx, Kind::Ping, &()).await?;
+    // r1's control link dies. The client keeps heartbeating.
+    drop(r1);
+    for _ in 0..6 {
+        client.heartbeat(&hb_of(&cv)).await?;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // drain pushes so the client's view stays current
+        client.until(&mut cv, |_| true).await?;
+    }
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert!(!ns.leases.is_online(1), "the relay is offline to the coordinator");
+    assert!(ns.leases.is_online(c), "the client is not");
+    assert_eq!(ns.directory.published.attachment_of(c), Some(1), "so its attachment outlives the relay's lease");
+    drop(ns);
 
-    // Refreshing with *another member's* valid credential must not
-    // rebind this session (§3.3 identity continuity).
-    write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: r1cred }).await?;
-    c1.expect_closed().await;
+    // Once the client itself goes silent, the attachment goes with it.
+    drop(client);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        r2.until(&mut v2, |_| true).await.ok();
+        if env.state.networks["n1"].lock().unwrap().directory.published.attachment_of(c).is_none() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "attachment never expired with the client");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     Ok(())
 }
 
-/// A member that stops sending keepalives must be torn down by the
-/// liveness sweep — not left "online" until the QUIC idle timeout.
-/// (Regression: closing only the writer left the reader, and therefore
-/// the member's online state, hanging.)
 #[tokio::test]
 async fn silent_member_is_reaped_by_liveness_sweep() -> Result<()> {
     let env = setup().await;
     tokio::spawn(control::liveness_sweep(env.state.clone()));
-
     let cid = TlsIdentity::generate("c1")?;
-    let (cred, node) = join(&env, "c1", Role::Client, &cid, vec![]);
-    let mut c = Member::connect(&env, &cred, cid).await?;
-    c.wait_for(Kind::MembershipSnapshot).await?;
-
-    // One ping establishes last_seen, then we go silent. keepalive_secs
-    // = 1 and offline_after = 3, so the sweep should reap us in ~4 s.
-    write_msg(&mut c.tx, Kind::Ping, &()).await?;
-
+    let (cred, node) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut c = Member::connect(&env, &cred, &cid, 0).await?;
+    let view = c.snapshot().await?;
+    c.heartbeat(&hb_of(&view)).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         {
             let ns = env.state.networks["n1"].lock().unwrap();
-            if !ns.directory.peers[&node].online {
+            if !ns.directory.published.member(node).unwrap().online {
+                assert!(!ns.sessions.contains_key(&node), "and the session was closed");
                 return Ok(());
             }
         }
@@ -362,357 +399,236 @@ async fn silent_member_is_reaped_by_liveness_sweep() -> Result<()> {
     }
 }
 
-/// Ownership can fall due purely by elapsed time: once a returning
-/// older registrant's hold-down expires it must reclaim, even though no
-/// membership event occurs at that moment.
 #[tokio::test]
 async fn hold_down_expiry_reclaims_without_an_event() -> Result<()> {
     let env = setup().await;
-    {
-        // 2-second hold-down for the test.
-        let mut ns = env.state.networks["n1"].lock().unwrap();
-        ns.directory.set_hold_down(2);
-    }
+    env.state.networks["n1"].lock().unwrap().directory.hold_down_secs = 2;
     tokio::spawn(control::liveness_sweep(env.state.clone()));
-
-    // r1 registers first (older), r2 second.
     let r1id = TlsIdentity::generate("r1")?;
-    let (r1cred, _) = join(&env, "r1", Role::Relay, &r1id, vec!["192.168.1.0/24"]);
+    let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec!["192.168.1.0/24"]);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let r2id = TlsIdentity::generate("r2")?;
-    let (r2cred, _) = join(&env, "r2", Role::Relay, &r2id, vec!["192.168.1.0/24"]);
-
-    // Only r2 is online: it owns.
-    let mut r2 = Member::connect(&env, &r2cred, r2id).await?;
-    r2.wait_for(Kind::MembershipSnapshot).await?;
-    {
-        let ns = env.state.networks["n1"].lock().unwrap();
-        assert_eq!(ns.directory.owners["192.168.1.0/24"], "r2");
-    }
-
-    // r1 (older) returns. No further events occur — only time passes.
-    let mut r1 = Member::connect(&env, &r1cred, r1id).await?;
-    r1.wait_for(Kind::MembershipSnapshot).await?;
+    let (r2cred, _) = join_as(&env, 2, Role::Relay, &r2id, vec!["192.168.1.0/24"]);
+    let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
+    let v2 = r2.snapshot().await?;
+    assert_eq!(env.state.networks["n1"].lock().unwrap().directory.owners["192.168.1.0/24"], 2);
+    let mut r1 = Member::connect(&env, &r1cred, &r1id, 0).await?;
+    let v1 = r1.snapshot().await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        {
-            let ns = env.state.networks["n1"].lock().unwrap();
-            if ns.directory.owners["192.168.1.0/24"] == "r1" {
-                return Ok(());
-            }
-        }
-        assert!(std::time::Instant::now() < deadline, "hold-down never expired into a reclaim");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// The MTU loop end to end on the wire: a member reports what its
-/// uplink can carry, and the coordinator publishes a network-wide value
-/// that no hop will drop — naming the member that set the floor.
-#[tokio::test]
-async fn an_mtu_report_produces_a_network_wide_minimum() -> Result<()> {
-    let env = setup().await;
-    let aid = TlsIdentity::generate("r1")?;
-    let (acred, _) = join(&env, "r1", Role::Relay, &aid, vec![]);
-    let mut a = Member::connect(&env, &acred, aid).await?;
-    // Every session is told the current MTU at setup.
-    let first: NetworkMtu =
-        nqvpn_proto::envelope::decode_payload(&a.wait_for(Kind::NetworkMtu).await?)?;
-    assert_eq!(first.mtu, 1350, "starts at the configured ceiling");
-    assert_eq!(first.limited_by, "config");
-
-    // A second member joins and reports a *smaller* usable MTU.
-    let bid = TlsIdentity::generate("c1")?;
-    let (bcred, _) = join(&env, "c1", Role::Client, &bid, vec![]);
-    let mut b = Member::connect(&env, &bcred, bid).await?;
-    b.wait_for(Kind::NetworkMtu).await?;
-    write_msg(&mut b.tx, Kind::MtuReport, &MtuReport { usable_mtu: 1300 }).await?;
-
-    // Both members must learn the new floor, not just the one that
-    // reported it — otherwise the other keeps sending oversized packets.
-    for m in [&mut a, &mut b] {
-        let got: NetworkMtu =
-            nqvpn_proto::envelope::decode_payload(&m.wait_for(Kind::NetworkMtu).await?)?;
-        assert_eq!(got.mtu, 1300, "the network drops to the smallest uplink");
-        assert_eq!(got.limited_by, "c1", "and says which member set it");
-    }
-    Ok(())
-}
-
-/// A member that leaves must stop constraining everyone else, or one
-/// departed laptop pins the whole network to its old uplink forever.
-#[tokio::test]
-async fn a_departing_member_stops_limiting_the_mtu() -> Result<()> {
-    let env = setup().await;
-    let aid = TlsIdentity::generate("r1")?;
-    let (acred, _) = join(&env, "r1", Role::Relay, &aid, vec![]);
-    let mut a = Member::connect(&env, &acred, aid).await?;
-    a.wait_for(Kind::NetworkMtu).await?;
-
-    let bid = TlsIdentity::generate("c1")?;
-    let (bcred, _) = join(&env, "c1", Role::Client, &bid, vec![]);
-    let mut b = Member::connect(&env, &bcred, bid).await?;
-    b.wait_for(Kind::NetworkMtu).await?;
-    write_msg(&mut b.tx, Kind::MtuReport, &MtuReport { usable_mtu: 1290 }).await?;
-
-    loop {
-        let m: NetworkMtu =
-            nqvpn_proto::envelope::decode_payload(&a.wait_for(Kind::NetworkMtu).await?)?;
-        if m.mtu == 1290 {
-            break;
-        }
-    }
-    drop(b); // the constrained member goes away
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let m: NetworkMtu =
-            nqvpn_proto::envelope::decode_payload(&a.wait_for(Kind::NetworkMtu).await?)?;
-        if m.mtu == 1350 && m.limited_by == "config" {
+        r1.heartbeat(&hb_of(&v1)).await?;
+        r2.heartbeat(&hb_of(&v2)).await?;
+        if env.state.networks["n1"].lock().unwrap().directory.owners["192.168.1.0/24"] == 1 {
             return Ok(());
         }
-        assert!(std::time::Instant::now() < deadline, "MTU never recovered: {m:?}");
+        assert!(std::time::Instant::now() < deadline, "hold-down never expired into a reclaim");
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 
 #[tokio::test]
-async fn disconnect_marks_offline() -> Result<()> {
+async fn mtu_is_the_network_minimum_and_recovers_when_the_limiter_leaves() -> Result<()> {
+    let env = setup().await;
+    let aid = TlsIdentity::generate("r1")?;
+    let (acred, _) = join_as(&env, 1, Role::Relay, &aid, vec![]);
+    let mut a = Member::connect(&env, &acred, &aid, 0).await?;
+    let mut av = a.snapshot().await?;
+    assert_eq!(av.mtu.mtu, 1350);
+    let bid = TlsIdentity::generate("c1")?;
+    let (bcred, b_node) = join_as(&env, 10, Role::Client, &bid, vec![]);
+    let mut b = Member::connect(&env, &bcred, &bid, 0).await?;
+    let bv = b.snapshot().await?;
+    let mut h = hb_of(&bv);
+    h.usable_mtu = 1300;
+    b.heartbeat(&h).await?;
+    a.until(&mut av, |v| v.mtu.mtu == 1300).await?;
+    assert_eq!(av.mtu.limited_by, format!("#{b_node}"));
+    drop(b);
+    a.until(&mut av, |v| v.mtu.mtu == 1350).await?;
+    assert_eq!(av.mtu.limited_by, "config");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_behind_is_caught_up_by_deltas_and_a_stranger_by_snapshot() -> Result<()> {
     let env = setup().await;
     let cid = TlsIdentity::generate("c1")?;
-    let (cred, node) = join(&env, "c1", Role::Client, &cid, vec![]);
-    let c = Member::connect(&env, &cred, cid).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (cred, _) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut c = Member::connect(&env, &cred, &cid, 0).await?;
+    let mut view = c.snapshot().await?;
+    let g0 = view.gen;
+
+    // Two changes happen while we are away.
+    drop(c);
+    let r1id = TlsIdentity::generate("r1")?;
+    join_as(&env, 1, Role::Relay, &r1id, vec![]);
+    let r2id = TlsIdentity::generate("r2")?;
+    join_as(&env, 2, Role::Relay, &r2id, vec![]);
+
+    // Reconnect saying what we hold: deltas, not a snapshot.
+    let mut c = Member::connect(&env, &cred, &cid, g0).await?;
+    let (k, payload) = c.next().await?;
+    assert_eq!(k, Kind::HelloAck as u16);
+    let (k, payload2) = c.next().await?;
+    assert_eq!(k, Kind::Delta as u16, "a known generation is caught up by deltas");
+    let d: Delta = decode_payload(&payload2)?;
+    assert_eq!(d.base_gen, g0);
+    view.apply(&d)?;
+    let st = env.state.clone();
+    c.until(&mut view, |v| {
+        let ns = st.networks["n1"].lock().unwrap();
+        v.gen == ns.directory.gen && v.member(1).is_some() && v.member(2).is_some()
+    })
+    .await?;
+    let _ = payload;
     {
         let ns = env.state.networks["n1"].lock().unwrap();
-        assert!(ns.directory.peers[&node].online);
+        assert_eq!(view.digest(), ns.directory.published_digest);
     }
-    drop(c);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        {
-            let ns = env.state.networks["n1"].lock().unwrap();
-            if !ns.directory.peers[&node].online {
-                break;
-            }
-        }
-        assert!(std::time::Instant::now() < deadline, "never went offline");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+
+    // A heartbeat claiming an unknown generation gets a snapshot.
+    let mut h = hb_of(&view);
+    h.gen = 12345;
+    c.heartbeat(&h).await?;
+    let snap = c.snapshot().await?;
+    assert_eq!(snap.digest(), view.digest());
+
+    // Same generation, different digest: a bug — resynced, and loudly.
+    let mut h = hb_of(&view);
+    h.digest ^= 1;
+    c.heartbeat(&h).await?;
+    let snap = c.snapshot().await?;
+    assert_eq!(snap.gen, view.gen);
+
+    // An explicit Resync works the same way.
+    write_msg(&mut c.tx, Kind::Resync, &Resync { have_gen: 0 }).await?;
+    c.snapshot().await?;
     Ok(())
 }
 
-/// The RPC layer over a real control session.
-///
-/// The unit tests in `nqvpn-proto` wire two peers to each other in
-/// memory. This checks the part they cannot: that requests survive the
-/// actual QUIC stream, share it with the coordinator's pushes without
-/// either corrupting the other, and come back correlated.
+#[tokio::test]
+async fn a_replaced_instance_is_closed_and_refused() -> Result<()> {
+    let env = setup().await;
+    let old_id = TlsIdentity::generate("laptop-old")?;
+    let (old_cred, node) = join_as(&env, 10, Role::Client, &old_id, vec![]);
+    let mut old = Member::connect(&env, &old_cred, &old_id, 0).await?;
+    old.snapshot().await?;
+
+    // A different machine joins as the same node.
+    let new_id = TlsIdentity::generate("laptop-new")?;
+    let (new_cred, _) = join_as(&env, 10, Role::Client, &new_id, vec![]);
+    old.expect_closed().await;
+    // Its credential no longer opens a session, even before expiry.
+    let mut again = Member::connect(&env, &old_cred, &old_id, 0).await?;
+    again.expect_closed().await;
+    // The new instance is fine, and everyone sees the new login_gen.
+    let mut new = Member::connect(&env, &new_cred, &new_id, 0).await?;
+    let snap = new.snapshot().await?;
+    assert_eq!(snap.member(node).unwrap().login_gen, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabling_evicts_the_member_everywhere() -> Result<()> {
+    let env = setup().await;
+    let rid = TlsIdentity::generate("r1")?;
+    let (rcred, _) = join_as(&env, 1, Role::Relay, &rid, vec![]);
+    let mut relay = Member::connect(&env, &rcred, &rid, 0).await?;
+    let mut rv = relay.snapshot().await?;
+    let cid = TlsIdentity::generate("c1")?;
+    let (ccred, node) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut c = Member::connect(&env, &ccred, &cid, 0).await?;
+    c.snapshot().await?;
+    relay.until(&mut rv, |v| v.member(node).is_some()).await?;
+
+    {
+        let mut ns = env.state.networks["n1"].lock().unwrap();
+        ns.registry.members.get_mut(&node).unwrap().disabled = true;
+        ns.close_session(node, "disabled");
+        ns.leases.remove(node);
+        env.state.publish(&mut ns);
+    }
+    c.expect_closed().await;
+    relay.until(&mut rv, |v| v.member(node).is_none()).await?;
+    let mut again = Member::connect(&env, &ccred, &cid, 0).await?;
+    again.expect_closed().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_extends_the_session_but_never_rebinds_it() -> Result<()> {
+    let env = setup().await;
+    let c1id = TlsIdentity::generate("c1")?;
+    let (c1cred, node) = join_as(&env, 10, Role::Client, &c1id, vec![]);
+    let r1id = TlsIdentity::generate("r1")?;
+    let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec![]);
+    let mut c1 = Member::connect(&env, &c1cred, &c1id, 0).await?;
+    let view = c1.snapshot().await?;
+    let exp_before = env.state.networks["n1"].lock().unwrap().sessions[&node].exp;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (renewed, _) = join_as(&env, 10, Role::Client, &c1id, vec![]);
+    write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: renewed }).await?;
+    c1.heartbeat(&hb_of(&view)).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(env.state.networks["n1"].lock().unwrap().sessions[&node].exp > exp_before);
+    write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: r1cred }).await?;
+    c1.expect_closed().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_restarted_coordinator_collects_before_publishing() -> Result<()> {
+    let env = setup().await;
+    env.state.networks["n1"].lock().unwrap().started_at = now_unix(); // grace = 2 × 1 s
+    let cid = TlsIdentity::generate("c1")?;
+    let (cred, _) = join_as(&env, 10, Role::Client, &cid, vec![]);
+    let mut c = Member::connect(&env, &cred, &cid, 0).await?;
+    let (k, _) = c.next().await?;
+    assert_eq!(k, Kind::HelloAck as u16);
+    // Nothing else during the grace; the member keeps its old view.
+    assert!(tokio::time::timeout(Duration::from_millis(800), c.next()).await.is_err());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    c.heartbeat(&Heartbeat::default()).await?;
+    c.snapshot().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn rpc_api_versions_over_a_real_control_session() -> Result<()> {
-    use nqvpn_proto::envelope::{decode_payload, encode_msg};
-    use nqvpn_proto::rpc::{ApiVersions, Request, Response, VerbSupport, verb};
-
+    use nqvpn_proto::envelope::encode_msg;
+    use nqvpn_proto::rpc::{verb, ApiVersions, Request, Response, VerbSupport};
     let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let (cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-    let mut m = Member::connect(&env, &cred, id).await?;
-
-    // Ask the coordinator what it implements. Sent by hand rather than
-    // through RpcPeer so the test pins the actual bytes on the wire.
+    let id = TlsIdentity::generate("r1")?;
+    let (cred, _) = join_as(&env, 1, Role::Relay, &id, vec![]);
+    let mut m = Member::connect(&env, &cred, &id, 0).await?;
     let req = Request { req_id: 77, verb: verb::API_VERSIONS, version: 1, payload: Vec::new() };
-    let bytes = encode_msg(Kind::Request, &req)?;
-    m.tx.write_all(&bytes).await?;
-
-    // The reply has to be found among the membership pushes that arrive
-    // unprompted on the same stream — which is the real test.
-    let payload = m.wait_for(Kind::Response).await?;
-    let resp: Response = decode_payload(&payload)?;
-    assert_eq!(resp.req_id, 77, "reply must carry the request id");
-    assert_eq!(resp.code, None, "api_versions must succeed");
+    m.tx.write_all(&encode_msg(Kind::Request, &req)?).await?;
+    let resp: Response = decode_payload(&m.wait_for(Kind::Response).await?)?;
+    assert_eq!(resp.req_id, 77);
     let versions: ApiVersions = decode_payload(&resp.payload)?;
-    assert!(
-        versions.verbs.contains(&VerbSupport { verb: verb::API_VERSIONS, min: 1, max: 1 }),
-        "api_versions must always advertise itself, got {:?}",
-        versions.verbs
-    );
-
-    // An unknown verb is answered, and the session keeps working after —
-    // the property that makes adding verbs safe.
+    assert!(versions.verbs.contains(&VerbSupport { verb: verb::API_VERSIONS, min: 1, max: 1 }));
     let req = Request { req_id: 78, verb: 60000, version: 1, payload: Vec::new() };
     m.tx.write_all(&encode_msg(Kind::Request, &req)?).await?;
-    let payload = m.wait_for(Kind::Response).await?;
-    let resp: Response = decode_payload(&payload)?;
-    assert_eq!(resp.req_id, 78);
-    assert_eq!(resp.code.as_deref(), Some("unsupported_verb"));
-
-    // Still alive: a Ping must still be accepted afterwards.
-    write_msg(&mut m.tx, Kind::Ping, &()).await?;
-    let req = Request { req_id: 79, verb: verb::API_VERSIONS, version: 1, payload: Vec::new() };
-    m.tx.write_all(&encode_msg(Kind::Request, &req)?).await?;
-    let payload = m.wait_for(Kind::Response).await?;
-    let resp: Response = decode_payload(&payload)?;
-    assert_eq!(resp.req_id, 79, "session must survive an unknown verb");
+    let resp: Response = decode_payload(&m.wait_for(Kind::Response).await?)?;
+    assert_eq!(resp.code.as_deref(), Some("unsupported_verb"), "answered, not fatal");
     Ok(())
 }
 
-/// Identity rotation over the control session.
-///
-/// The security-critical property is the overlap: after rotating, *both*
-/// identities must authenticate until the window closes, so a member that
-/// crashes before switching is not locked out and forced through an admin
-/// `reset-pin` — the one operation that reopens the trust window.
-#[tokio::test]
-async fn rotate_identity_keeps_the_old_key_working_during_the_overlap() -> Result<()> {
-    use nqvpn_proto::envelope::{decode_payload, encode_msg, encode_payload};
-    use nqvpn_proto::rpc::{Request, Response, RotateIdentity, RotateIdentityOk, verb};
-
-    let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let old_fp = id.fingerprint();
-    let (cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-    let mut m = Member::connect(&env, &cred, id.clone()).await?;
-
-    // A second identity, as a member would generate before rotating.
-    let new_id = TlsIdentity::generate("r1-rotated").unwrap();
-    let new_fp = new_id.fingerprint();
-    assert_ne!(old_fp, new_fp);
-
-    let body = encode_payload(&RotateIdentity {
-        new_pubkey: String::new(), // leave the Noise key alone
-        new_cert_fp: new_fp.clone(),
-    })?;
-    let req = Request { req_id: 1, verb: verb::ROTATE_IDENTITY, version: 1, payload: body };
-    m.tx.write_all(&encode_msg(Kind::Request, &req)?).await?;
-
-    let payload = m.wait_for(Kind::Response).await?;
-    let resp: Response = decode_payload(&payload)?;
-    assert_eq!(resp.code, None, "rotation should succeed: {:?}", resp.code);
-    let ok: RotateIdentityOk = decode_payload(&resp.payload)?;
-    assert!(ok.old_retires_unix > now_unix(), "the overlap must be in the future");
-
-    // Both fingerprints authenticate right now.
-    {
-        let ns = env.state.networks.get("n1").unwrap().lock().unwrap();
-        let rec = ns.registry.members.get("r1").expect("member");
-        let now = now_unix();
-        assert!(rec.cert_fps.accepts(&new_fp, now), "new identity must be accepted");
-        assert!(
-            rec.cert_fps.accepts(&old_fp, now),
-            "old identity must still work — a member that crashes mid-rotation \
-             must not need an admin reset-pin"
-        );
-        // ...and the old one really does expire.
-        assert!(!rec.cert_fps.accepts(&old_fp, ok.old_retires_unix));
-        // The advertised pin follows the new identity, since that is what
-        // dialers verify against.
-        assert_eq!(rec.cert_fp.as_deref(), Some(new_fp.as_str()));
-    }
-
-    // Rejoining with the OLD identity still works during the overlap.
-    let (cred2, _) = join(&env, "r1", Role::Relay, &id, vec![]);
-    assert!(!cred2.is_empty(), "old identity must still be able to join");
-    Ok(())
-}
-
-/// Rejoining with the new identity retires the old one immediately —
-/// once the member demonstrably holds the new key, leaving the old one
-/// valid for the rest of the window only widens the exposure.
-#[tokio::test]
-async fn using_the_new_identity_retires_the_old_one_early() -> Result<()> {
-    use nqvpn_proto::envelope::{encode_msg, encode_payload};
-    use nqvpn_proto::rpc::{Request, RotateIdentity, verb};
-
-    let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let old_fp = id.fingerprint();
-    let (cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-    let mut m = Member::connect(&env, &cred, id).await?;
-
-    let new_id = TlsIdentity::generate("r1-rotated").unwrap();
-    let new_fp = new_id.fingerprint();
-    let body = encode_payload(&RotateIdentity {
-        new_pubkey: String::new(),
-        new_cert_fp: new_fp.clone(),
-    })?;
-    let req = Request { req_id: 1, verb: verb::ROTATE_IDENTITY, version: 1, payload: body };
-    m.tx.write_all(&encode_msg(Kind::Request, &req)?).await?;
-    let _ = m.wait_for(Kind::Response).await?;
-
-    // Join with the new identity: that confirms it is in use.
-    let (_cred, _) = join(&env, "r1", Role::Relay, &new_id, vec![]);
-    {
-        let ns = env.state.networks.get("n1").unwrap().lock().unwrap();
-        let rec = ns.registry.members.get("r1").expect("member");
-        assert!(rec.cert_fps.accepts(&new_fp, now_unix()));
-        assert!(
-            !rec.cert_fps.accepts(&old_fp, now_unix()),
-            "the old identity should retire as soon as the new one is seen in use"
-        );
-    }
-    Ok(())
-}
-
-/// An unrelated third key must never authenticate — rotation widens the
-/// accepted set deliberately, and only to keys the member registered.
-#[tokio::test]
-async fn rotation_does_not_accept_an_unregistered_key() -> Result<()> {
-    let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let (_cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-
-    let stranger = TlsIdentity::generate("attacker").unwrap();
-    let ns = env.state.networks.get("n1").unwrap().lock().unwrap();
-    let rec = ns.registry.members.get("r1").expect("member");
-    assert!(
-        !rec.cert_fps.accepts(&stranger.fingerprint(), now_unix()),
-        "only registered identities may authenticate"
-    );
-    Ok(())
-}
-
-/// A peer speaking a different protocol version is refused at Hello.
-///
-/// The check exists because the previous framing change desynced
-/// silently: both sides stayed connected and simply misread each other.
-/// A refusal that names both versions is the difference between a
-/// five-minute diagnosis and an afternoon.
 #[tokio::test]
 async fn a_wrong_protocol_version_is_refused_at_hello() -> Result<()> {
     use nqvpn_proto::envelope::{Envelope, PROTO_MINOR};
-
     let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let (cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-
+    let id = TlsIdentity::generate("r1")?;
+    let (cred, _) = join_as(&env, 1, Role::Relay, &id, vec![]);
     let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
-    ep.set_default_client_config(client_config(&id, Some(env.server_fp.clone()), 5).unwrap());
+    ep.set_default_client_config(client_config(&id, None, 5).unwrap());
     let conn = ep.connect(env.addr, "coord")?.await?;
     let (mut tx, mut rx) = conn.open_bi().await?;
-
-    // A Hello from a peer one minor version ahead.
-    let payload = nqvpn_proto::envelope::encode_payload(&Hello { credential: cred })?;
+    let payload = nqvpn_proto::envelope::encode_payload(&Hello { credential: cred, have_gen: 0 })?;
     let mut wrong = Envelope::new(Kind::Hello, payload);
     wrong.minor = PROTO_MINOR.wrapping_add(1);
     tx.write_all(&wrong.encode()).await?;
-
-    // The session must not proceed: reading yields an error rather than
-    // the HelloAck a compatible peer would get.
     let outcome = tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut rx)).await?;
-    assert!(
-        outcome.is_err(),
-        "a version-mismatched peer must be refused, but the session continued"
-    );
-    Ok(())
-}
-
-/// ...and the ordinary case still works, so the check is not simply
-/// rejecting everything.
-#[tokio::test]
-async fn a_matching_protocol_version_is_accepted() -> Result<()> {
-    let env = setup().await;
-    let id = TlsIdentity::generate("r1").unwrap();
-    let (cred, _node) = join(&env, "r1", Role::Relay, &id, vec![]);
-    let mut m = Member::connect(&env, &cred, id).await?;
-    m.wait_for(Kind::HelloAck).await?;
+    assert!(outcome.is_err(), "a version-mismatched peer must be refused");
     Ok(())
 }

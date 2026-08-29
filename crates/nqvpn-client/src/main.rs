@@ -84,7 +84,7 @@ async fn run(cli: Cli) -> Result<()> {
         Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::SystemProgrammer { device: tun.name() }))
     };
 
-    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, cfg.relay.preferred.clone());
+    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, cfg.relay.preferred);
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&cfg.coordinator) {
         use std::net::ToSocketAddrs;
         if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {

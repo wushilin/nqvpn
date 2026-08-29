@@ -581,7 +581,7 @@ secret      = "change-me-laptop"   # or secret_file
 state_dir   = "/var/lib/nqvpn-client"
 
 [relay]
-# preferred = "home"           # member name; omit => lowest RTT
+# preferred = 1           # member name; omit => lowest RTT
 
 [address]
 # pool = "default"

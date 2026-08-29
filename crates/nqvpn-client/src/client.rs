@@ -91,7 +91,7 @@ pub struct Client {
     mode: Mode,
     lanes: u8,
     keepalive_secs: u64,
-    preferred_relay: Option<String>,
+    preferred_relay: Option<NodeId>,
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
     pub counters: ClientCounters,
@@ -112,7 +112,7 @@ impl Client {
         keys: StaticKeys,
         tun: Arc<dyn TunDevice>,
         routes: Arc<dyn RouteSink>,
-        preferred_relay: Option<String>,
+        preferred_relay: Option<NodeId>,
     ) -> Arc<Client> {
         let mut hosts = Vec::new();
         if let Some(ip) = joined.ip4 {
@@ -191,7 +191,7 @@ impl Client {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
-            let Some(entry) = choose_relay(&candidates, self.preferred_relay.as_deref(), &self.identity, self.keepalive_secs).await else {
+            let Some(entry) = choose_relay(&candidates, self.preferred_relay, &self.identity, self.keepalive_secs).await else {
                 failures = failures.saturating_add(1);
                 let wait = nqvpn_proto::joinapi::retry_delay(false, failures);
                 tracing::warn!(retry_in_secs = wait.as_secs(), "no reachable relay");
@@ -328,18 +328,18 @@ impl Reconcile for ClientReconciler {
     }
 }
 
-/// Rank the fleet: the preferred relay when reachable, otherwise lowest
-/// RTT. Probes run in parallel so one dead relay costs one timeout, not
-/// one per relay.
-pub async fn choose_relay(fleet: &[RelayEntry], preferred: Option<&str>, identity: &TlsIdentity, keepalive: u64) -> Option<RelayEntry> {
-    if let Some(name) = preferred {
-        if let Some(e) = fleet.iter().find(|r| r.name == name) {
+/// Rank the fleet: the preferred relay (by node id) when reachable,
+/// otherwise lowest RTT. Probes run in parallel so one dead relay costs
+/// one timeout, not one per relay.
+pub async fn choose_relay(fleet: &[RelayEntry], preferred: Option<NodeId>, identity: &TlsIdentity, keepalive: u64) -> Option<RelayEntry> {
+    if let Some(id) = preferred {
+        if let Some(e) = fleet.iter().find(|r| r.relay_id == id) {
             if probe_rtt(e, identity, keepalive).await.is_some() {
                 return Some(e.clone());
             }
-            tracing::warn!(relay = %name, "preferred relay unreachable; falling back to RTT");
+            tracing::warn!(relay = id, name = %e.name, "preferred relay unreachable; falling back to RTT");
         } else {
-            tracing::warn!(relay = %name, "preferred relay is not in the fleet");
+            tracing::warn!(relay = id, "preferred relay is not in the fleet");
         }
     }
     let mut set = tokio::task::JoinSet::new();

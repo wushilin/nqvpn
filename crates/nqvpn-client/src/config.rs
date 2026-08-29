@@ -42,9 +42,10 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayCfg {
-    /// Attach here when reachable; otherwise pick by measured RTT.
+    /// Node id of the relay to attach to when reachable; otherwise the
+    /// fleet is ranked by measured RTT.
     #[serde(default)]
-    pub preferred: Option<String>,
+    pub preferred: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -143,14 +144,14 @@ secret = "s"
 tun_name = "nqvpn0"
 state_dir = "/tmp/x"
 [relay]
-preferred = "home"
+preferred = 1
 [address]
 pool = "default"
 preferred_ip4 = "10.99.1.50"
 "#,
         )
         .unwrap();
-        assert_eq!(c.relay.preferred.as_deref(), Some("home"));
+        assert_eq!(c.relay.preferred, Some(1));
         assert!(!c.trust_any_cert);
         assert_eq!(c.tls().ca_pem, Some(PathBuf::from("/etc/nqvpn/coord-ca.pem")));
     }

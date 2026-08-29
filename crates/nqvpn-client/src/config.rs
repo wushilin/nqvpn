@@ -9,7 +9,7 @@ use nqvpn_proto::token::Token;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     #[serde(default)]
@@ -37,6 +37,15 @@ fn d_true() -> bool {
 
 fn d_state() -> PathBuf {
     PathBuf::from("/var/lib/nqvpn-client")
+}
+
+/// The same defaults whether or not a config file exists (`--token`
+/// alone must trust any coordinator certificate, like a parsed file
+/// with the key omitted would).
+impl Default for ClientConfig {
+    fn default() -> Self {
+        ClientConfig { token: None, token_file: None, trust_any_cert: true, ca: None, state_dir: d_state(), tun_name: None }
+    }
 }
 
 impl ClientConfig {
@@ -90,7 +99,10 @@ mod tests {
     fn the_command_line_wins_and_no_token_is_an_error() {
         let c = ClientConfig::default();
         assert!(c.member(None).is_err());
-        assert_eq!(c.member(Some(&tok())).unwrap().secret, "s");
+        let m = c.member(Some(&tok())).unwrap();
+        assert_eq!(m.secret, "s");
+        assert!(m.tls.trust_any_cert, "--token without a config file must still trust any coordinator certificate");
+        assert_eq!(c.state_dir, d_state());
     }
 
     #[test]

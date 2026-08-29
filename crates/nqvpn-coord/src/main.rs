@@ -98,7 +98,8 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let api_addr: SocketAddr = coord.listen.api.parse().context("parsing listen.api")?;
     let quic_addr: SocketAddr = coord.listen.quic.parse().context("parsing listen.quic")?;
 
-    let state = Arc::new(AppState::new(coord, admin_token, keyring, db.clone(), quic_addr.port()));
+    let control_port = coord.listen.public_quic_port.unwrap_or(quic_addr.port());
+    let state = Arc::new(AppState::new(coord, admin_token, keyring, db.clone(), control_port));
     let loaded = db.load_all().context("loading networks from the database")?;
     if loaded.is_empty() {
         tracing::info!(db = %db_path.display(), "no networks yet — create one in the UI at /ui");

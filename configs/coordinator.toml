@@ -7,6 +7,7 @@ api  = "0.0.0.0:8443"        # HTTPS: the UI at /ui, the API at /api/v1/*
 quic = "0.0.0.0:14433"       # QUIC control plane; published to members at join
 # public_url = "https://coord.example.com:8443"   # written into every token;
                                                   # default: the URL your browser used
+# public_quic_port = 14433     # only if a port-forward exposes quic on another port
 
 [state]
 dir = "/var/lib/nqvpn-coord" # nqvpn.db (networks, members, secrets, registries),

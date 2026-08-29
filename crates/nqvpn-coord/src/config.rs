@@ -47,6 +47,11 @@ pub struct ListenCfg {
     /// token. Unset: the URL the operator's browser used for the UI.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// The UDP port members should dial for the control plane, when it
+    /// differs from `quic`'s (a port-forward). Members dial the host of
+    /// their token's URL on this port.
+    #[serde(default)]
+    pub public_quic_port: Option<u16>,
 }
 
 fn d_quic() -> String {

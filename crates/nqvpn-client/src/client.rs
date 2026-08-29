@@ -15,6 +15,7 @@ use nqvpn_proto::transport::{Mode, PacketChannel};
 use nqvpn_proto::types::NodeId;
 use nqvpn_session::{End, Session, SessionConfig};
 use nqvpn_sync::link::MemberHooks;
+use nqvpn_session::{Refused, CLOSE_EVICTED, CLOSE_STALE_LOGIN};
 use nqvpn_sync::{LinkHandle, LocalFacts, Reconcile, View};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,12 +42,23 @@ impl<P: nqvpn_endpoint::routes::RouteProgrammer + 'static> RouteSink for nqvpn_e
 #[derive(Default)]
 pub struct RelayUplink {
     session: Mutex<Option<Arc<Session>>>,
-    pub attached_to: Mutex<Option<(NodeId, String)>>,
+    pub attached_to: Mutex<Option<Attached>>,
     pub drops: AtomicU64,
 }
 
+/// The fleet entry the uplink was dialed from. Reconcile compares it
+/// with the entry the coordinator publishes now: a relay that
+/// re-registered from elsewhere is a zombie even if it still answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attached {
+    pub relay_id: NodeId,
+    pub name: String,
+    pub addr: String,
+    pub cert_fp: String,
+}
+
 impl RelayUplink {
-    pub fn set(&self, s: Option<Arc<Session>>, relay: Option<(NodeId, String)>) {
+    pub fn set(&self, s: Option<Arc<Session>>, relay: Option<Attached>) {
         *self.session.lock().unwrap() = s;
         *self.attached_to.lock().unwrap() = relay;
     }
@@ -92,6 +104,9 @@ pub struct Client {
     lanes: u8,
     keepalive_secs: u64,
     preferred_relay: Option<String>,
+    /// While attached to a fallback relay, how often to check whether
+    /// the preferred one is reachable again.
+    pub prefer_recheck: Mutex<Duration>,
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
     pub counters: ClientCounters,
@@ -141,6 +156,7 @@ impl Client {
             lanes: joined.lanes.max(1),
             keepalive_secs: joined.keepalive_secs.max(1) as u64,
             preferred_relay,
+            prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
             counters: ClientCounters::default(),
         })
@@ -184,6 +200,10 @@ impl Client {
     pub async fn run_uplink(self: Arc<Self>) {
         let mut failures: u32 = 0;
         loop {
+            if self.link.stop_reason().is_some() {
+                // Kicked out (replaced or refused): the process exits.
+                return;
+            }
             let candidates: Vec<RelayEntry> = self.view.with(|s| {
                 s.relays.iter().map(|r| RelayEntry { relay_id: r.relay_id, name: r.name.clone(), addr: r.addr.clone(), cert_fp: r.cert_fp.clone() }).collect()
             });
@@ -207,9 +227,19 @@ impl Client {
                 Ok(session) => {
                     self.counters.attaches.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(relay = %entry.name, addr = %entry.addr, "attached");
-                    self.uplink.set(Some(session.clone()), Some((entry.relay_id, entry.name.clone())));
+                    self.uplink.set(
+                        Some(session.clone()),
+                        Some(Attached { relay_id: entry.relay_id, name: entry.name.clone(), addr: entry.addr.clone(), cert_fp: entry.cert_fp.clone() }),
+                    );
                     self.link.kick();
                     let attached_at = std::time::Instant::now();
+                    // Preferred but not attached to it: keep checking,
+                    // and move as soon as it is reachable again.
+                    let _return_watch = self
+                        .preferred_relay
+                        .as_deref()
+                        .filter(|p| *p != entry.name)
+                        .map(|_| AbortGuard(tokio::spawn(self.clone().watch_for_preferred(session.clone()))));
                     let me = self.clone();
                     let end: End = session
                         .run(&SessionConfig { probe_secs: 2, probe_misses: 5 }, None, move |d, _lane| {
@@ -220,6 +250,10 @@ impl Client {
                     tracing::warn!(relay = %entry.name, ?end, "uplink ended; re-attaching");
                     self.uplink.set(None, None);
                     self.link.kick();
+                    if let Some((CLOSE_STALE_LOGIN, reason)) = session.close_reason() {
+                        self.link.replaced(format!("relay {} says: {reason}", entry.name));
+                        return;
+                    }
                     failures = if attached_at.elapsed() >= Duration::from_secs(30) { 0 } else { failures.saturating_add(1) };
                     // A session the relay ended on purpose (evicted,
                     // replaced) is not a reason to hammer it.
@@ -228,6 +262,10 @@ impl Client {
                     }
                 }
                 Err(err) => {
+                    if let Some(Refused { code: CLOSE_STALE_LOGIN, reason }) = err.downcast_ref::<Refused>() {
+                        self.link.replaced(format!("relay {} says: {reason}", entry.name));
+                        return;
+                    }
                     self.counters.attach_failures.fetch_add(1, Ordering::Relaxed);
                     failures = failures.saturating_add(1);
                     let wait = nqvpn_proto::joinapi::retry_delay(false, failures);
@@ -239,7 +277,7 @@ impl Client {
     }
 
     pub fn status_line(&self) -> String {
-        let relay = self.uplink.attached_to.lock().unwrap().clone().map(|(_, n)| n);
+        let relay = self.uplink.attached_to.lock().unwrap().clone().map(|a| a.name);
         format!(
             "{} relay={:?} gen={} attaches={} uplink_drops={}",
             self.engine.status_line(),
@@ -253,7 +291,7 @@ impl Client {
 
 impl LocalFacts for Client {
     fn heartbeat(&self) -> Heartbeat {
-        let attached_to = self.uplink.attached_to.lock().unwrap().as_ref().map(|(id, _)| *id);
+        let attached_to = self.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id);
         let usable_mtu = self.uplink.channel().and_then(|c| c.usable_inner_mtu()).map(|m| m as u16).unwrap_or(0);
         Heartbeat { attached_to, usable_mtu, ..Default::default() }
     }
@@ -322,9 +360,56 @@ impl Reconcile for ClientReconciler {
         if let Err(e) = c.routes.reconcile(&keep) {
             tracing::warn!("route reconcile: {e:#}");
         }
-        // The relay I am attached to left the fleet or changed: the
-        // session will end on its own (the relay closes, or probes
-        // fail); nothing to do here beyond making candidates current.
+        // The relay I am attached to re-registered from somewhere else
+        // (a new address or session certificate under the same name):
+        // what I hold is a zombie even if it still answers, and the
+        // coordinator no longer lists me behind it. Drop it; the
+        // uplink loop re-attaches to the fleet as published. A relay
+        // that merely left the fleet closes its sessions itself.
+        let attached = c.uplink.attached_to.lock().unwrap().clone();
+        if let Some(a) = attached {
+            if let Some(r) = view.relays.iter().find(|r| r.relay_id == a.relay_id) {
+                if r.addr != a.addr || r.cert_fp != a.cert_fp {
+                    tracing::warn!(relay = %a.name, old = %a.addr, new = %r.addr, "attached relay re-registered elsewhere; re-attaching");
+                    if let Some(s) = c.uplink.session() {
+                        s.close(CLOSE_EVICTED, "relay re-registered elsewhere");
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct AbortGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Client {
+    /// Attached to a fallback while a preferred relay is named: go back
+    /// to it once it answers. Preference is non-binding either way.
+    async fn watch_for_preferred(self: Arc<Self>, session: Arc<Session>) {
+        let Some(name) = self.preferred_relay.clone() else { return };
+        loop {
+            let every = *self.prefer_recheck.lock().unwrap();
+            tokio::time::sleep(every).await;
+            let entry = self.view.with(|s| {
+                s.relays
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| RelayEntry { relay_id: r.relay_id, name: r.name.clone(), addr: r.addr.clone(), cert_fp: r.cert_fp.clone() })
+            });
+            if let Some(e) = entry {
+                if probe_rtt(&e, &self.identity, self.keepalive_secs).await.is_some() {
+                    tracing::info!(relay = %name, "preferred relay is reachable again; moving to it");
+                    session.close(CLOSE_EVICTED, "moving to the preferred relay");
+                    return;
+                }
+            }
+        }
     }
 }
 

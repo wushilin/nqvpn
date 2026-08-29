@@ -110,6 +110,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_shipped_sample_configs_are_valid() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let plain = RelayConfig::load(&root.join("relay.toml")).expect("relay.toml");
+        assert!(!plain.networks[0].want_vpn_ip);
+        let gw = RelayConfig::load(&root.join("relay-gateway.toml"));
+        // The gateway sample reads its secret from a file that only exists
+        // on a real host; everything else must parse.
+        assert!(gw.unwrap_err().to_string().contains("home.secret"));
+    }
+
+    #[test]
     fn parses_a_multi_network_relay() {
         let cfg: RelayConfig = toml::from_str(
             r#"

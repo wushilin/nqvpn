@@ -1,0 +1,20 @@
+# A pure forwarding relay: no address, no LAN, no TUN — it only carries
+# other members' traffic. Run as any user that may bind the port.
+
+coordinator = "https://coord.example.com:8443"
+# trust_any_cert = true             # default; false + ca = strict verification
+# ca = "/etc/nqvpn/coord-ca.pem"
+
+listen     = "0.0.0.0:4444"         # one QUIC socket: clients + mesh
+relay_addr = "cloud.example.com:4444"   # what the coordinator's entry says
+state_dir  = "/var/lib/nqvpn-relay" # auto-generated cert + key; safe to delete
+
+[limits]
+max_session_mbps = 0                # per attached client; 0 = unlimited
+workers = 0                         # tokio threads; 0 = one per core
+
+[[networks]]                        # a relay may serve several networks
+network_id  = "acme-prod"
+name        = "cloud"
+secret      = "change-me-cloud"     # or secret_file = "/etc/nqvpn/cloud.secret"
+want_vpn_ip = false                 # pure forwarder

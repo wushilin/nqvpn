@@ -23,7 +23,7 @@ use nqvpn_proto::frame::{bump_hop, Decision, RoutedHeader, TraceNote, T_TRACE_NO
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::transport::{Mode, PacketChannel};
 use nqvpn_proto::types::{NodeId, Role};
-use nqvpn_session::{End, Session, SessionConfig, Verifier, CLOSE_EVICTED, CLOSE_REPLACED};
+use nqvpn_session::{End, Refused, Session, SessionConfig, StaleLogin, Verifier, CLOSE_EVICTED, CLOSE_REPLACED, CLOSE_STALE_LOGIN};
 use nqvpn_sync::{LinkHandle, LocalFacts, Reconcile, View};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +45,19 @@ struct Held {
 struct Dialer {
     sig: String,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Fault injection for tests: what a misbehaving relay might do to the
+/// frames it forwards. Endpoints must survive all of it, since relays
+/// are untrusted by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chaos {
+    /// Forward every frame twice.
+    Duplicate,
+    /// Damage a byte of the sealed payload of every `n`th frame.
+    Corrupt(u64),
+    /// Silently drop every `n`th frame.
+    Drop(u64),
 }
 
 pub struct RelayNet {
@@ -70,6 +83,8 @@ pub struct RelayNet {
     local_switched: ByteCounter,
     terminated: ByteCounter,
     endpoint: RwLock<Option<Arc<LocalEndpoint>>>,
+    chaos: RwLock<Option<Chaos>>,
+    chaos_seq: AtomicU64,
 }
 
 impl RelayNet {
@@ -108,7 +123,26 @@ impl RelayNet {
             local_switched: ByteCounter::default(),
             terminated: ByteCounter::default(),
             endpoint: RwLock::new(None),
+            chaos: RwLock::new(None),
+            chaos_seq: AtomicU64::new(0),
         })
+    }
+
+    /// Misbehave on purpose (tests only).
+    pub fn set_chaos(&self, mode: Option<Chaos>) {
+        *self.chaos.write().unwrap() = mode;
+    }
+
+    /// Close the mesh link to `peer` from this side, as a link failure
+    /// would. The dialer (whichever side dials) re-establishes it.
+    pub fn close_mesh(&self, peer: NodeId) -> bool {
+        match self.mesh.read().unwrap().get(&peer) {
+            Some(h) => {
+                h.session.close(CLOSE_EVICTED, "link cut");
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -197,6 +231,9 @@ impl RelayNet {
             .await;
         drop(reg);
         tracing::info!(network = %self.network_id, peer, ?end, "mesh link down");
+        if let Some((CLOSE_STALE_LOGIN, reason)) = session.close_reason() {
+            self.link.replaced(format!("relay {peer} says: {reason}"));
+        }
         end
     }
 
@@ -239,6 +276,10 @@ impl RelayNet {
                     let _ = tokio::spawn(self.clone().run_mesh(session, true)).await;
                 }
                 Err(e) => {
+                    if let Some(Refused { code: CLOSE_STALE_LOGIN, reason }) = e.downcast_ref::<Refused>() {
+                        self.link.replaced(format!("relay {} says: {reason}", entry.name));
+                        return;
+                    }
                     tracing::warn!(network = %self.network_id, peer = %entry.name, addr = %entry.addr, "mesh dial failed: {e:#}");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
@@ -303,8 +344,26 @@ impl RelayNet {
         };
         match route {
             Route::Local(_) | Route::Mesh(_) => {
+                let chaos = *self.chaos.read().unwrap();
+                let seq = self.chaos_seq.fetch_add(1, Ordering::Relaxed);
+                match chaos {
+                    Some(Chaos::Drop(n)) if n > 0 && seq.is_multiple_of(n) => return,
+                    Some(Chaos::Corrupt(n)) if n > 0 && seq.is_multiple_of(n) => {
+                        // Per-relay damage: two byzantine relays in lockstep
+                        // must not cancel each other out with a symmetric flip.
+                        if let Some(b) = buf.last_mut() {
+                            *b = b.wrapping_add(1 + (self.my_node_id % 200) as u8);
+                        }
+                    }
+                    _ => {}
+                }
                 let sent = match self.channel_for(&route) {
-                    Some(c) => c.send_on(Bytes::from(buf), lane),
+                    Some(c) => {
+                        if chaos == Some(Chaos::Duplicate) {
+                            let _ = c.send_on(Bytes::from(buf.clone()), lane);
+                        }
+                        c.send_on(Bytes::from(buf), lane)
+                    }
                     None => false,
                 };
                 if sent {
@@ -422,7 +481,10 @@ impl Verifier for RelayNet {
         // login generation is a replaced instance.
         let (known, member) = self.view.with(|s| (!s.members.is_empty(), s.member(claims.node_id).cloned()));
         match member {
-            Some(m) => anyhow::ensure!(claims.login_gen >= m.login_gen, "node {} was replaced by a newer join", claims.node_id),
+            Some(m) if claims.login_gen < m.login_gen => {
+                return Err(StaleLogin(format!("node {} was replaced by a newer join", claims.node_id)).into());
+            }
+            Some(_) => {}
             None if known => anyhow::bail!("node {} is not in the network view", claims.node_id),
             None => {}
         }
@@ -472,23 +534,25 @@ impl RelayNet {
 
         // Evict sessions the view no longer vouches for. An empty view
         // (nothing received yet) vouches for nobody and evicts nobody.
-        let stale: Vec<(Arc<Session>, &'static str)> = {
+        let stale: Vec<(Arc<Session>, u32, &'static str)> = {
             let mut v = Vec::new();
             if !view.members.is_empty() {
                 for held in self.clients.read().unwrap().values().chain(self.mesh.read().unwrap().values()) {
                     let node = held.session.node_id();
                     match view.member(node) {
-                        None => v.push((held.session.clone(), "no longer a member")),
-                        Some(m) if held.session.login_gen() < m.login_gen => v.push((held.session.clone(), "replaced by a newer join")),
+                        None => v.push((held.session.clone(), CLOSE_EVICTED, "no longer a member")),
+                        Some(m) if held.session.login_gen() < m.login_gen => {
+                            v.push((held.session.clone(), CLOSE_STALE_LOGIN, "replaced by a newer join"))
+                        }
                         _ => {}
                     }
                 }
             }
             v
         };
-        for (s, why) in stale {
+        for (s, code, why) in stale {
             tracing::info!(network = %self.network_id, node = s.node_id(), why, "evicting session");
-            s.close(CLOSE_EVICTED, why);
+            s.close(code, why);
         }
 
         // Dialer set: one task per peer we are responsible for dialing

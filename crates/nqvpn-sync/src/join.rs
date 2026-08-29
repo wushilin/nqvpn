@@ -57,19 +57,22 @@ pub fn join_once(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) 
     joinapi::join(&cfg.coordinator, &cfg.request(identity, keys), &cfg.tls)
 }
 
-/// Join, retrying until it succeeds. Terminal rejections — a disabled
-/// member, a wrong secret — are fixed at the coordinator, and the member
-/// can only learn of the fix by asking again, so they poll slowly and
-/// forever rather than exiting. Blocking: call from `spawn_blocking`.
-pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
+/// Join, retrying until it succeeds or the coordinator says it never
+/// will. Transient failures (unreachable, 5xx, rate limited) retry
+/// tightly and forever: a member with a valid identity connects
+/// eventually, as long as the coordinator comes back. A terminal
+/// rejection — disabled, unknown, wrong secret — is returned: the
+/// member has been kicked out and must stop trying (retrying can only
+/// hammer the coordinator, or, after a replacement, fight the newer
+/// instance). Blocking: call from `spawn_blocking`.
+pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &StaticKeys) -> Result<JoinResponse, JoinError> {
     let mut consecutive: u32 = 0;
     loop {
         match join_once(cfg, identity, keys) {
-            Ok(r) => return r,
+            Ok(r) => return Ok(r),
             Err(e) if e.is_terminal() => {
-                let wait = joinapi::retry_delay(true, 1);
-                tracing::error!(retry_in_secs = wait.as_secs(), "join rejected: {e} — fix this at the coordinator; retrying until then");
-                std::thread::sleep(wait);
+                tracing::error!("join rejected: {e} — this instance stops; fix it at the coordinator and restart");
+                return Err(e);
             }
             Err(e) => {
                 consecutive = consecutive.saturating_add(1);
@@ -85,17 +88,16 @@ pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &Stat
 /// cancelled between attempts (a blocking sleep in a `spawn_blocking`
 /// would pin the runtime's shutdown). Every attempt itself runs on the
 /// blocking pool.
-pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> JoinResponse {
+pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> Result<JoinResponse, JoinError> {
     let mut consecutive: u32 = 0;
     loop {
         let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
         let attempt = tokio::task::spawn_blocking(move || join_once(&c, &i, &k)).await;
         let wait = match attempt {
-            Ok(Ok(r)) => return r,
+            Ok(Ok(r)) => return Ok(r),
             Ok(Err(e)) if e.is_terminal() => {
-                let wait = joinapi::retry_delay(true, 1);
-                tracing::error!(retry_in_secs = wait.as_secs(), "join rejected: {e} — fix this at the coordinator; retrying until then");
-                wait
+                tracing::error!("join rejected: {e} — this instance stops; fix it at the coordinator and restart");
+                return Err(e);
             }
             Ok(Err(e)) => {
                 consecutive = consecutive.saturating_add(1);

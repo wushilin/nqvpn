@@ -1,0 +1,14 @@
+[Unit]
+Description=NetQ VPN coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nqvpn-coord run --config /etc/nqvpn/coordinator.toml
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+StateDirectory=nqvpn-coord
+
+[Install]
+WantedBy=multi-user.target

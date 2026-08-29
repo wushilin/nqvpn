@@ -1,0 +1,20 @@
+coordinator = "https://coord.example.com:8443"
+# trust_any_cert = true             # default; false + ca = strict verification
+# ca = "/etc/nqvpn/coord-ca.pem"
+
+network_id  = "acme-prod"
+name        = "laptop-1"
+secret      = "change-me-laptop"    # or secret_file = "/etc/nqvpn/laptop-1.secret"
+state_dir   = "/var/lib/nqvpn-client"
+# tun_name  = "nqvpn0"
+
+[relay]
+# A preference, not a requirement: attach here whenever it is reachable,
+# fall back to the lowest-RTT relay when it is not, and move back on your
+# own once it answers again. Omit => lowest RTT.
+# preferred = "home"
+
+[address]
+# pool = "default"
+# preferred_ip4 = "10.99.1.50"
+# want_vpn_ip = true                # false = headless (no tunnel address)

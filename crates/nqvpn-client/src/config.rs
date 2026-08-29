@@ -132,6 +132,14 @@ secret = "s"
     }
 
     #[test]
+    fn the_shipped_sample_config_is_valid() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let c = ClientConfig::load(&root.join("client.toml")).expect("client.toml");
+        assert_eq!(c.name, "laptop-1");
+        assert!(c.member().is_ok());
+    }
+
+    #[test]
     fn full_config_parses() {
         let c: ClientConfig = toml::from_str(
             r#"

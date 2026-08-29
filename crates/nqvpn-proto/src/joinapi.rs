@@ -253,8 +253,10 @@ pub fn retry_delay(terminal: bool, consecutive: u32) -> Duration {
     if terminal {
         return Duration::from_secs(60);
     }
-    let secs = 1u64 << consecutive.min(5); // 1,2,4,8,16,32
-    Duration::from_secs(secs.min(30))
+    // Tight: a member that lost its coordinator is back within seconds
+    // of the coordinator being back. 1, 2, 4, 5, 5, ...
+    let secs = 1u64 << consecutive.min(3);
+    Duration::from_secs(secs.min(5))
 }
 
 #[cfg(test)]
@@ -307,8 +309,9 @@ mod tests {
     fn transient_failures_back_off_but_are_capped() {
         let d = |n| retry_delay(false, n).as_secs();
         assert_eq!(d(0), 1);
-        assert_eq!(d(3), 8);
-        assert_eq!(d(u32::MAX), 30);
+        assert_eq!(d(2), 4);
+        assert_eq!(d(3), 5);
+        assert_eq!(d(u32::MAX), 5);
     }
 
     #[test]

@@ -91,9 +91,9 @@ pub trait LocalFacts: Send + Sync {
 /// the guard — including when the owning future is cancelled — aborts
 /// the task, so a torn-down session never leaves a writer behind still
 /// heartbeating on its behalf.
-struct AbortOnDrop(tokio::task::JoinHandle<Result<(), nqvpn_proto::stream::StreamError>>);
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -105,9 +105,93 @@ impl Drop for AbortOnDrop {
 pub struct LinkHandle {
     kick: Notify,
     refresh: Mutex<Option<String>>,
+    stop: Mutex<Option<MemberExit>>,
+    stop_notify: Notify,
 }
 
+/// The control session must end because this member is done: carried
+/// as the error of `run_session`.
+#[derive(Debug)]
+pub struct Stop(pub MemberExit);
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            MemberExit::Replaced(r) => write!(f, "replaced: {r}"),
+            MemberExit::Refused(r) => write!(f, "refused: {r}"),
+        }
+    }
+}
+
+impl std::error::Error for Stop {}
+
+/// Why `run_member` returned. It returns only when this instance has
+/// been kicked out; anything else is retried forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberExit {
+    /// Another instance holds this member's identity now. Re-joining
+    /// would only take it back and the two would replace each other
+    /// forever, so the process exits with `EXIT_REPLACED`. If the other
+    /// join was not the operator's doing, the secret has leaked and
+    /// must be rotated.
+    Replaced(String),
+    /// The coordinator rejected this member for good: disabled,
+    /// deleted, or a secret that no longer matches. Exit with
+    /// `EXIT_REFUSED`; an operator fixes it at the coordinator and
+    /// restarts.
+    Refused(String),
+}
+
+impl MemberExit {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            MemberExit::Replaced(_) => EXIT_REPLACED,
+            MemberExit::Refused(_) => EXIT_REFUSED,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            MemberExit::Replaced(r) | MemberExit::Refused(r) => r,
+        }
+    }
+}
+
+/// Process exit codes for `MemberExit`. A supervisor can keep a kicked
+/// instance down (`RestartPreventExitStatus=3 4` in systemd).
+pub const EXIT_REPLACED: i32 = 3;
+pub const EXIT_REFUSED: i32 = 4;
+
 impl LinkHandle {
+    /// Another instance holds this member's identity: the coordinator
+    /// or a relay said so. Recorded once; the control loop ends with
+    /// `MemberExit::Replaced` and nothing re-joins.
+    pub fn replaced(&self, reason: String) {
+        self.stop(MemberExit::Replaced(reason));
+    }
+
+    /// The coordinator turned this member away for good.
+    pub fn refused(&self, reason: String) {
+        self.stop(MemberExit::Refused(reason));
+    }
+
+    pub fn stop(&self, exit: MemberExit) {
+        let mut r = self.stop.lock().unwrap();
+        if r.is_none() {
+            match &exit {
+                MemberExit::Replaced(reason) => tracing::error!(%reason, "this node was replaced by another instance"),
+                MemberExit::Refused(reason) => tracing::error!(%reason, "this node was refused by the coordinator"),
+            }
+            *r = Some(exit);
+        }
+        self.stop_notify.notify_one();
+    }
+
+    /// Set once this member has been kicked out; never cleared.
+    pub fn stop_reason(&self) -> Option<MemberExit> {
+        self.stop.lock().unwrap().clone()
+    }
+
     /// A local fact changed: heartbeat now instead of at the next tick.
     pub fn kick(&self) {
         self.kick.notify_one();
@@ -127,6 +211,15 @@ pub struct SessionParams {
     pub credential: String,
     pub keepalive_secs: u64,
     pub heartbeat_secs: u64,
+}
+
+fn app_close(conn: &quinn::Connection) -> Option<(u32, String)> {
+    match conn.close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(a) => {
+            Some((a.error_code.into_inner() as u32, String::from_utf8_lossy(&a.reason).into_owned()))
+        }
+        _ => None,
+    }
 }
 
 fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
@@ -212,9 +305,23 @@ pub async fn run_session(
     });
 
     let result = loop {
-        let env = match read_envelope(&mut rx).await {
-            Ok(e) => e,
-            Err(e) => break Err(anyhow!("control stream ended: {e}")),
+        let env = tokio::select! {
+            env = read_envelope(&mut rx) => match env {
+                Ok(e) => e,
+                Err(e) => {
+                    if let Some((code, reason)) = app_close(&conn) {
+                        if code == nqvpn_proto::control::CLOSE_REPLACED {
+                            break Err(Stop(MemberExit::Replaced(reason)).into());
+                        }
+                        break Err(anyhow!("coordinator closed the session (code {code}): {reason}"));
+                    }
+                    break Err(anyhow!("control stream ended: {e}"));
+                }
+            },
+            _ = handle.stop_notify.notified() => {
+                let exit = handle.stop_reason().unwrap_or(MemberExit::Refused("stopped".into()));
+                break Err(Stop(exit).into());
+            }
         };
         match env.kind {
             k if k == Kind::HelloAck as u16 => {
@@ -250,9 +357,10 @@ pub trait MemberHooks: Send + Sync {
 }
 
 /// The whole member control loop: join, hold a session, reconnect with
-/// backoff, renew at two thirds of the credential lifetime. Never
-/// returns. The first join is done before this is called so the owner
-/// can set itself up with the response.
+/// backoff, renew at two thirds of the credential lifetime. Returns
+/// only when this instance has been replaced by another join under
+/// the same name (see `MemberExit`). The first join is done before
+/// this is called so the owner can set itself up with the response.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_member(
     cfg: Arc<MemberConfig>,
@@ -263,8 +371,10 @@ pub async fn run_member(
     facts: Arc<dyn LocalFacts>,
     handle: Arc<LinkHandle>,
     hooks: Arc<dyn MemberHooks>,
-) {
+) -> MemberExit {
     let credential = Arc::new(Mutex::new(first.credential.clone()));
+    #[allow(unused_assignments)]
+    let mut renewal_guard: Option<AbortOnDrop<()>> = None;
     let control_addr = Arc::new(Mutex::new(
         nqvpn_proto::joinapi::control_addr(&cfg.coordinator, first.control_port).unwrap_or_default(),
     ));
@@ -277,10 +387,19 @@ pub async fn run_member(
         let (cfg, identity, keys, credential, handle, hooks, control_addr) =
             (cfg.clone(), identity.clone(), keys.clone(), credential.clone(), handle.clone(), hooks.clone(), control_addr.clone());
         let mut wait = renew_after(&first.credential);
-        tokio::spawn(async move {
+        let _renewal = AbortOnDrop(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(wait).await;
-                let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
+                if handle.stop_reason().is_some() {
+                    return;
+                }
+                let r = match join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        handle.refused(e.to_string());
+                        return;
+                    }
+                };
                 wait = renew_after(&r.credential);
                 *credential.lock().unwrap() = r.credential.clone();
                 if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
@@ -290,11 +409,19 @@ pub async fn run_member(
                 hooks.joined(&r);
                 tracing::info!(next_in_secs = wait.as_secs(), "credential renewed");
             }
-        });
+        }));
+        // Held until this function returns: a replaced instance must
+        // not renew (a renewal is a join, and a join takes the identity
+        // back).
+        renewal_guard = Some(_renewal);
     }
 
+    let _renewal_guard = renewal_guard;
     let mut delay = Duration::from_secs(1);
     loop {
+        if let Some(exit) = handle.stop_reason() {
+            return exit;
+        }
         let started = std::time::Instant::now();
         let params = SessionParams {
             control_addr: control_addr.lock().unwrap().clone(),
@@ -304,16 +431,34 @@ pub async fn run_member(
         };
         match run_session(&identity, params, view.clone(), facts.clone(), handle.clone()).await {
             Ok(()) => tracing::warn!("coordinator session ended; reconnecting"),
-            Err(e) => tracing::warn!("coordinator session lost: {e:#}"),
+            Err(e) => {
+                if let Some(Stop(exit)) = e.downcast_ref::<Stop>() {
+                    handle.stop(exit.clone());
+                    return exit.clone();
+                }
+                tracing::warn!("coordinator session lost: {e:#}")
+            }
         }
         // Reset the backoff only after a session that actually lasted.
         let was_healthy = started.elapsed() >= Duration::from_secs(30);
         tokio::time::sleep(delay).await;
-        delay = if was_healthy { Duration::from_secs(1) } else { (delay * 2).min(Duration::from_secs(30)) };
+        // Tight: back within seconds of the coordinator being back.
+        delay = if was_healthy { Duration::from_secs(1) } else { (delay * 2).min(Duration::from_secs(5)) };
         // Re-join: a fresh credential and a fresh declaration. The view
         // is kept; Hello says what we hold and the coordinator sends
-        // only what changed.
-        let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
+        // only what changed. Never after a replacement: that join
+        // would win, and the two instances would take turns.
+        if let Some(exit) = handle.stop_reason() {
+            return exit;
+        }
+        let r = match join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                let exit = MemberExit::Refused(e.to_string());
+                handle.stop(exit.clone());
+                return exit;
+            }
+        };
         *credential.lock().unwrap() = r.credential.clone();
         if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
             *control_addr.lock().unwrap() = a;

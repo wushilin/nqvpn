@@ -572,6 +572,17 @@ pool = "default"
     }
 
     #[test]
+    fn the_shipped_sample_configs_are_valid() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        load_coord_config(&root.join("coordinator.toml")).expect("coordinator.toml");
+        let nets = load_networks(&root.join("networks.d")).expect("networks.d");
+        assert_eq!(nets.len(), 1);
+        assert_eq!(nets[0].network_id, "acme-prod");
+        assert_eq!(nets[0].relays.len(), 3);
+        assert_eq!(nets[0].clients.len(), 2);
+    }
+
+    #[test]
     fn settings_are_bounds_checked() {
         let mut s = base();
         s.push_str("[settings]\ncredential_ttl_mins = 0\n");

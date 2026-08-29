@@ -38,7 +38,13 @@ fn main() -> Result<()> {
         cfg.limits.workers
     };
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build()?;
-    rt.block_on(run(cfg, cli))
+    let code = rt.block_on(run(cfg, cli))?;
+    // Guards (TUN, routes, addresses) are dropped by now; the runtime goes last.
+    drop(rt);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// After every join: the credential moves to the dialed mesh sessions.
@@ -53,9 +59,12 @@ impl nqvpn_sync::link::MemberHooks for Hooks {
     }
 }
 
-async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<()> {
+async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-relay").context("loading relay TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
+    // Each network's member loop returns only when this relay has been
+    // replaced under that name; the first one to do so ends the process.
+    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<(String, nqvpn_sync::MemberExit)>(4);
 
     // Bind before joining: the coordinator may probe the advertised
     // address during the join, and a port conflict should fail early.
@@ -71,7 +80,13 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<()> {
     let mut guards = Vec::new();
     for ncfg in &cfg.networks {
         let member = Arc::new(member_config(&cfg, ncfg)?);
-        let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
+        let joined = match nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(network = %ncfg.network_id, "not joining: {e}");
+                return Ok(nqvpn_sync::EXIT_REFUSED);
+            }
+        };
         tracing::info!(network = %ncfg.network_id, node_id = joined.node_id, relays = joined.relays.len(), "joined");
 
         let net = RelayNet::new(
@@ -138,16 +153,23 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<()> {
         }
 
         nqvpn_sync::spawn_reconciler(net.view.clone(), Arc::new(nqvpn_relay::net::NetReconciler(net.clone())), Duration::from_secs(20));
-        tokio::spawn(nqvpn_sync::run_member(
-            member,
-            identity.clone(),
-            keys.clone(),
-            joined,
-            net.view.clone(),
-            net.clone(),
-            net.link.clone(),
-            Arc::new(Hooks { net: net.clone() }),
-        ));
+        tokio::spawn({
+            let (exit_tx, network_id) = (exit_tx.clone(), ncfg.network_id.clone());
+            let member_loop = nqvpn_sync::run_member(
+                member,
+                identity.clone(),
+                keys.clone(),
+                joined,
+                net.view.clone(),
+                net.clone(),
+                net.link.clone(),
+                Arc::new(Hooks { net: net.clone() }),
+            );
+            async move {
+                let exit = member_loop.await;
+                let _ = exit_tx.send((network_id, exit)).await;
+            }
+        });
         nets.insert(ncfg.network_id.clone(), net);
     }
 
@@ -167,8 +189,26 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<()> {
         });
     }
     let _guards = guards;
-    std::future::pending::<()>().await;
-    Ok(())
+    match exit_rx.recv().await {
+        Some((network, exit)) => {
+            match &exit {
+                nqvpn_sync::MemberExit::Replaced(reason) => tracing::error!(
+                    %network,
+                    %reason,
+                    "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, rotate this member's secret at the coordinator.",
+                    exit.exit_code()
+                ),
+                nqvpn_sync::MemberExit::Refused(reason) => tracing::error!(
+                    %network,
+                    %reason,
+                    "the coordinator refused this relay; exiting with code {}. Fix it at the coordinator and restart.",
+                    exit.exit_code()
+                ),
+            }
+            Ok(exit.exit_code())
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn member_config(cfg: &RelayConfig, n: &NetworkCfg) -> Result<MemberConfig> {

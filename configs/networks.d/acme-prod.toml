@@ -1,25 +1,48 @@
+# One file per network; the file name must equal network_id.
 network_id = "acme-prod"
-cidrs = ["10.99.0.0/16", "fd99::/64"]
+cidrs = ["10.99.0.0/16", "fd99::/64"]     # tunnel space (may overlap across networks)
 
 [pools.default]
-cidr = "10.99.1.0/24"
+cidr = "10.99.1.0/24"                     # entirely inside a cidr; pools are disjoint
 [pools.v6]
 cidr = "fd99::1:0/112"
 
-# A member is a name + a secret. Secrets minted from the admin API/UI
-# live in the state dir and take precedence over the ones written here.
-# The wire identity (a 32-bit node id) is assigned by the coordinator at
-# first join and is never configured.
+# All optional; defaults shown.
+# [settings]
+# credential_ttl_mins = 15
+# heartbeat_secs = 5             # members heartbeat every 5 s
+# offline_after = 3              # missed heartbeats before "offline"
+# hold_down_secs = 60            # gateway ownership flap damping (0 = off)
+# mtu = 1350
+# transport = "stream"           # or "datagram"
+# lanes = 1
+# relay_reachability = "warn"    # off | warn | deny
+# max_session_mbps = 0           # per-client cap enforced by relays
+# allow_loopback_relays = false  # single-machine demos only
+
+# A member is a name + a secret. A secret minted from the admin API/UI
+# lives in the state dir and takes precedence over the one written here.
+# The 32-bit node id used on the wire is assigned at first join and is
+# never configured.
 [relays.home]
 secret = "change-me-home"
-relay_addr = "203.0.113.7:4444"
-allowed_cidrs = ["192.168.1.0/24"]
+relay_addr = "home.example.com:4444"
+allowed_cidrs = ["192.168.1.0/24"]        # LANs this relay may front
 preferred_ip4 = "10.99.0.1"
 
-[relays.home-backup]
+[relays.home-backup]                      # same LAN → age-based failover
 secret = "change-me-backup"
-relay_addr = "203.0.113.8:4444"
+relay_addr = "home2.example.com:4444"
 allowed_cidrs = ["192.168.1.0/24"]
+
+[relays.cloud]                            # pure forwarder, in the coordinator's eyes
+secret = "change-me-cloud"
+relay_addr = "cloud.example.com:4444"
 
 [clients.laptop-1]
 secret = "change-me-laptop"
+
+[clients.build-server]
+secret = "change-me-build"
+preferred_ip4 = "10.99.1.10"
+max_session_mbps = 50

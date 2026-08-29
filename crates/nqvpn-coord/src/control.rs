@@ -67,6 +67,20 @@ pub const CLOSE_VERSION: u32 = 3;
 pub const CLOSE_EVICTED: u32 = 4;
 pub const CLOSE_OVERFLOW: u32 = 5;
 pub const CLOSE_EXPIRED: u32 = 6;
+pub const CLOSE_REPLACED: u32 = nqvpn_proto::control::CLOSE_REPLACED;
+
+/// The credential belongs to an instance that has since been replaced
+/// by a newer join under the same name.
+#[derive(Debug)]
+pub struct Replaced(pub String);
+
+impl std::fmt::Display for Replaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Replaced {}
 
 pub fn bind(addr: SocketAddr, id: &TlsIdentity) -> Result<quinn::Endpoint> {
     let cfg = server_config(id, 15).map_err(|e| anyhow!("quic server config: {e}"))?;
@@ -115,7 +129,18 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
     }
     let hello: Hello = parse(&env)?;
 
-    let (claims, network_id) = verify_credential(&state, &hello.credential, &fp)?;
+    let (claims, network_id) = match verify_credential(&state, &hello.credential, &fp) {
+        Ok(v) => v,
+        Err(e) => {
+            // Tell a replaced instance so in a way it can act on: it
+            // must stop re-joining and exit.
+            if e.downcast_ref::<Replaced>().is_some() {
+                tracing::warn!(%remote, "refusing session: {e}");
+                conn.close(CLOSE_REPLACED.into(), e.to_string().as_bytes());
+            }
+            return Err(e);
+        }
+    };
     let node_id = claims.node_id;
     let role = claims.role;
     let name = claims.sub.clone();
@@ -358,12 +383,12 @@ fn verify_credential(state: &AppState, token: &str, presented_fp: &str) -> Resul
         anyhow::bail!("node {} is disabled", claims.node_id);
     }
     if claims.login_gen < rec.login_gen {
-        anyhow::bail!(
-            "node {} was replaced by a newer join (credential login_gen {} < {})",
-            claims.node_id,
-            claims.login_gen,
-            rec.login_gen
-        );
+        let from = rec.replaced_from.clone().unwrap_or_else(|| "an unknown address".into());
+        return Err(Replaced(format!(
+            "node {} ({}) was replaced by a newer join from {from} (credential login_gen {} < {})",
+            claims.node_id, claims.sub, claims.login_gen, rec.login_gen
+        ))
+        .into());
     }
     if claims.cert_fp != presented_fp {
         anyhow::bail!("cert_fp mismatch: credential says {}, TLS presented {presented_fp}", claims.cert_fp);

@@ -1,0 +1,21 @@
+[Unit]
+Description=NetQ VPN client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nqvpn-client --config /etc/nqvpn/client.toml
+Restart=always
+RestartSec=2
+# A member that is kicked out — replaced by a newer join under the same
+# name (exit 3) or refused for good by the coordinator (exit 4) — must not
+# be restarted blindly: it would only take the identity back or hammer the
+# coordinator. Everything else (crash, network loss) is restarted.
+RestartPreventExitStatus=3 4
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+StateDirectory=nqvpn-client
+
+[Install]
+WantedBy=multi-user.target

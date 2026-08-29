@@ -156,19 +156,21 @@ fn member(coord_url: &str, node_id: NodeId, role: Role, relay_addr: Option<Strin
 }
 
 async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
-    nqvpn_sync::join_with_backoff_async(cfg.clone(), id.clone(), keys.clone()).await
+    nqvpn_sync::join_with_backoff_async(cfg.clone(), id.clone(), keys.clone()).await.expect("join accepted")
 }
 
 struct RelayHandle {
     net: Arc<RelayNet>,
     node_id: NodeId,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    sync: Option<tokio::task::JoinHandle<()>>,
+    sync: Option<tokio::task::JoinHandle<MemberExit>>,
     endpoint: quinn::Endpoint,
     cfg: Arc<MemberConfig>,
     identity: TlsIdentity,
     keys: StaticKeys,
 }
+
+use nqvpn_sync::MemberExit;
 
 struct RelayHooks(Arc<RelayNet>);
 impl nqvpn_sync::link::MemberHooks for RelayHooks {
@@ -217,6 +219,14 @@ impl RelayHandle {
         )));
     }
 
+    fn stop_reason(&self) -> Option<MemberExit> {
+        self.net.link.stop_reason()
+    }
+
+    fn control_finished(&self) -> bool {
+        self.sync.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+    }
+
     /// Cut the relay's control link (its data plane keeps running).
     fn cut_control(&mut self) {
         if let Some(t) = self.sync.take() {
@@ -249,7 +259,7 @@ struct ClientHandle {
     node_id: NodeId,
     /// Pumps and reconciler; they end with the handle.
     _tasks: Vec<tokio::task::JoinHandle<()>>,
-    sync: Option<tokio::task::JoinHandle<()>>,
+    sync: Option<tokio::task::JoinHandle<MemberExit>>,
     cfg: Arc<MemberConfig>,
     identity: TlsIdentity,
     keys: StaticKeys,
@@ -257,13 +267,20 @@ struct ClientHandle {
 
 impl ClientHandle {
     async fn start(coord_url: &str, node_id: NodeId) -> ClientHandle {
+        Self::start_preferring(coord_url, node_id, None).await
+    }
+
+    /// With a preferred relay (by name). The preference is re-checked
+    /// every 2 s here (30 s in production).
+    async fn start_preferring(coord_url: &str, node_id: NodeId, preferred: Option<&str>) -> ClientHandle {
         let identity = TlsIdentity::generate(&format!("client{node_id}")).unwrap();
         let keys = StaticKeys::generate().unwrap();
         let cfg = member(coord_url, node_id, Role::Client, None);
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, None);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, preferred.map(str::to_string));
+        *client.prefer_recheck.lock().unwrap() = Duration::from_secs(2);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
@@ -303,7 +320,18 @@ impl ClientHandle {
     }
 
     fn attached_to(&self) -> Option<NodeId> {
-        self.client.uplink.attached_to.lock().unwrap().as_ref().map(|(id, _)| *id)
+        self.client.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id)
+    }
+
+    /// Set once this instance learned it was kicked out. A real process
+    /// exits with `exit.exit_code()` at that point.
+    fn stop_reason(&self) -> Option<MemberExit> {
+        self.client.link.stop_reason()
+    }
+
+    /// The control loop has returned (the process would be exiting).
+    fn control_finished(&self) -> bool {
+        self.sync.as_ref().map(|t| t.is_finished()).unwrap_or(true)
     }
 
     fn uplink_ends(&self) -> u64 {
@@ -392,10 +420,18 @@ impl World {
     }
 
     async fn restart_coordinator(&mut self) {
+        self.stop_coordinator();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.start_coordinator().await;
+    }
+
+    fn stop_coordinator(&mut self) {
         if let Some(c) = self.coord.take() {
             c.stop();
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    async fn start_coordinator(&mut self) {
         self.coord = Some(Coord::start(self.dir.path(), self.api_port, self.quic_port, &self.toml).await);
     }
 }
@@ -546,8 +582,13 @@ async fn a_different_machine_joining_as_the_same_node_replaces_it() -> Result<()
     let a2 = ClientHandle::start(&w.url(), 10).await;
     wait_until("the old instance is thrown off its relay", Duration::from_secs(15), || a.uplink_ends() > ends_before).await?;
     all_pairs_reach(&[&a2, &b], Duration::from_secs(20)).await?;
-    // The old instance keeps trying with its stale credential and is
-    // refused; it never carries traffic again.
+    // Its control link is gone, so the relay is what tells it (a
+    // stale-login refusal). It stops re-attaching — a real process
+    // exits here — and never carries traffic again.
+    wait_until("the old instance learns it from the relay", Duration::from_secs(15), || {
+        matches!(a.stop_reason(), Some(MemberExit::Replaced(_)))
+    })
+    .await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!ping(&a, &b, Duration::from_secs(3)).await, "the replaced instance must not keep forwarding");
     Ok(())
@@ -573,6 +614,10 @@ async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!ping(&a, &b, Duration::from_secs(3)).await, "disabled member must not reach anyone");
     assert!(!ping(&b, &a, Duration::from_secs(3)).await, "nor be reachable");
+    // Kicked out for good: its re-join is refused and it stops (a real
+    // process exits with EXIT_REFUSED) instead of polling forever.
+    wait_until("the disabled instance stops", Duration::from_secs(20), || matches!(a.stop_reason(), Some(MemberExit::Refused(_)))).await?;
+    wait_until("and its control loop returns", Duration::from_secs(5), || a.control_finished()).await?;
     Ok(())
 }
 
@@ -601,5 +646,316 @@ async fn relay_flapping_converges() -> Result<()> {
     .await?;
     let r1 = r1.take().unwrap();
     wait_until("mesh re-formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![_r2.node_id]).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// More ways to break it.
+
+impl RelayHandle {
+    /// Cut this relay's mesh link to `peer` (from this side).
+    fn cut_mesh(&self, peer: NodeId) -> bool {
+        self.net.close_mesh(peer)
+    }
+}
+
+impl ClientHandle {
+    /// Restart the same member on the same machine (same keys): rejoin,
+    /// new uplink, no replacement.
+    async fn restart(self, coord_url: &str) -> ClientHandle {
+        let (identity, keys, name) = (self.identity.clone(), self.keys.clone(), self.cfg.name.clone());
+        self.kill();
+        let cfg = Arc::new(MemberConfig { name, ..(*member(coord_url, 0, Role::Client, None)).clone() });
+        let joined = join(&cfg, &identity, &keys).await;
+        let tun = FakeTun::new(joined.mtu);
+        let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, None);
+        client.spawn_pumps();
+        let tasks = vec![
+            nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
+            tokio::spawn(client.clone().run_uplink()),
+        ];
+        let ip4 = joined.ip4.expect("address");
+        let node_id = joined.node_id;
+        let mut h = ClientHandle { client, tun, ip4, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
+        h.start_sync(joined);
+        h
+    }
+
+    fn kill(self) {
+        for t in self._tasks {
+            t.abort();
+        }
+        if let Some(t) = self.sync {
+            t.abort();
+        }
+        if let Some(s) = self.client.uplink.session() {
+            s.close(0, "client killed");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_mesh_link_heals_and_cross_relay_traffic_resumes() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    wait_until("mesh up", Duration::from_secs(10), || r1.net.mesh_peers() == vec![r2.node_id]).await?;
+
+    for i in 0..3 {
+        // Cut from alternating sides; the dialer side must redial either way.
+        let cut = if i % 2 == 0 { r1.cut_mesh(r2.node_id) } else { r2.cut_mesh(r1.node_id) };
+        assert!(cut, "there was a link to cut");
+        wait_until("link re-formed", Duration::from_secs(15), || {
+            r1.net.mesh_peers() == vec![r2.node_id] && r2.net.mesh_peers() == vec![r1.node_id]
+        })
+        .await?;
+        all_pairs_reach(&[&a, &b], Duration::from_secs(15)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_restart_on_the_same_machine_keeps_its_identity() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    let (id, ip) = (a.node_id, a.ip4);
+    let login_gen_before = w.coord().state.networks[NET].lock().unwrap().registry.members[&id].login_gen;
+
+    let a = a.restart(&w.url()).await;
+    assert_eq!(a.node_id, id, "same name, same wire identity");
+    assert_eq!(a.ip4, ip, "same address");
+    let login_gen_after = w.coord().state.networks[NET].lock().unwrap().registry.members[&id].login_gen;
+    assert_eq!(login_gen_after, login_gen_before, "same keys: not a replacement");
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_byzantine_relay_cannot_break_end_to_end_traffic() -> Result<()> {
+    use nqvpn_relay::net::Chaos;
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    for mode in [Chaos::Duplicate, Chaos::Corrupt(2), Chaos::Drop(3)] {
+        r1.net.set_chaos(Some(mode));
+        r2.net.set_chaos(Some(mode));
+        for _ in 0..8 {
+            all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+        }
+        r1.net.set_chaos(None);
+        r2.net.set_chaos(None);
+    }
+    // The endpoints saw the abuse and named it, instead of failing.
+    let (ca, cb) = (a.engine_counters(), b.engine_counters());
+    let n = |k: &str| ca.get(k).copied().unwrap_or(0) + cb.get(k).copied().unwrap_or(0);
+    let c = (&ca, &cb);
+    assert!(n("drop_replay") > 0, "duplicates were refused by the replay window: {c:?}");
+    assert!(n("drop_seal_failed") > 0, "corrupted frames failed authentication: {c:?}");
+    assert!(n("received") > 20, "and real traffic kept flowing: {c:?}");
+    Ok(())
+}
+
+impl ClientHandle {
+    fn engine_counters(&self) -> std::collections::HashMap<&'static str, u64> {
+        self.client.engine.counters.snapshot().into_iter().collect()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nine_clients_three_relays_all_reach_each_other() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2, 3], &[10, 11, 12, 20, 21, 22, 30, 31, 32]).await;
+    let relays: Vec<RelayHandle> = {
+        let mut v = Vec::new();
+        for (id, p) in &rp {
+            v.push(RelayHandle::start(&w.url(), *id, *p).await);
+        }
+        v
+    };
+    let mut clients = Vec::new();
+    for id in [10, 11, 12, 20, 21, 22, 30, 31, 32] {
+        clients.push(ClientHandle::start(&w.url(), id).await);
+    }
+    let refs: Vec<&ClientHandle> = clients.iter().collect();
+    all_pairs_reach(&refs, Duration::from_secs(30)).await?;
+    wait_until("full mesh", Duration::from_secs(15), || relays.iter().all(|r| r.net.mesh_peers().len() == 2)).await?;
+    wait_until("coordinator agrees with every client", Duration::from_secs(15), || {
+        clients.iter().all(|c| w.coord().attachment_of(c.node_id) == c.attached_to() && c.attached_to().is_some())
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotating_a_secret_evicts_the_holder_of_the_old_one_at_expiry() -> Result<()> {
+    // credential_ttl_mins is a whole-minute setting; with a 1-minute TTL the
+    // member renews at 40 s, is refused, and every session ends at 60 s.
+    let (w, rp) = World::new_with_ttl(&[1], &[10, 20], 1).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Rotate a's secret: the running instance never learns the new one.
+    w.coord().state.secrets.lock().unwrap().mint(NET, "c10", 0);
+    let ends_before = a.uplink_ends();
+    wait_until("a's sessions end at credential expiry", Duration::from_secs(90), || a.uplink_ends() > ends_before && a.attached_to().is_none()).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!ping(&a, &b, Duration::from_secs(3)).await, "the old secret's holder is out");
+    Ok(())
+}
+
+impl World {
+    async fn new_with_ttl(relays: &[NodeId], clients: &[NodeId], ttl_mins: u64) -> (World, Vec<(NodeId, u16)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (api_port, quic_port) = (port(), port());
+        let relay_ports: Vec<(NodeId, u16)> = relays.iter().map(|r| (*r, port())).collect();
+        let toml = net_toml(&relay_ports, clients).replace("[settings]\n", &format!("[settings]\ncredential_ttl_mins = {ttl_mins}\n"));
+        let coord = Coord::start(dir.path(), api_port, quic_port, &toml).await;
+        coord.state.networks[NET].lock().unwrap().started_at = 0;
+        (World { dir, coord: Some(coord), api_port, quic_port, toml }, relay_ports)
+    }
+}
+
+// ---- Kicked out: learn why, stop, never fight back ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_replaced_from_elsewhere_stops_and_its_clients_move() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    let (ends_a, ends_b) = (a.uplink_ends(), b.uplink_ends());
+
+    // The operator moves r1 to another machine: the configured address
+    // is updated and a fresh process (new keys) joins from there. The
+    // old process was never stopped and is still up and answering.
+    let new_port = port();
+    {
+        let mut ns = w.coord().state.networks[NET].lock().unwrap();
+        ns.cfg.relays.get_mut("r1").unwrap().relay_addr = Some(format!("127.0.0.1:{new_port}"));
+    }
+    let r1b = RelayHandle::start(&w.url(), 1, new_port).await;
+    wait_until("the old relay learns it was replaced", Duration::from_secs(15), || {
+        matches!(r1.stop_reason(), Some(MemberExit::Replaced(_)))
+    })
+    .await?;
+    wait_until("and its control loop returns", Duration::from_secs(5), || r1.control_finished()).await?;
+    assert!(r1.stop_reason().unwrap().reason().contains("replaced"));
+    // Its clients see the fleet entry change under them and leave the
+    // zombie without being told by it.
+    wait_until("clients leave the zombie", Duration::from_secs(15), || a.uplink_ends() > ends_a && b.uplink_ends() > ends_b).await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(30)).await?;
+    // The old instance does not re-join, so the replacement is not
+    // replaced back.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(r1b.stop_reason().is_none(), "the replacement keeps its identity");
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    r1.kill();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_client_is_told_by_the_coordinator_and_stops() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Control link intact this time: the coordinator itself tells it.
+    let a2 = ClientHandle::start(&w.url(), 10).await;
+    wait_until("the old instance is told", Duration::from_secs(15), || matches!(a.stop_reason(), Some(MemberExit::Replaced(_)))).await?;
+    wait_until("and its control loop returns", Duration::from_secs(5), || a.control_finished()).await?;
+    all_pairs_reach(&[&a2, &b], Duration::from_secs(20)).await?;
+    // Before, any lost session was followed by a re-join, which would
+    // have made a2 the replaced one by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(a2.stop_reason().is_none(), "the replacement keeps its identity");
+    all_pairs_reach(&[&a2, &b], Duration::from_secs(10)).await?;
+    assert!(!ping(&a, &b, Duration::from_secs(3)).await, "the replaced instance is out");
+    Ok(())
+}
+
+// ---- Preferred relay: used when available, never required ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preferred_relay_is_used_when_available_and_not_required() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20, 30]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    // r2 is configured but not running yet.
+    let b = ClientHandle::start(&w.url(), 20).await;
+    let a = ClientHandle::start_preferring(&w.url(), 10, Some("r2")).await;
+    // A preferred relay that does not exist at all is no different.
+    let c = ClientHandle::start_preferring(&w.url(), 30, Some("nope")).await;
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+    assert_eq!(a.attached_to(), Some(r1.node_id), "falls back while the preferred relay is absent");
+    assert_eq!(c.attached_to(), Some(r1.node_id), "an unknown preference is ignored");
+
+    // The preferred relay shows up: a moves to it without being told.
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    wait_until("a moves to its preferred relay", Duration::from_secs(20), || a.attached_to() == Some(r2.node_id)).await?;
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+    assert_eq!(c.attached_to(), Some(r1.node_id), "no preference, no reason to move");
+
+    // And it dies: a falls back again; nothing waits for it.
+    r2.kill();
+    wait_until("a falls back", Duration::from_secs(30), || a.attached_to() == Some(r1.node_id)).await?;
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+    Ok(())
+}
+
+// ---- Valid members connect eventually; nothing else is needed ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn members_connect_eventually_when_the_coordinator_comes_up_late() -> Result<()> {
+    let (mut w, rp) = World::new(&[1], &[10, 20]).await;
+    w.stop_coordinator();
+
+    // Both start against a dead coordinator and keep trying.
+    let r1 = tokio::spawn({
+        let url = w.url();
+        async move { RelayHandle::start(&url, 1, rp[0].1).await }
+    });
+    let a = tokio::spawn({
+        let url = w.url();
+        async move { ClientHandle::start(&url, 10).await }
+    });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!r1.is_finished() && !a.is_finished(), "nothing joins while the coordinator is down");
+
+    w.start_coordinator().await;
+    let up = std::time::Instant::now();
+    let r1 = tokio::time::timeout(Duration::from_secs(15), r1).await??;
+    let a = tokio::time::timeout(Duration::from_secs(15), a).await??;
+    assert!(up.elapsed() < Duration::from_secs(10), "joined {:?} after the coordinator came up", up.elapsed());
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    drop(r1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn members_are_back_within_seconds_of_a_coordinator_restart() -> Result<()> {
+    let (mut w, rp) = World::new(&[1], &[10]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    wait_until("both online", Duration::from_secs(15), || w.coord().online(r1.node_id) && w.coord().online(a.node_id)).await?;
+
+    w.restart_coordinator().await;
+    let up = std::time::Instant::now();
+    wait_until("both back", Duration::from_secs(15), || w.coord().online(r1.node_id) && w.coord().online(a.node_id)).await?;
+    assert!(up.elapsed() < Duration::from_secs(10), "reconnect took {:?}", up.elapsed());
     Ok(())
 }

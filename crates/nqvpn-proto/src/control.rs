@@ -342,6 +342,13 @@ pub struct LinkTraffic {
     pub up: bool,
 }
 
+/// QUIC application close code the coordinator uses when it closes a
+/// member's control connection because another instance joined as the
+/// same member. The member must not re-join: it would only take the
+/// identity back, and the two instances would replace each other
+/// forever. It exits instead (see `nqvpn_sync::EXIT_REPLACED`).
+pub const CLOSE_REPLACED: u32 = 7;
+
 #[cfg(test)]
 mod tests {
     use super::*;

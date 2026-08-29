@@ -421,3 +421,35 @@ async fn foreign_and_stolen_credentials_are_refused() -> Result<()> {
     assert!(StubMember::connect(&r1, &ca.credential(10, Role::Client, &victim.fingerprint()), &thief).await.is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn chaos_modes_actually_misbehave() -> Result<()> {
+    use nqvpn_relay::net::Chaos;
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let a_id = TlsIdentity::generate("a")?;
+    let b_id = TlsIdentity::generate("b")?;
+    let a = StubMember::connect(&r1, &ca.credential(10, Role::Client, &a_id.fingerprint()), &a_id).await?;
+    let b = StubMember::connect(&r1, &ca.credential(11, Role::Client, &b_id.fingerprint()), &b_id).await?;
+    assert!(attached(&r1, 10).await && attached(&r1, 11).await);
+
+    r1.net.set_chaos(Some(Chaos::Corrupt(1)));
+    a.send_data(10, 11, b"payload-bytes");
+    let got = b.recv().await?;
+    assert_ne!(&got[nqvpn_proto::frame::ROUTED_HEADER_LEN..], b"payload-bytes", "corrupted in flight");
+    assert_eq!(got.len(), StubMember::frame(10, 11, b"payload-bytes", false).len());
+
+    r1.net.set_chaos(Some(Chaos::Duplicate));
+    a.send_data(10, 11, b"twice");
+    let one = b.recv().await?;
+    let two = b.recv().await?;
+    assert_eq!(one, two);
+
+    r1.net.set_chaos(Some(Chaos::Drop(1)));
+    a.send_data(10, 11, b"never");
+    assert!(b.try_recv(Duration::from_millis(400)).await.is_none());
+    r1.net.set_chaos(None);
+    a.send_data(10, 11, b"again");
+    assert_eq!(&b.recv().await?[nqvpn_proto::frame::ROUTED_HEADER_LEN..], b"again");
+    Ok(())
+}

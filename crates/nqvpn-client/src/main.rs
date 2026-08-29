@@ -37,16 +37,28 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(run(cli))
+    let code = rt.block_on(run(cli))?;
+    // Guards (TUN, routes) are dropped by now; the runtime goes last.
+    drop(rt);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli) -> Result<i32> {
     let cfg = Arc::new(ClientConfig::load(&cli.config)?);
     let member = Arc::new(cfg.member()?);
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
-    let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
+    let joined = match nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!("not joining: {e}");
+            return Ok(nqvpn_sync::EXIT_REFUSED);
+        }
+    };
     tracing::info!(node_id = joined.node_id, name = %joined.name, ip4 = ?joined.ip4, relays = joined.relays.len(), "joined {}", cfg.network_id);
 
     let _guard = if cli.dry_run {
@@ -113,6 +125,22 @@ async fn run(cli: Cli) -> Result<()> {
         });
     }
 
-    nqvpn_sync::run_member(member, identity, keys, joined, client.view.clone(), client.clone(), client.link.clone(), client.clone()).await;
-    Ok(())
+    let exit = nqvpn_sync::run_member(member, identity, keys, joined, client.view.clone(), client.clone(), client.link.clone(), client.clone()).await;
+    report_exit(&exit);
+    Ok(exit.exit_code())
+}
+
+fn report_exit(exit: &nqvpn_sync::MemberExit) {
+    match exit {
+        nqvpn_sync::MemberExit::Replaced(reason) => tracing::error!(
+            %reason,
+            "another instance joined as this node; exiting with code {} and not re-joining. If that was not you, rotate this member's secret at the coordinator.",
+            exit.exit_code()
+        ),
+        nqvpn_sync::MemberExit::Refused(reason) => tracing::error!(
+            %reason,
+            "the coordinator refused this node; exiting with code {}. Fix it at the coordinator and restart.",
+            exit.exit_code()
+        ),
+    }
 }

@@ -92,9 +92,13 @@ impl NetState {
 
     /// Close a member's control session, if any.
     pub fn close_session(&mut self, node: NodeId, reason: &str) {
+        self.close_session_with(node, control::CLOSE_EVICTED, reason);
+    }
+
+    pub fn close_session_with(&mut self, node: NodeId, code: u32, reason: &str) {
         if let Some(s) = self.sessions.remove(&node) {
             let _ = s.tx.try_send(Push::Close(reason.to_string()));
-            s.conn.close(control::CLOSE_EVICTED.into(), reason.as_bytes());
+            s.conn.close(code.into(), reason.as_bytes());
         }
     }
 }
@@ -312,7 +316,11 @@ impl AppState {
             // once relays see the new login_gen in the snapshot.
             let stale = ns.sessions.get(&node_id).map(|s| s.login_gen < login_gen).unwrap_or(false);
             if stale {
-                ns.close_session(node_id, "replaced by a newer join");
+                ns.close_session_with(
+                    node_id,
+                    control::CLOSE_REPLACED,
+                    &format!("replaced by a newer join as {name} from {peer_ip}"),
+                );
             }
         }
 

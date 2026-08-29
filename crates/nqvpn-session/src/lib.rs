@@ -36,6 +36,48 @@ pub const CLOSE_PROBE_TIMEOUT: u32 = 7;
 pub const CLOSE_REPLACED: u32 = 8;
 pub const CLOSE_EVICTED: u32 = 9;
 pub const CLOSE_SHUTDOWN: u32 = 10;
+/// The peer's credential carries an older login generation than the
+/// network's: another instance has joined as that member since.
+pub const CLOSE_STALE_LOGIN: u32 = 11;
+
+/// Returned by a [`Verifier`] for a credential whose login generation
+/// is behind. `accept` turns it into a `CLOSE_STALE_LOGIN` close so the
+/// far end can tell it apart from any other refusal and exit.
+#[derive(Debug)]
+pub struct StaleLogin(pub String);
+
+impl std::fmt::Display for StaleLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleLogin {}
+
+/// `dial` failed because the far end closed the connection during the
+/// handshake and said why.
+#[derive(Debug)]
+pub struct Refused {
+    pub code: u32,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused (code {}): {}", self.code, self.reason)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn app_close(conn: &quinn::Connection) -> Option<(u32, String)> {
+    match conn.close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(a) => {
+            Some((a.error_code.into_inner() as u32, String::from_utf8_lossy(&a.reason).into_owned()))
+        }
+        _ => None,
+    }
+}
 
 /// Why `run` returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +175,12 @@ impl Session {
     }
 
     /// End the session from outside; `run` returns `End::Closed`.
+    /// Why the far end closed this session, if it did so deliberately:
+    /// the application close code and reason it sent.
+    pub fn close_reason(&self) -> Option<(u32, String)> {
+        app_close(&self.conn)
+    }
+
     pub fn close(&self, code: u32, reason: &str) {
         self.conn.close(code.into(), reason.as_bytes());
     }
@@ -283,7 +331,14 @@ pub async fn accept(conn: quinn::Connection, acceptor: &dyn Acceptor) -> Result<
     let hello: Hello = parse(&env)?;
     let network = nqvpn_proto::credential::peek_network(&hello.credential).ok_or_else(|| anyhow!("malformed credential"))?;
     let params = acceptor.params_for(&network).ok_or_else(|| anyhow!("not serving network {network:?}"))?;
-    let claims = params.verifier.verify(&hello.credential, &fp)?;
+    let claims = match params.verifier.verify(&hello.credential, &fp) {
+        Ok(c) => c,
+        Err(e) => {
+            let code = if e.downcast_ref::<StaleLogin>().is_some() { CLOSE_STALE_LOGIN } else { CLOSE_EVICTED };
+            conn.close(code.into(), e.to_string().as_bytes());
+            return Err(e);
+        }
+    };
     write_msg(&mut tx, Kind::HelloAck, &HelloAck { gen: params.ack_gen }).await?;
     let chan = PacketChannel::start_lanes(conn.clone(), params.mode, params.lanes);
     let (peer, role) = (claims.node_id, claims.role);
@@ -342,7 +397,18 @@ pub async fn dial(
         let fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("peer presented no certificate"))?;
         let (mut tx, mut rx) = conn.open_bi().await?;
         write_msg(&mut tx, Kind::Hello, &Hello { credential: credential.to_string(), have_gen: 0 }).await?;
-        let ack = tokio::time::timeout(Duration::from_secs(10), read_envelope(&mut rx)).await.context("waiting for HelloAck")??;
+        let ack = match tokio::time::timeout(Duration::from_secs(10), read_envelope(&mut rx)).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                // A deliberate refusal carries a code; surface it so the
+                // caller can act on it (a stale login means: exit).
+                if let Some((code, reason)) = app_close(&conn) {
+                    return Err(Refused { code, reason }.into());
+                }
+                return Err(anyhow!("waiting for HelloAck: {e}"));
+            }
+            Err(_) => return Err(anyhow!("waiting for HelloAck: timed out")),
+        };
         anyhow::ensure!(ack.kind == Kind::HelloAck as u16, "peer refused our credential");
         let chan = PacketChannel::start_lanes(conn.clone(), mode, lanes);
         // The endpoint must outlive the connection: park it on a task.

@@ -7,6 +7,9 @@ quic = "0.0.0.0:14433"      # QUIC control plane; the port is published to
 [state]
 dir = "/var/lib/nqvpn-coord" # registries, secrets.toml (0600), signing key, cert
 
+# networks_dir = "networks.d"  # one <network_id>.toml per network; relative to
+                               # this file. `nqvpn-coord run --networks DIR` overrides.
+
 [admin]
 bearer_token = "change-me"  # or bearer_token_file = "/etc/nqvpn/admin-token"
 

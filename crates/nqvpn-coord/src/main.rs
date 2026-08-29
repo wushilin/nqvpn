@@ -56,8 +56,13 @@ async fn main() -> Result<()> {
 
 async fn run(config_path: PathBuf, networks_dir: Option<PathBuf>) -> Result<()> {
     let coord = load_coord_config(&config_path)?;
-    let networks_dir = networks_dir.unwrap_or_else(|| {
-        config_path.parent().unwrap_or(std::path::Path::new(".")).join("networks.d")
+    // Precedence: --networks, then networks_dir in the config, then
+    // networks.d next to the config file. A relative path in the config
+    // is relative to the config file, not the working directory.
+    let config_dir = config_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let networks_dir = networks_dir.unwrap_or_else(|| match &coord.networks_dir {
+        Some(d) => config_dir.join(d),
+        None => config_dir.join("networks.d"),
     });
     let net_cfgs = load_networks(&networks_dir)?;
     anyhow::ensure!(!net_cfgs.is_empty(), "no networks defined in {}", networks_dir.display());

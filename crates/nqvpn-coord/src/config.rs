@@ -26,6 +26,11 @@ pub struct CoordConfig {
     #[serde(default)]
     pub tls: Option<TlsCfg>,
     pub state: StateCfg,
+    /// Directory of per-network files (`<network_id>.toml`). Default:
+    /// `networks.d` next to this file. `--networks` on the command line
+    /// overrides both.
+    #[serde(default)]
+    pub networks_dir: Option<String>,
     #[serde(default)]
     pub admin: AdminCfg,
     #[serde(default)]

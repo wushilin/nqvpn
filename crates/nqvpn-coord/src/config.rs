@@ -1,17 +1,19 @@
-//! Coordinator + per-network config loading and validation (§3.1, §3.2).
-//! The operator's TOML is the plan of record; validation failures are
-//! planning bugs and fail startup (or leave the old config running on
-//! reload).
+//! Configuration. The process-level part (`coordinator.toml`: where to
+//! listen, TLS, the database, the admin token) is the only file. Every
+//! network — its address space, settings, members — lives in the
+//! database and is edited in the UI; the structs here are its in-memory
+//! shape, and `validate_network` is the one rule set every change must
+//! pass before it is committed.
 //!
-//! A member is a **node id + secret**. The id is chosen by the operator
-//! here; the secret is either written here or minted into the managed
-//! store (which wins when both exist). Nothing else authenticates.
+//! A member is a **name + secret**. The secret is generated, never
+//! chosen, and is all a machine ever holds (inside its token). Nothing
+//! else authenticates.
 
 use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use nqvpn_proto::lpm::overlaps;
 use nqvpn_proto::types::Role;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -26,11 +28,6 @@ pub struct CoordConfig {
     #[serde(default)]
     pub tls: Option<TlsCfg>,
     pub state: StateCfg,
-    /// Directory of per-network files (`<network_id>.toml`). Default:
-    /// `networks.d` next to this file. `--networks` on the command line
-    /// overrides both.
-    #[serde(default)]
-    pub networks_dir: Option<String>,
     #[serde(default)]
     pub admin: AdminCfg,
     #[serde(default)]
@@ -46,6 +43,10 @@ pub struct ListenCfg {
     /// it is published in the join response; nothing else configures it.
     #[serde(default = "d_quic")]
     pub quic: String,
+    /// The URL members reach this coordinator at, written into every
+    /// token. Unset: the URL the operator's browser used for the UI.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 fn d_quic() -> String {
@@ -62,16 +63,32 @@ pub struct TlsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateCfg {
+    /// Holds `nqvpn.db` (networks, members, secrets, registries), the
+    /// credential signing key and the auto-generated certificate.
     pub dir: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminCfg {
+    /// UI login. The hash is an argon2 PHC string, from
+    /// `nqvpn-coord hash-password`.
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password_hash: Option<String>,
+    /// A static token for scripts (`Authorization: Bearer ...`).
     #[serde(default)]
     pub bearer_token: Option<String>,
     #[serde(default)]
     pub bearer_token_file: Option<String>,
+    /// UI session lifetime.
+    #[serde(default = "d_session_hours")]
+    pub session_hours: u64,
+}
+
+fn d_session_hours() -> u64 {
+    12
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,10 +110,13 @@ fn default_join_rate() -> u32 {
 
 // ---- per-network ----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     pub network_id: String,
+    /// Tunnel address space: what auto-allocation draws from and what
+    /// every member routes into the tunnel. Configured addresses may
+    /// lie outside it; they are routed as host prefixes.
     pub cidrs: Vec<IpNet>,
     #[serde(default)]
     pub pools: BTreeMap<String, PoolCfg>,
@@ -108,13 +128,13 @@ pub struct NetworkConfig {
     pub clients: BTreeMap<String, MemberCfg>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolCfg {
     pub cidr: IpNet,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsCfg {
     #[serde(default = "d_ttl")]
@@ -197,20 +217,23 @@ fn d_transport() -> String {
     "stream".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberCfg {
-    /// The member's secret. Optional here: a secret minted into the
-    /// managed store (admin API / UI) takes precedence, and a member with
-    /// neither cannot join.
+    /// Generated at creation, rotated on request. `None` only for a
+    /// member that was imported without one; it cannot join until it
+    /// is rotated.
     #[serde(default)]
     pub secret: Option<String>,
-    /// Relays only: public address the fleet and clients dial.
+    /// Relays only: the address the fleet and clients dial, or
+    /// `auto:<port>` for "wherever this relay joins from".
     #[serde(default)]
     pub relay_addr: Option<String>,
-    /// Relays only: CIDRs this member MAY register.
+    /// Relays only: LAN prefixes this relay routes. Accepted as declared
+    /// when they conflict with nothing; two relays declaring the same
+    /// prefix are a failover pair.
     #[serde(default)]
-    pub allowed_cidrs: Vec<IpNet>,
+    pub local_cidrs: Vec<IpNet>,
     #[serde(default)]
     pub preferred_ip4: Option<Ipv4Addr>,
     #[serde(default)]
@@ -218,10 +241,14 @@ pub struct MemberCfg {
     /// Pin auto-allocation to this pool.
     #[serde(default)]
     pub pool: Option<String>,
+    /// Default true; false is a headless member (relays: pure forwarder).
     #[serde(default)]
     pub want_vpn_ip: Option<bool>,
     #[serde(default)]
     pub max_session_mbps: Option<u32>,
+    /// Clients only: the relay to attach to when reachable.
+    #[serde(default)]
+    pub preferred_relay: Option<String>,
 }
 
 impl NetworkConfig {
@@ -230,6 +257,32 @@ impl NetworkConfig {
             .get(name)
             .map(|m| (m, Role::Client))
             .or_else(|| self.relays.get(name).map(|m| (m, Role::Relay)))
+    }
+
+    pub fn member_by_name_mut(&mut self, name: &str) -> Option<(&mut MemberCfg, Role)> {
+        if let Some(m) = self.clients.get_mut(name) {
+            return Some((m, Role::Client));
+        }
+        self.relays.get_mut(name).map(|m| (m, Role::Relay))
+    }
+
+    /// Every member: (name, config, role), clients then relays.
+    pub fn members(&self) -> impl Iterator<Item = (&String, &MemberCfg, Role)> {
+        self.clients
+            .iter()
+            .map(|(n, m)| (n, m, Role::Client))
+            .chain(self.relays.iter().map(|(n, m)| (n, m, Role::Relay)))
+    }
+
+    pub fn insert_member(&mut self, name: &str, role: Role, m: MemberCfg) {
+        match role {
+            Role::Client => self.clients.insert(name.to_string(), m),
+            Role::Relay => self.relays.insert(name.to_string(), m),
+        };
+    }
+
+    pub fn remove_member(&mut self, name: &str) -> bool {
+        self.clients.remove(name).is_some() || self.relays.remove(name).is_some()
     }
 }
 
@@ -246,34 +299,6 @@ pub fn load_coord_config(path: &Path) -> Result<CoordConfig> {
         }
     }
     Ok(cfg)
-}
-
-/// Load and validate every `networks.d/<network_id>.toml`.
-pub fn load_networks(dir: &Path) -> Result<Vec<NetworkConfig>> {
-    let mut out = Vec::new();
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading networks dir {}", dir.display()))?;
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        let cfg: NetworkConfig = toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-        if stem != cfg.network_id {
-            bail!(
-                "{}: file stem {stem:?} must equal network_id {:?}",
-                path.display(),
-                cfg.network_id
-            );
-        }
-        validate_network(&cfg).with_context(|| format!("validating {}", path.display()))?;
-        out.push(cfg);
-    }
-    out.sort_by(|a, b| a.network_id.cmp(&b.network_id));
-    Ok(out)
 }
 
 pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
@@ -349,19 +374,42 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
             }
         }
         if !is_relay {
-            if m.relay_addr.is_some() || !m.allowed_cidrs.is_empty() {
-                bail!("client {name}: relay_addr/allowed_cidrs are relay-only fields");
+            if m.relay_addr.is_some() || !m.local_cidrs.is_empty() || m.max_session_mbps.is_some() {
+                bail!("client {name}: relay_addr/local_cidrs/max_session_mbps are relay-only fields");
             }
         } else {
+            if m.preferred_relay.is_some() {
+                bail!("relay {name}: preferred_relay is a client-only field");
+            }
             let addr = m
                 .relay_addr
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("relay {name}: relay_addr is required"))?;
             validate_relay_addr(name, addr, cfg)?;
-            for c in &m.allowed_cidrs {
+            for c in &m.local_cidrs {
+                if c.addr() != c.network() {
+                    bail!("relay {name}: local cidr {c} is not a network address (did you mean {}?)", c.trunc());
+                }
                 for t in &cfg.cidrs {
                     if overlaps(c, t) {
-                        bail!("relay {name}: allowed cidr {c} overlaps tunnel space {t}");
+                        bail!("relay {name}: local cidr {c} overlaps tunnel space {t}");
+                    }
+                }
+                // Other members' prefixes: identical is a failover pair;
+                // partial overlap would make routing ambiguous.
+                for (other, om, _) in cfg.members() {
+                    if other == name {
+                        continue;
+                    }
+                    for oc in &om.local_cidrs {
+                        if overlaps(c, oc) && c.trunc() != oc.trunc() {
+                            bail!("relay {name}: local cidr {c} partially overlaps {oc} routed by {other}");
+                        }
+                    }
+                    for ip in [om.preferred_ip4.map(IpAddr::V4), om.preferred_ip6.map(IpAddr::V6)].into_iter().flatten() {
+                        if c.contains(&ip) {
+                            bail!("relay {name}: local cidr {c} contains {other}'s address {ip}");
+                        }
                     }
                 }
             }
@@ -371,30 +419,31 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
                 bail!("member {name}: unknown pool {pool:?}");
             }
         }
+        if let Some(p) = &m.preferred_relay {
+            if !cfg.relays.contains_key(p) {
+                bail!("member {name}: preferred relay {p:?} is not a relay of this network");
+            }
+        }
+        // Addresses need not lie inside the tunnel cidrs (they are
+        // routed as host prefixes); they must be unique and routable.
         if let Some(ip) = m.preferred_ip4 {
-            check_in_cidrs(&cfg.cidrs, IpAddr::V4(ip))
-                .with_context(|| format!("member {name}: preferred_ip4 {ip}"))?;
+            if unroutable(IpAddr::V4(ip)) {
+                bail!("member {name}: preferred_ip4 {ip} is not a usable address");
+            }
             if let Some(prev) = seen4.insert(ip, name.clone()) {
                 bail!("preferred_ip4 {ip} claimed by both {prev} and {name}");
             }
         }
         if let Some(ip) = m.preferred_ip6 {
-            check_in_cidrs(&cfg.cidrs, IpAddr::V6(ip))
-                .with_context(|| format!("member {name}: preferred_ip6 {ip}"))?;
+            if unroutable(IpAddr::V6(ip)) {
+                bail!("member {name}: preferred_ip6 {ip} is not a usable address");
+            }
             if let Some(prev) = seen6.insert(ip, name.clone()) {
                 bail!("preferred_ip6 {ip} claimed by both {prev} and {name}");
             }
         }
     }
     Ok(())
-}
-
-fn check_in_cidrs(cidrs: &[IpNet], ip: IpAddr) -> Result<()> {
-    if cidrs.iter().any(|c| c.contains(&ip)) {
-        Ok(())
-    } else {
-        bail!("address {ip} is outside every network cidr")
-    }
 }
 
 fn unroutable(ip: IpAddr) -> bool {
@@ -421,6 +470,11 @@ fn unroutable(ip: IpAddr) -> bool {
 /// resolved here as well, so a name pointing at tunnel space is caught
 /// at load rather than when every dialer loops into its own TUN.
 fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()> {
+    if let Some(port) = addr.strip_prefix("auto:") {
+        port.parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("relay {name}: relay_addr {addr:?} must be auto:<port>"))?;
+        return Ok(());
+    }
     let (host, port) = addr
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("relay {name}: relay_addr {addr:?} must be host:port"))?;
@@ -454,7 +508,7 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
             .relays
             .values()
             .chain(cfg.clients.values())
-            .flat_map(|m| m.allowed_cidrs.iter())
+            .flat_map(|m| m.local_cidrs.iter())
             .any(|c| c.contains(&ip));
         if in_lan {
             bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside a routed LAN prefix");
@@ -487,7 +541,7 @@ cidr = "10.99.1.0/24"
 [relays.r1]
 secret = "s"
 relay_addr = "1.2.3.4:4444"
-allowed_cidrs = ["192.168.1.0/24"]
+local_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 [clients.c1]
 secret = "s"
@@ -558,33 +612,67 @@ pool = "default"
     }
 
     #[test]
-    fn allowed_cidr_overlapping_tunnel_fails() {
+    fn local_cidr_overlapping_tunnel_fails() {
         assert!(validate_network(&parse(&base().replace("192.168.1.0/24", "10.99.5.0/24"))).is_err());
     }
 
     #[test]
-    fn overlapping_allowed_cidrs_across_relays_ok_for_failover() {
+    fn identical_local_cidrs_across_relays_ok_for_failover_but_partial_overlap_fails() {
         let mut s = base();
-        s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nallowed_cidrs = [\"192.168.1.0/24\"]\n");
+        s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.1.0/24\"]\n");
         validate_network(&parse(&s)).unwrap();
+        let mut s = base();
+        s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.1.128/25\"]\n");
+        assert!(validate_network(&parse(&s)).is_err());
+        let mut s = base();
+        s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.2.1/24\"]\n");
+        assert!(validate_network(&parse(&s)).is_err(), "not a network address");
+    }
+
+    #[test]
+    fn addresses_may_lie_outside_the_tunnel_cidrs_but_must_be_usable_and_unique() {
+        validate_network(&parse(&base().replace("10.99.0.1", "172.20.0.7"))).unwrap();
+        assert!(validate_network(&parse(&base().replace("10.99.0.1", "127.0.0.1"))).is_err());
+        assert!(validate_network(&parse(&base().replace("10.99.0.1", "192.168.1.7"))).is_ok(), "inside its own LAN is fine");
+        let mut s = base();
+        s.push_str("[clients.c2]\npreferred_ip4 = \"192.168.1.9\"\n");
+        assert!(validate_network(&parse(&s)).is_err(), "inside another member's routed LAN is not");
+    }
+
+    #[test]
+    fn relay_addr_may_be_auto_with_a_port() {
+        validate_network(&parse(&base().replace("1.2.3.4:4444", "auto:4444"))).unwrap();
+        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "auto:x"))).is_err());
     }
 
     #[test]
     fn a_secret_is_optional_but_not_empty() {
         let s = base().replace("secret = \"s\"\npool", "pool");
-        validate_network(&parse(&s)).expect("managed store may hold it");
+        validate_network(&parse(&s)).expect("an imported member may have none yet");
         assert!(validate_network(&parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
     }
 
     #[test]
-    fn the_shipped_sample_configs_are_valid() {
+    fn preferred_relay_must_name_a_relay() {
+        let mut s = base();
+        s.push_str("[clients.c2]\npreferred_relay = \"r1\"\n[clients.c3]\npreferred_relay = \"nope\"\n");
+        assert!(validate_network(&parse(&s)).is_err());
+        let mut s = base();
+        s.push_str("[clients.c2]\npreferred_relay = \"r1\"\n");
+        validate_network(&parse(&s)).unwrap();
+    }
+
+    #[test]
+    fn the_shipped_sample_config_is_valid_and_round_trips_as_json() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
-        load_coord_config(&root.join("coordinator.toml")).expect("coordinator.toml");
-        let nets = load_networks(&root.join("networks.d")).expect("networks.d");
-        assert_eq!(nets.len(), 1);
-        assert_eq!(nets[0].network_id, "acme-prod");
-        assert_eq!(nets[0].relays.len(), 3);
-        assert_eq!(nets[0].clients.len(), 2);
+        let c = load_coord_config(&root.join("coordinator.toml")).expect("coordinator.toml");
+        assert_eq!(c.admin.user.as_deref(), Some("admin"));
+        assert!(c.admin.password_hash.is_some());
+        let cfg = parse(&base());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: NetworkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.relays["r1"].local_cidrs, cfg.relays["r1"].local_cidrs);
+        assert_eq!(back.settings.mtu, cfg.settings.mtu);
     }
 
     #[test]

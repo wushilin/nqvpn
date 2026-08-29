@@ -99,11 +99,17 @@ pub fn allocate(
     Ok(Granted { ip4, ip6 })
 }
 
-fn check_in_network(cfg: &NetworkConfig, ip: IpAddr) -> Result<(), ApiError> {
-    if cfg.cidrs.iter().any(|c| c.contains(&ip)) {
-        Ok(())
+/// A configured address may lie outside the tunnel cidrs (it is routed
+/// as a host prefix); it only has to be a usable unicast address.
+fn check_in_network(_cfg: &NetworkConfig, ip: IpAddr) -> Result<(), ApiError> {
+    let bad = match ip {
+        IpAddr::V4(v) => v.is_loopback() || v.is_unspecified() || v.is_multicast() || v.is_broadcast(),
+        IpAddr::V6(v) => v.is_loopback() || v.is_unspecified() || v.is_multicast(),
+    };
+    if bad {
+        Err(ApiError::bad_request(format!("{ip} is not a usable address")))
     } else {
-        Err(ApiError::bad_request(format!("{ip} is outside the network cidrs")))
+        Ok(())
     }
 }
 
@@ -383,10 +389,9 @@ cidr = "10.99.1.0/28"
         let cursor = reg.alloc_cursor.clone();
         assert!(!cursor.is_empty(), "allocation advanced a cursor");
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("r.json");
-        reg.commit(&path).unwrap();
-        let back = Registry::load_or_create(&path).unwrap();
+        // What the database stores is this JSON; a restart reads it back.
+        let json = serde_json::to_string(&reg).unwrap();
+        let back: Registry = serde_json::from_str(&json).unwrap();
         assert_eq!(
             back.alloc_cursor, cursor,
             "a restart must not reset the cursor, or reuse starts over"
@@ -413,11 +418,12 @@ cidr = "10.99.1.0/28"
     }
 
     #[test]
-    fn preferred_outside_network_rejected() {
+    fn preferred_outside_the_tunnel_cidrs_is_fine_but_unusable_addresses_are_not() {
         let c = cfg();
         let mut reg = Registry::new();
-        let err = allocate(&c, &mut reg, "c1", None, Some("192.168.9.9".parse().unwrap()), None)
-            .unwrap_err();
+        let g = allocate(&c, &mut reg, "c1", None, Some("192.168.9.9".parse().unwrap()), None).unwrap();
+        assert_eq!(g.ip4, Some("192.168.9.9".parse().unwrap()), "routed as a host prefix");
+        let err = allocate(&c, &mut reg, "c1", None, Some("127.0.0.1".parse().unwrap()), None).unwrap_err();
         assert_eq!(err.code.as_str(), "bad_request");
     }
 

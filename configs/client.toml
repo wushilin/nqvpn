@@ -1,20 +1,11 @@
-coordinator = "https://coord.example.com:8443"
-# trust_any_cert = true             # default; false + ca = strict verification
+# NetQ VPN client: a token and nothing else. Address, preferred relay,
+# MTU and the relay fleet come from the coordinator at join.
+#
+# The config file is optional:  nqvpn-client --token "nqv1.…"
+
+token_file = "/etc/nqvpn/client.token"
+# token = "nqv1.…"
+state_dir = "/var/lib/nqvpn-client"
+# tun_name = "nqvpn0"             # Linux: any name; macOS: utunN
+# trust_any_cert = true           # default; set false to verify the coordinator's cert
 # ca = "/etc/nqvpn/coord-ca.pem"
-
-network_id  = "acme-prod"
-name        = "laptop-1"
-secret      = "change-me-laptop"    # or secret_file = "/etc/nqvpn/laptop-1.secret"
-state_dir   = "/var/lib/nqvpn-client"
-# tun_name  = "nqvpn0"
-
-[relay]
-# A preference, not a requirement: attach here whenever it is reachable,
-# fall back to the lowest-RTT relay when it is not, and move back on your
-# own once it answers again. Omit => lowest RTT.
-# preferred = "home"
-
-[address]
-# pool = "default"
-# preferred_ip4 = "10.99.1.50"
-# want_vpn_ip = true                # false = headless (no tunnel address)

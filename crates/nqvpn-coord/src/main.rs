@@ -1,19 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
+use nqvpn_coord::api;
+use nqvpn_coord::config::{load_coord_config, read_bearer_token};
+use nqvpn_coord::db::Db;
+use nqvpn_coord::signer::Keyring;
+use nqvpn_coord::state::{now_unix, AppState};
+use nqvpn_proto::identity::TlsIdentity;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-use nqvpn_coord::api;
-use nqvpn_coord::config::{load_coord_config, load_networks, read_bearer_token};
-use nqvpn_coord::registry::Registry;
-use nqvpn_coord::signer::Keyring;
-use nqvpn_coord::state::{self, now_unix, AppState, NetState};
-use nqvpn_proto::identity::TlsIdentity;
+use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "nqvpn-coord", about = "nqvpn coordinator (control plane)")]
+#[command(name = "nqvpn-coord", about = "NetQ VPN coordinator")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -21,17 +19,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the coordinator.
+    /// Run the coordinator. Networks and members are created in the UI
+    /// (or the API) and kept in the database; nothing else to configure.
     Run {
         /// Path to coordinator.toml
         #[arg(long, default_value = "/etc/nqvpn/coordinator.toml")]
         config: PathBuf,
-        /// Path to networks.d/ (default: <config dir>/networks.d)
-        #[arg(long)]
-        networks: Option<PathBuf>,
     },
-    /// Print a freshly generated member secret.
-    Secret,
+    /// Hash a password for `[admin] password_hash` (reads it from stdin
+    /// if not given).
+    HashPassword {
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -40,58 +40,42 @@ async fn main() -> Result<()> {
     // axum-server); pick ring process-wide so every TLS config agrees.
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-
-    match Cli::parse().cmd {
-        Cmd::Secret => {
-            println!("{}", nqvpn_coord::secrets::generate_secret());
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Run { config } => run(config).await,
+        Cmd::HashPassword { password } => {
+            let pw = match password {
+                Some(p) => p,
+                None => {
+                    eprint!("password: ");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s)?;
+                    s.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            anyhow::ensure!(!pw.is_empty(), "empty password");
+            println!("{}", nqvpn_coord::auth::hash_password(&pw).map_err(|e| anyhow::anyhow!(e))?);
             Ok(())
         }
-        Cmd::Run { config, networks } => run(config, networks).await,
     }
 }
 
-async fn run(config_path: PathBuf, networks_dir: Option<PathBuf>) -> Result<()> {
+async fn run(config_path: PathBuf) -> Result<()> {
     let coord = load_coord_config(&config_path)?;
-    // Precedence: --networks, then networks_dir in the config, then
-    // networks.d next to the config file. A relative path in the config
-    // is relative to the config file, not the working directory.
-    let config_dir = config_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-    let networks_dir = networks_dir.unwrap_or_else(|| match &coord.networks_dir {
-        Some(d) => config_dir.join(d),
-        None => config_dir.join("networks.d"),
-    });
-    let net_cfgs = load_networks(&networks_dir)?;
-    anyhow::ensure!(!net_cfgs.is_empty(), "no networks defined in {}", networks_dir.display());
-
     let state_dir = PathBuf::from(&coord.state.dir);
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("creating state dir {}", state_dir.display()))?;
+    std::fs::create_dir_all(&state_dir).with_context(|| format!("creating state dir {}", state_dir.display()))?;
 
     let keyring = Keyring::load_or_create(&state_dir.join("signing.json"), now_unix())?;
-
-    let mut networks = HashMap::new();
-    for cfg in net_cfgs {
-        let registry_path = state_dir.join(format!("registry-{}.json", cfg.network_id));
-        let registry = Registry::load_or_create(&registry_path)?;
-        for w in state::config_matches_registry(&cfg, &registry) {
-            tracing::warn!("{}: {w}", cfg.network_id);
-        }
-        tracing::info!(
-            network = %cfg.network_id,
-            members = registry.members.len(),
-            uuid = %registry.network_uuid,
-            "network loaded"
-        );
-        networks.insert(cfg.network_id.clone(), Mutex::new(NetState::new(cfg, registry, registry_path)));
-    }
+    let db_path = state_dir.join("nqvpn.db");
+    let db = Arc::new(Db::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?);
 
     let admin_token = read_bearer_token(&coord.admin)?;
-    if admin_token.is_none() {
-        tracing::warn!("no admin bearer token configured — admin endpoints disabled");
+    match (&coord.admin.user, &coord.admin.password_hash, &admin_token) {
+        (Some(u), Some(_), _) => tracing::info!(user = %u, "UI login enabled"),
+        (_, _, Some(_)) => tracing::warn!("no [admin] user/password_hash: the UI cannot log in (the API accepts the bearer token)"),
+        _ => tracing::warn!("no admin login configured — the UI and admin API are disabled"),
     }
 
     // One identity for both the HTTPS API and the QUIC control port:
@@ -112,21 +96,22 @@ async fn run(config_path: PathBuf, networks_dir: Option<PathBuf>) -> Result<()> 
 
     let api_addr: SocketAddr = coord.listen.api.parse().context("parsing listen.api")?;
     let quic_addr: SocketAddr = coord.listen.quic.parse().context("parsing listen.quic")?;
-    let secrets_path = state_dir.join("secrets.toml");
-    let secrets = nqvpn_coord::secrets::SecretStore::load_or_create(&secrets_path).context("loading secrets.toml")?;
-    tracing::info!(path = %secrets_path.display(), count = secrets.members.len(), "secret store loaded");
 
-    let state = Arc::new(AppState {
-        coord,
-        admin_token,
-        networks,
-        keyring,
-        join_rate: Mutex::new(Default::default()),
-        networks_dir: Some(networks_dir.clone()),
-        secrets: Mutex::new(secrets),
-        secrets_path,
-        control_port: quic_addr.port(),
-    });
+    let state = Arc::new(AppState::new(coord, admin_token, keyring, db.clone(), quic_addr.port()));
+    let loaded = db.load_all().context("loading networks from the database")?;
+    if loaded.is_empty() {
+        tracing::info!(db = %db_path.display(), "no networks yet — create one in the UI at /ui");
+    }
+    for (cfg, registry) in loaded {
+        tracing::info!(
+            network = %cfg.network_id,
+            members = cfg.members().count(),
+            joined = registry.members.len(),
+            uuid = %registry.network_uuid,
+            "network loaded"
+        );
+        state.add_network(cfg, registry);
+    }
 
     {
         let s = state.clone();

@@ -1,20 +1,16 @@
-//! Durable per-network registry (§3.3): everything a coordinator restart
-//! must not lose. One JSON file per network, atomically rewritten
-//! (temp + fsync + rename + dir fsync); durability precedes visibility.
+//! Durable per-network registry: everything a coordinator restart must
+//! not lose. Stored as one JSON row per network in the database;
+//! durability precedes visibility.
 //!
 //! Keyed by node id — the member's identity. Everything else in a record
 //! is the member's latest *declaration* (replaced by every join) or
 //! bookkeeping about it.
 
-use anyhow::{Context, Result};
 use ipnet::IpNet;
 use nqvpn_proto::types::{NodeId, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +40,11 @@ pub struct MemberRecord {
     pub ip6: Option<Ipv6Addr>,
     #[serde(default)]
     pub routes: Vec<RouteReg>,
-    /// Durable admin override; never written into the operator's TOML.
+    /// Relays: the address the fleet dials, as resolved at the latest
+    /// join (`auto:<port>` becomes the address it joined from).
+    #[serde(default)]
+    pub relay_addr: Option<String>,
+    /// Durable admin override.
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
@@ -104,42 +104,6 @@ impl Registry {
         }
     }
 
-    pub fn load_or_create(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let reg: Registry = serde_json::from_str(&raw).with_context(|| {
-                format!(
-                    "parsing {} (an older registry format cannot be migrated; move it aside to start fresh)",
-                    path.display()
-                )
-            })?;
-            Ok(reg)
-        } else {
-            Ok(Registry::new())
-        }
-    }
-
-    /// Atomic durable commit: temp file, fsync, rename, fsync directory.
-    pub fn commit(&self, path: &Path) -> Result<()> {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir)?;
-        let tmp: PathBuf = path.with_extension("json.tmp");
-        {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()?;
-        Ok(())
-    }
-
     /// The first generation a fresh process may use.
     pub fn initial_gen(&self, now_ms: u64) -> u64 {
         now_ms.max(self.gen_hwm + GEN_PERSIST_STEP)
@@ -192,6 +156,7 @@ impl Registry {
             ip4: None,
             ip6: None,
             routes: Vec::new(),
+            relay_addr: None,
             disabled: false,
             created_unix: now,
             last_join_unix: None,
@@ -251,17 +216,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commit_and_reload_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("n1.json");
+    fn stored_form_round_trips() {
         let mut r = Registry::new();
-        r.member_mut(7, "a", Role::Client, 42).pubkey = Some("PK".into());
-        r.commit(&path).unwrap();
-        let back = Registry::load_or_create(&path).unwrap();
+        r.member_mut(7, "a", Role::Client, 1).pubkey = Some("PK".into());
+        let back: Registry = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.network_uuid, r.network_uuid);
         assert_eq!(back.members[&7].pubkey.as_deref(), Some("PK"));
         assert_eq!(back.members[&7].name, "a");
-        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]

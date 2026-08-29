@@ -29,6 +29,9 @@ struct Cli {
     /// did with it; the notes are logged as they arrive.
     #[arg(long)]
     trace: Option<IpAddr>,
+    /// The member token (overrides the config's token / token_file).
+    #[arg(long)]
+    token: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -47,8 +50,16 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
-    let cfg = Arc::new(ClientConfig::load(&cli.config)?);
-    let member = Arc::new(cfg.member()?);
+    let cfg = Arc::new(match ClientConfig::load(&cli.config) {
+        Ok(c) => c,
+        // No config file is fine when the token comes from the command line.
+        Err(e) if cli.token.is_some() && !cli.config.exists() => {
+            tracing::debug!("no config file ({e:#}); using --token alone");
+            ClientConfig::default()
+        }
+        Err(e) => return Err(e),
+    });
+    let member = Arc::new(cfg.member(cli.token.as_deref())?);
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
@@ -59,12 +70,16 @@ async fn run(cli: Cli) -> Result<i32> {
             return Ok(nqvpn_sync::EXIT_REFUSED);
         }
     };
-    tracing::info!(node_id = joined.node_id, name = %joined.name, ip4 = ?joined.ip4, relays = joined.relays.len(), "joined {}", cfg.network_id);
+    if joined.role != nqvpn_proto::types::Role::Client {
+        tracing::error!(network = %joined.network_id, name = %joined.name, "this token belongs to a {} member, not a client", joined.role);
+        return Ok(nqvpn_sync::EXIT_REFUSED);
+    }
+    tracing::info!(node_id = joined.node_id, name = %joined.name, ip4 = ?joined.ip4, relays = joined.relays.len(), "joined {}", joined.network_id);
 
     let _guard = if cli.dry_run {
         None
     } else {
-        Some(nqvpn_endpoint::endpoint_guard::EndpointGuard::acquire(&cfg.network_id, &format!("client node {}", joined.node_id))?)
+        Some(nqvpn_endpoint::endpoint_guard::EndpointGuard::acquire(&joined.network_id, &format!("client node {}", joined.node_id))?)
     };
 
     let mut hosts = Vec::new();
@@ -96,8 +111,8 @@ async fn run(cli: Cli) -> Result<i32> {
         Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::SystemProgrammer { device: tun.name() }))
     };
 
-    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, cfg.relay.preferred.clone());
-    if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&cfg.coordinator) {
+    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None);
+    if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
         use std::net::ToSocketAddrs;
         if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {
             client.set_underlay(it.map(|s| s.ip()).collect());

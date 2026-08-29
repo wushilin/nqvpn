@@ -36,7 +36,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 argon2 = "0.5"
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 quinn = "0.11"
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -55,3 +55,5 @@ webpki-roots = "1"
 rustls-pemfile = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 getifaddrs = "0.6"
+futures-util = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }

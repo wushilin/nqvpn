@@ -68,6 +68,7 @@ pub const CLOSE_EVICTED: u32 = 4;
 pub const CLOSE_OVERFLOW: u32 = 5;
 pub const CLOSE_EXPIRED: u32 = 6;
 pub const CLOSE_REPLACED: u32 = nqvpn_proto::control::CLOSE_REPLACED;
+pub const CLOSE_RECONFIGURED: u32 = nqvpn_proto::control::CLOSE_RECONFIGURED;
 
 /// The credential belongs to an instance that has since been replaced
 /// by a newer join under the same name.
@@ -164,7 +165,7 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
     // Register: supersede any older session for this node, mark alive,
     // publish, and decide what this session needs to be current.
     let (superseded, gen) = {
-        let net = state.networks.get(&network_id).expect("verified above");
+        let net = state.net(&network_id).expect("verified above");
         let mut ns = net.lock().unwrap();
         let now = now_unix();
         let superseded = ns.sessions.insert(
@@ -216,7 +217,7 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
     // Teardown: drop the session (unless already superseded) and let the
     // lease decide what that means.
     {
-        let net = state.networks.get(&network_id).expect("verified above");
+        let net = state.net(&network_id).expect("verified above");
         let mut ns = net.lock().unwrap();
         let still_mine = ns.sessions.get(&node_id).map(|s| s.id) == Some(session_id);
         if still_mine {
@@ -301,7 +302,7 @@ async fn reader_loop(
         match env.kind {
             k if k == Kind::Heartbeat as u16 => {
                 let hb: Heartbeat = parse(&env)?;
-                let net = state.networks.get(network_id).expect("verified");
+                let net = state.net(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
                 let now = now_unix();
                 ns.leases.heartbeat(node_id, role, &hb, now_ms());
@@ -332,7 +333,7 @@ async fn reader_loop(
             }
             k if k == Kind::Resync as u16 => {
                 let r: Resync = parse(&env)?;
-                let net = state.networks.get(network_id).expect("verified");
+                let net = state.net(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
                 if !ns.in_grace(now_unix()) {
                     catch_up(&mut ns, node_id, r.have_gen);
@@ -345,7 +346,7 @@ async fn reader_loop(
                 if net_id != network_id || claims.node_id != node_id || claims.role != role || claims.cert_fp != fp {
                     anyhow::bail!("Refresh identity mismatch for node {node_id}");
                 }
-                let net = state.networks.get(network_id).expect("verified");
+                let net = state.net(network_id).expect("verified");
                 let mut ns = net.lock().unwrap();
                 if let Some(s) = ns.sessions.get_mut(&node_id) {
                     s.exp = claims.exp;
@@ -361,10 +362,7 @@ async fn reader_loop(
 /// Verify a credential offline and confirm the TLS possession proof.
 fn verify_credential(state: &AppState, token: &str, presented_fp: &str) -> Result<(Claims, String)> {
     let unverified_net = credential::peek_network(token).ok_or_else(|| anyhow!("malformed credential"))?;
-    let net = state
-        .networks
-        .get(&unverified_net)
-        .ok_or_else(|| anyhow!("unknown network {unverified_net}"))?;
+    let net = state.net(&unverified_net).ok_or_else(|| anyhow!("unknown network {unverified_net}"))?;
     let keys = state.keyring.verifying_keys();
     let (uuid, rec) = {
         let ns = net.lock().unwrap();
@@ -404,7 +402,7 @@ pub async fn liveness_sweep(state: Arc<AppState>) {
     loop {
         tick.tick().await;
         let now = now_unix();
-        for net in state.networks.values() {
+        for (_, net) in state.nets() {
             let mut ns = net.lock().unwrap();
             ns.directory.prune_traffic(now);
             let window = ns.cfg.settings.liveness_window_secs();

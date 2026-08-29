@@ -9,7 +9,7 @@ use nqvpn_coord::config::{CoordConfig, NetworkConfig};
 use nqvpn_coord::control;
 use nqvpn_coord::registry::Registry;
 use nqvpn_coord::signer::Keyring;
-use nqvpn_coord::state::{now_unix, AppState, NetState};
+use nqvpn_coord::state::{now_unix, AppState};
 use nqvpn_proto::api::JoinRequest;
 use nqvpn_proto::control::*;
 use nqvpn_proto::envelope::{decode_payload, Kind};
@@ -17,16 +17,13 @@ use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::quic::client_config;
 use nqvpn_proto::stream::{read_envelope, write_msg};
 use nqvpn_proto::types::{NodeId, Role};
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-const SECRET: &str = "s3cret";
 
 fn net_toml() -> String {
-    format!(
-        r#"
+    r#"
 network_id = "n1"
 cidrs = ["10.99.0.0/16"]
 [pools.default]
@@ -36,19 +33,18 @@ heartbeat_secs = 1
 offline_after = 3
 hold_down_secs = 0
 [relays.r1]
-secret = "{SECRET}"
+secret = "s-r1"
 relay_addr = "1.2.3.4:4444"
-allowed_cidrs = ["192.168.1.0/24"]
+local_cidrs = ["192.168.1.0/24"]
 [relays.r2]
-secret = "{SECRET}"
+secret = "s-r2"
 relay_addr = "5.6.7.8:4444"
-allowed_cidrs = ["192.168.1.0/24"]
+local_cidrs = ["192.168.1.0/24"]
 [clients.c1]
-secret = "{SECRET}"
+secret = "s-c1"
 [clients.c2]
-secret = "{SECRET}"
-"#
-    )
+secret = "s-c2"
+"#.to_string()
 }
 
 struct Env {
@@ -62,23 +58,14 @@ async fn setup() -> Env {
     let coord: CoordConfig =
         toml::from_str("[listen]\napi = \"127.0.0.1:0\"\n[state]\ndir = \"x\"\n").unwrap();
     let cfg: NetworkConfig = toml::from_str(&net_toml()).unwrap();
-    let registry_path = dir.path().join("reg.json");
-    let mut ns = NetState::new(cfg, Registry::load_or_create(&registry_path).unwrap(), registry_path);
+    let db = Arc::new(nqvpn_coord::db::Db::open_memory().unwrap());
+    let keyring = Keyring::load_or_create(&dir.path().join("signing.json"), now_unix()).unwrap();
+    let state = Arc::new(AppState::new(coord, Some("tok".into()), keyring, db.clone(), 0));
+    let reg = Registry::new();
+    db.save_network_and_registry(&cfg, &reg).unwrap();
+    let ns = state.add_network(cfg, reg);
     // Tests are not a restart: skip the collect-before-publish grace.
-    ns.started_at = 0;
-    let mut networks = HashMap::new();
-    networks.insert("n1".to_string(), Mutex::new(ns));
-    let state = Arc::new(AppState {
-        coord,
-        admin_token: Some("tok".into()),
-        networks,
-        keyring: Keyring::load_or_create(&dir.path().join("signing.json"), now_unix()).unwrap(),
-        join_rate: Mutex::new(Default::default()),
-        networks_dir: None,
-        secrets: Mutex::new(nqvpn_coord::secrets::SecretStore::default()),
-        secrets_path: dir.path().join("secrets.toml"),
-        control_port: 0,
-    });
+    ns.lock().unwrap().started_at = 0;
     let id = TlsIdentity::generate("coord").unwrap();
     let endpoint = control::bind("127.0.0.1:0".parse().unwrap(), &id).unwrap();
     let addr = endpoint.local_addr().unwrap();
@@ -168,24 +155,17 @@ fn join_as(env: &Env, node_id: NodeId, role: Role, id: &TlsIdentity, cidrs: Vec<
         11 => "c2",
         _ => panic!("unknown test member"),
     };
-    let req = JoinRequest {
-        network_id: "n1".into(),
-        name: name.into(),
-        secret: SECRET.into(),
-        pubkey: B64.encode([node_id as u8; 32]),
-        role,
-        want_vpn_ip: true,
-        pool: None,
-        preferred_ip4: None,
-        preferred_ip6: None,
-        local_cidrs: cidrs.iter().map(|c| c.parse().unwrap()).collect(),
-        relay_addr: match (role, node_id) {
-            (Role::Relay, 2) => Some("5.6.7.8:4444".to_string()),
-            (Role::Relay, _) => Some("1.2.3.4:4444".to_string()),
-            _ => None,
-        },
-        cert_fingerprint: id.fingerprint(),
-    };
+    // Routes are configured at the coordinator, not requested.
+    if role == Role::Relay {
+        let net = env.state.net("n1").unwrap();
+        let mut spec = {
+            let ns = net.lock().unwrap();
+            nqvpn_coord::admin::MemberSpec::from_cfg(ns.cfg.member_by_name(name).unwrap().0)
+        };
+        spec.local_cidrs = cidrs.iter().map(|c| c.parse().unwrap()).collect();
+        env.state.update_member("n1", name, &spec).unwrap();
+    }
+    let req = JoinRequest { secret: format!("s-{name}"), pubkey: B64.encode([node_id as u8; 32]), cert_fingerprint: id.fingerprint() };
     let r = env.state.join(&req, "1.1.1.1").unwrap();
     (r.credential, r.node_id)
 }
@@ -208,7 +188,8 @@ async fn hello_gets_ack_and_a_snapshot_that_matches_the_digest() -> Result<()> {
     assert!(me.prefixes.iter().any(|p| p.to_string().ends_with("/32")));
     assert_eq!(snap.keys.len(), 1);
     assert_eq!(snap.mtu.mtu, 1350);
-    let ns = env.state.networks["n1"].lock().unwrap();
+    let net = env.state.net("n1").unwrap();
+    let ns = net.lock().unwrap();
     assert_eq!(snap.digest(), ns.directory.published_digest, "member and coordinator agree bit for bit");
     Ok(())
 }
@@ -238,7 +219,8 @@ async fn a_change_is_pushed_as_a_delta_that_applies_cleanly() -> Result<()> {
     let (_, c_node) = join_as(&env, 10, Role::Client, &cid, vec![]);
     relay.until(&mut view, |v| v.member(c_node).is_some()).await?;
     let (gen, digest) = {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         (ns.directory.gen, ns.directory.published_digest)
     };
     assert_eq!(view.gen, gen);
@@ -278,7 +260,8 @@ async fn a_relay_declares_attachments_as_a_set_and_moves_win_by_recency() -> Res
     r1.heartbeat(&h).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         assert_eq!(ns.directory.published.attachment_of(c), Some(2), "a repeated stale declaration does not win");
     }
 
@@ -287,7 +270,8 @@ async fn a_relay_declares_attachments_as_a_set_and_moves_win_by_recency() -> Res
     h.attached = vec![];
     r1.heartbeat(&h).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let ns = env.state.networks["n1"].lock().unwrap();
+    let net = env.state.net("n1").unwrap();
+    let ns = net.lock().unwrap();
     assert_eq!(ns.directory.published.attachment_of(c), Some(2));
     Ok(())
 }
@@ -303,7 +287,8 @@ async fn a_client_heartbeat_cannot_declare_attachments() -> Result<()> {
     h.attached = attached(&[(node, 1)]);
     c.heartbeat(&h).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let ns = env.state.networks["n1"].lock().unwrap();
+    let net = env.state.net("n1").unwrap();
+    let ns = net.lock().unwrap();
     assert!(ns.directory.published.attachments.is_empty(), "only relays hold clients");
     assert!(ns.sessions.contains_key(&node), "and it is not fatal");
     Ok(())
@@ -320,7 +305,8 @@ async fn death_withdraws_routes_and_fails_over() -> Result<()> {
     let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
     let mut view = r2.snapshot().await?;
     {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         assert_eq!(ns.directory.owners["192.168.1.0/24"], 1, "oldest live registrant owns");
     }
     drop(r1);
@@ -328,7 +314,8 @@ async fn death_withdraws_routes_and_fails_over() -> Result<()> {
         v.member(r2_node).map(|p| p.prefixes.iter().any(|x| x.to_string() == "192.168.1.0/24")).unwrap_or(false)
     })
     .await?;
-    let ns = env.state.networks["n1"].lock().unwrap();
+    let net = env.state.net("n1").unwrap();
+    let ns = net.lock().unwrap();
     assert_eq!(ns.directory.owners["192.168.1.0/24"], 2);
     Ok(())
 }
@@ -364,7 +351,8 @@ async fn a_relay_losing_its_control_link_keeps_its_attachments() -> Result<()> {
         client.until(&mut cv, |_| true).await?;
     }
     {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         assert!(!ns.leases.is_online(1), "the relay is offline to the coordinator");
         assert!(ns.leases.is_online(c), "the client is not");
         assert_eq!(ns.directory.published.attachment_of(c), Some(1), "so its attachment outlives the relay's lease");
@@ -375,7 +363,8 @@ async fn a_relay_losing_its_control_link_keeps_its_attachments() -> Result<()> {
     drop(client);
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let (online, att) = {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         (ns.leases.is_online(c), ns.directory.published.attachment_of(c))
     };
     assert!(!online);
@@ -395,7 +384,8 @@ async fn silent_member_is_reaped_by_liveness_sweep() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         {
-            let ns = env.state.networks["n1"].lock().unwrap();
+            let net = env.state.net("n1").unwrap();
+            let ns = net.lock().unwrap();
             if !ns.directory.published.member(node).unwrap().online {
                 assert!(!ns.sessions.contains_key(&node), "and the session was closed");
                 return Ok(());
@@ -409,7 +399,7 @@ async fn silent_member_is_reaped_by_liveness_sweep() -> Result<()> {
 #[tokio::test]
 async fn hold_down_expiry_reclaims_without_an_event() -> Result<()> {
     let env = setup().await;
-    env.state.networks["n1"].lock().unwrap().directory.hold_down_secs = 2;
+    env.state.net("n1").unwrap().lock().unwrap().directory.hold_down_secs = 2;
     tokio::spawn(control::liveness_sweep(env.state.clone()));
     let r1id = TlsIdentity::generate("r1")?;
     let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec!["192.168.1.0/24"]);
@@ -418,14 +408,14 @@ async fn hold_down_expiry_reclaims_without_an_event() -> Result<()> {
     let (r2cred, _) = join_as(&env, 2, Role::Relay, &r2id, vec!["192.168.1.0/24"]);
     let mut r2 = Member::connect(&env, &r2cred, &r2id, 0).await?;
     let v2 = r2.snapshot().await?;
-    assert_eq!(env.state.networks["n1"].lock().unwrap().directory.owners["192.168.1.0/24"], 2);
+    assert_eq!(env.state.net("n1").unwrap().lock().unwrap().directory.owners["192.168.1.0/24"], 2);
     let mut r1 = Member::connect(&env, &r1cred, &r1id, 0).await?;
     let v1 = r1.snapshot().await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         r1.heartbeat(&hb_of(&v1)).await?;
         r2.heartbeat(&hb_of(&v2)).await?;
-        if env.state.networks["n1"].lock().unwrap().directory.owners["192.168.1.0/24"] == 1 {
+        if env.state.net("n1").unwrap().lock().unwrap().directory.owners["192.168.1.0/24"] == 1 {
             return Ok(());
         }
         assert!(std::time::Instant::now() < deadline, "hold-down never expired into a reclaim");
@@ -483,17 +473,20 @@ async fn a_member_behind_is_caught_up_by_deltas_and_a_stranger_by_snapshot() -> 
     view.apply(&d)?;
     let st = env.state.clone();
     let (r1n, r2n) = {
-        let ns = st.networks["n1"].lock().unwrap();
+        let net = st.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         (ns.registry.id_of("r1").unwrap(), ns.registry.id_of("r2").unwrap())
     };
     c.until(&mut view, |v| {
-        let ns = st.networks["n1"].lock().unwrap();
+        let net = st.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         v.gen == ns.directory.gen && v.member(r1n).is_some() && v.member(r2n).is_some()
     })
     .await?;
     let _ = payload;
     {
-        let ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let ns = net.lock().unwrap();
         assert_eq!(view.digest(), ns.directory.published_digest);
     }
 
@@ -553,7 +546,8 @@ async fn disabling_evicts_the_member_everywhere() -> Result<()> {
     relay.until(&mut rv, |v| v.member(node).is_some()).await?;
 
     {
-        let mut ns = env.state.networks["n1"].lock().unwrap();
+        let net = env.state.net("n1").unwrap();
+        let mut ns = net.lock().unwrap();
         ns.registry.members.get_mut(&node).unwrap().disabled = true;
         ns.close_session(node, "disabled");
         ns.leases.remove(node);
@@ -575,13 +569,13 @@ async fn refresh_extends_the_session_but_never_rebinds_it() -> Result<()> {
     let (r1cred, _) = join_as(&env, 1, Role::Relay, &r1id, vec![]);
     let mut c1 = Member::connect(&env, &c1cred, &c1id, 0).await?;
     let view = c1.snapshot().await?;
-    let exp_before = env.state.networks["n1"].lock().unwrap().sessions[&node].exp;
+    let exp_before = env.state.net("n1").unwrap().lock().unwrap().sessions[&node].exp;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let (renewed, _) = join_as(&env, 10, Role::Client, &c1id, vec![]);
     write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: renewed }).await?;
     c1.heartbeat(&hb_of(&view)).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(env.state.networks["n1"].lock().unwrap().sessions[&node].exp > exp_before);
+    assert!(env.state.net("n1").unwrap().lock().unwrap().sessions[&node].exp > exp_before);
     write_msg(&mut c1.tx, Kind::Refresh, &Refresh { credential: r1cred }).await?;
     c1.expect_closed().await;
     Ok(())
@@ -590,7 +584,7 @@ async fn refresh_extends_the_session_but_never_rebinds_it() -> Result<()> {
 #[tokio::test]
 async fn a_restarted_coordinator_collects_before_publishing() -> Result<()> {
     let env = setup().await;
-    env.state.networks["n1"].lock().unwrap().started_at = now_unix(); // grace = 2 × 1 s
+    env.state.net("n1").unwrap().lock().unwrap().started_at = now_unix(); // grace = 2 × 1 s
     let cid = TlsIdentity::generate("c1")?;
     let (cred, _) = join_as(&env, 10, Role::Client, &cid, vec![]);
     let mut c = Member::connect(&env, &cred, &cid, 0).await?;

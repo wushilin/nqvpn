@@ -26,6 +26,9 @@ rustls-pemfile.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rusqlite.workspace = true
+argon2.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,22 +1,30 @@
+# NetQ VPN coordinator. This is the only file: networks, members and
+# their tokens are created in the UI (or the API) and live in the
+# database under state.dir.
+
 [listen]
-api  = "0.0.0.0:8443"       # HTTPS: /api/v1/* and /ui — self-signed certificate
-                            # generated into state.dir unless [tls] is set
-quic = "0.0.0.0:14433"      # QUIC control plane; the port is published to
-                            # members at join, so they only configure the API URL
+api  = "0.0.0.0:8443"        # HTTPS: the UI at /ui, the API at /api/v1/*
+quic = "0.0.0.0:14433"       # QUIC control plane; published to members at join
+# public_url = "https://coord.example.com:8443"   # written into every token;
+                                                  # default: the URL your browser used
 
 [state]
-dir = "/var/lib/nqvpn-coord" # registries, secrets.toml (0600), signing key, cert
-
-# networks_dir = "networks.d"  # one <network_id>.toml per network; relative to
-                               # this file. `nqvpn-coord run --networks DIR` overrides.
+dir = "/var/lib/nqvpn-coord" # nqvpn.db (networks, members, secrets, registries),
+                             # signing key, self-signed certificate
 
 [admin]
-bearer_token = "change-me"  # or bearer_token_file = "/etc/nqvpn/admin-token"
+user = "admin"
+# nqvpn-coord hash-password        (prints an argon2 hash for the password you type)
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$replace-me$replace-me"
+# session_hours = 12
+# bearer_token = "..."            # optional: a static token for scripts (curl)
+# bearer_token_file = "/etc/nqvpn/admin-token"
 
-# Optional: a real certificate for both the API and the control port.
+# Optional: a real certificate for the API and the control port. Without
+# it a self-signed one is generated; members accept it by default.
 # [tls]
 # cert = "/etc/nqvpn/tls/fullchain.pem"
 # key  = "/etc/nqvpn/tls/privkey.pem"
 
 # [limits]
-# join_rate_per_min = 30    # per (member name, source IP)
+# join_rate_per_min = 30          # per (token prefix, source IP)

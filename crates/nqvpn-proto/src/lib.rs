@@ -15,5 +15,6 @@ pub mod quic;
 pub mod rpc;
 pub mod seal;
 pub mod stream;
+pub mod token;
 pub mod transport;
 pub mod types;

@@ -156,7 +156,7 @@ re-attaches to the fleet as published.
 | `nqvpn-endpoint` | Noise engine, ingress filter, TUN, routes as a function of the view with local-LAN/underlay exclusion |
 | `nqvpn-relay` | one `RelayNet` per network (multi-tenant), the one-page forwarding rule, mesh dialers, hop guard, trace notes |
 | `nqvpn-client` | ~500 lines of wiring |
-| `nqvpn-coord` | join by name + secret, leases, directory with generations and a delta ring, HTTPS API, embedded admin UI |
+| `nqvpn-coord` | networks and members in SQLite, join by token, leases, directory with generations and a delta ring, HTTPS API, embedded live admin UI |
 
 Dependencies point strictly downward (`proto ← session ← sync/endpoint ←
 relay/client`; `coord ← proto`), so each crate is reviewable on its own.
@@ -164,84 +164,59 @@ relay/client`; `coord ← proto`), so each crate is reviewable on its own.
 
 ## Quick start
 
-Everything below runs on one machine; `allow_loopback_relays` exists for
-exactly that. Real deployments use public relay addresses.
+Nothing is configured on members. The coordinator holds every network and
+member in its database; a machine gets one **token** and discovers
+everything else — network, name, role, address, routed prefixes, relay
+fleet, MTU — when it joins.
 
-**Coordinator** — `configs/coordinator.toml` + `configs/networks.d/acme-prod.toml`:
+**1. Coordinator** — `configs/coordinator.toml` is the only file:
 
 ```toml
-# coordinator.toml
 [listen]
-api  = "0.0.0.0:8443"       # HTTPS (self-signed unless [tls] is set)
-quic = "0.0.0.0:14433"      # control plane; published to members at join
+api  = "0.0.0.0:8443"        # HTTPS: the UI at /ui, the API at /api/v1/*
+quic = "0.0.0.0:14433"       # control plane; published to members at join
+# public_url = "https://coord.example.com:8443"   # written into every token
 [state]
-dir = "/var/lib/nqvpn-coord"
+dir = "/var/lib/nqvpn-coord" # nqvpn.db, signing key, self-signed certificate
 [admin]
-bearer_token = "change-me"
-```
-
-```toml
-# networks.d/acme-prod.toml
-network_id = "acme-prod"
-cidrs = ["10.99.0.0/16"]
-[pools.default]
-cidr = "10.99.1.0/24"
-
-[relays.home]                       # a member is a name + a secret
-secret = "change-me-home"
-relay_addr = "home.example.com:4444"
-allowed_cidrs = ["192.168.1.0/24"]  # may front this LAN
-preferred_ip4 = "10.99.0.1"
-
-[clients.laptop-1]
-secret = "change-me-laptop"
+user = "admin"
+password_hash = "$argon2id$…" # nqvpn-coord hash-password
 ```
 
 ```sh
+nqvpn-coord hash-password             # paste the output into [admin] password_hash
 nqvpn-coord run --config configs/coordinator.toml
 ```
 
-**Relay** (`configs/relay.toml`; a gateway variant is in `configs/relay-gateway.toml`):
+**2. Open the UI** at `https://coord:8443/ui`, sign in, and follow the
+wizard: *New network* (id, address space, defaults are fine) → *Add
+member*. A relay gets an address to advertise (`auto:4444` means "wherever
+it joins from"), optionally an overlay address and the LANs it routes; a
+client optionally a preferred relay and a fixed address. Every member gets
+a token and a ready-to-paste config.
+
+**3. Members** hold the token and local facts only:
 
 ```toml
-coordinator = "https://coord.example.com:8443"
-listen      = "0.0.0.0:4444"
-relay_addr  = "home.example.com:4444"   # must match the coordinator's entry
-state_dir   = "/var/lib/nqvpn-relay"
-
+# /etc/nqvpn/relay.toml
+listen = "0.0.0.0:4444"      # the port in the relay's address at the coordinator
 [[networks]]
-network_id  = "acme-prod"
-name        = "home"
-secret      = "change-me-home"
-local_cidrs = ["192.168.1.0/24"]        # omit for a pure forwarder
+token = "nqv1.…"             # one entry per network this relay serves
 ```
 
 ```sh
-sudo nqvpn-relay --config configs/relay.toml --status-secs 30
+nqvpn-client --token "nqv1.…"          # or token_file = "…" in /etc/nqvpn/client.toml
 ```
 
-**Client** (`configs/client.toml`):
+Change anything about a member in the UI — its address, the LAN it routes,
+its preferred relay — and it is told to re-join; it applies the change in
+place, without a restart. Regenerate a token and the old one stops
+working immediately; whoever holds it is thrown off and stops.
 
-```toml
-coordinator = "https://coord.example.com:8443"
-network_id  = "acme-prod"
-name        = "laptop-1"
-secret      = "change-me-laptop"
-state_dir   = "/var/lib/nqvpn-client"
-[relay]
-# preferred = "home"                    # omit => lowest RTT
-```
-
-```sh
-sudo nqvpn-client --config configs/client.toml
-sudo nqvpn-client --config configs/client.toml --trace 10.99.0.1   # per-hop relay decisions in the log
-```
-
-Secrets: `nqvpn-coord secret` prints a fresh one; the admin UI at
-`https://coord:8443/ui` shows, regenerates and revokes them per member.
-Members accept the coordinator's self-signed certificate by default
-(`trust_any_cert = true`); set it to `false` and give a `ca` for strict
-verification.
+The UI is a single embedded page (no external assets), responsive, and
+pushed over a WebSocket: topology, traffic matrix, member state and prefix
+ownership update as they happen. `Export` / `Import` move all
+configuration as JSON for backup or version control.
 
 ## Testing philosophy
 
@@ -262,10 +237,13 @@ built around breaking things:
   coordinator link, coordinator restarts (and a coordinator that comes up
   late), a client or relay replaced from another machine (told by the
   coordinator, or by a relay when the coordinator link is down), disable,
-  secret rotation, preferred-relay fallback and return, and a byzantine
-  relay that duplicates, corrupts and drops frames — each asserting that
-  traffic converges without anyone restarting anything by hand, and that a
-  kicked-out instance stops instead of fighting back.
+  token regeneration, preferred-relay fallback and return, a byzantine
+  relay that duplicates, corrupts and drops frames, a member reconfigured
+  live from the coordinator (new address, a LAN added and withdrawn), a
+  relay with an `auto:` address, and a coordinator reloading everything
+  from its database — each asserting that traffic converges without anyone
+  restarting anything by hand, and that a kicked-out instance stops
+  instead of fighting back.
 
 ```sh
 cargo test                      # everything, ~2 minutes

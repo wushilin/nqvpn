@@ -114,8 +114,10 @@ Five rules keep it reviewable:
   configured by anyone. All forwarding uses node ids, never inner IPs;
   people only ever deal in member **names**.
 - **Clients** own exactly their VPN address(es), advertised as /32 and
-  /128. **Relays** may register **local CIDRs** they front, permitted by
-  `allowed_cidrs` in their config entry; a gateway relay may be headless.
+  /128. **Relays** register the **local CIDRs** the operator configured
+  for them at the coordinator; a gateway relay may be headless. Addresses
+  need not lie inside the tunnel CIDRs — a configured one is routed as a
+  host prefix — they only have to be unique and routable.
 - **Route lifecycle — liveness-bound, age-resolved.** Several relays may
   register overlapping CIDRs; for any prefix the **oldest living
   registration wins** and is the only owner pushed. A node going offline
@@ -130,38 +132,57 @@ Five rules keep it reviewable:
 
 ## 3. Coordinator
 
-### 3.1 Networks
+### 3.1 Networks: configuration is the coordinator's
 
-The coordinator hosts N isolated networks (`network_id`), one TOML each
-in `networks.d/`, overlap-validated at load. Per network: tunnel CIDRs,
-named pools (each entirely inside a tunnel CIDR, pairwise disjoint),
-settings, and the member list. Tunnel CIDRs may overlap *across*
-networks — tenants never see each other.
+The coordinator hosts N isolated networks (`network_id`). Every network —
+tunnel CIDRs, named pools (each entirely inside a tunnel CIDR, pairwise
+disjoint), settings, and its members with everything about them — is
+created and edited in the web UI (or the admin API) and kept in one
+SQLite database (`state.dir/nqvpn.db`), together with the registries.
+`coordinator.toml` holds only the process: listen addresses, TLS, the
+database directory, the admin login. Every change is validated as a whole
+network before it is committed; an invalid change leaves the running one
+untouched. Tunnel CIDRs may overlap *across* networks — tenants never see
+each other.
 
-IPAM: a joiner may name a `pool` (`409 pool_exhausted` / `400
-unknown_pool`) and a `preferred_ip4/6` anywhere in the tunnel CIDRs
-(`409 address_in_use` if taken). Assignments are sticky and durable;
-the allocator cycles forward DHCP-style so a freed address is not
-reissued immediately. Relays use the identical mechanism.
+A member's configuration is its *declaration*: address (or pool),
+routed prefixes and advertised address for relays, preferred relay for
+clients, bandwidth cap. Every join applies it in full. When the operator
+changes it, the coordinator closes the member's control session with
+`CLOSE_RECONFIGURED`; the member re-joins at once (no backoff) and
+applies the new facts in place — re-addresses its device, re-announces —
+without a restart. Conflicts (overlapping prefixes, duplicate addresses)
+are refused at edit time, where the operator is.
 
-### 3.2 Security model: name + secret
+IPAM: a configured `pool` (`409 pool_exhausted` / `400 unknown_pool`)
+or a `preferred_ip4/6` (`409 address_in_use` if taken). Assignments are
+sticky and durable; the allocator cycles forward DHCP-style so a freed
+address is not reissued immediately. Relays use the identical mechanism.
+A relay's advertised address may be `auto:<port>`: the address it joined
+from, on that port.
+
+### 3.2 Security model: the token
 
 **A member is a name and a secret. Nothing else authenticates.** The
-name is what people configure, type and see; the 32-bit node id is the
-wire identity, assigned by the coordinator at the member's first join,
-durable for the life of the record, never reused, and never written in
-any config.
+secret is what a machine holds, inside its **token** —
+`nqv1.<base64url(endpoint=https://coord:8443;secret=…)>` — an opaque
+lookup key, not a bearer of configuration: the coordinator maps the
+secret to the member (network, name, role) and to everything the
+operator configured for it. Tokens do not expire; they are regenerated.
+The 32-bit node id is the wire identity, assigned by the coordinator at
+the member's first join, durable for the life of the record, never
+reused, and never written anywhere by a person.
 
-- Join is `POST /api/v1/join` over HTTPS with `{network_id, name,
-  secret, …}`. The coordinator checks the secret and nothing about the
-  machine: there is no pinning, no device lock, no identity rotation.
-  Anyone with the id and secret *is* that node; rotate the secret to
-  evict them.
+- Join is `POST /api/v1/join` over HTTPS with `{secret, pubkey,
+  cert_fingerprint}` — nothing else about the member, because the
+  machine knows nothing else. The coordinator checks the secret and
+  nothing about the machine: there is no pinning, no device lock.
+  Anyone with the token *is* that member; regenerate the token to evict
+  them (immediately: the old holder's next join is refused and every
+  acceptor drops its sessions).
 - Secrets are **generated, never chosen** (32 random bytes) and kept
-  **in the clear** in `secrets.toml` (0600, in the state dir, never in
-  the config that ends up in git) so an operator can show or rotate one
-  at any time. A `secret` written in the network TOML is the fallback; a
-  managed secret for the same member wins.
+  **in the clear** in the database so an operator can show a token again
+  or regenerate it at any time. `Export`/`Import` carry them.
 - Each member auto-generates a TLS certificate and an X25519 key on
   first run. They are internals: recorded at each join, published to the
   network, replaced silently by the next join if the files were lost.
@@ -221,23 +242,31 @@ control plane, so one URL in its config is enough.
 
 ### 3.4 Admin API & web UI
 
-Bearer token (`[admin] bearer_token`). All under `/api/v1/`:
+Admin access is a UI login (`[admin] user` + argon2 `password_hash`,
+session cookie, throttled per address) or a static `bearer_token` for
+scripts. All under `/api/v1/`:
 
 | Route | Purpose |
 |---|---|
+| `POST login` / `POST logout` / `GET me` | UI session |
+| `GET ws` | live feed: every network's status, pushed on each publish and every 2 s |
 | `GET status` | per network: members, relays, online, current `gen` |
+| `POST networks` / `PUT`/`DELETE networks/{id}` / `GET networks/{id}/config` | create, edit (address space, pools, settings), delete, read a network |
 | `GET networks/{id}/status` | members (online, address, routes, attached relay, heartbeat age, `reported_gen` + `digest_ok`, last join from, `login_gen`, replaced from), prefix→owner table, traffic matrix |
-| `POST networks/{id}/members/{node}/disable` \| `enable` | durable flag; disable evicts |
-| `GET`/`POST`/`DELETE networks/{id}/members/{node}/secret` | show / regenerate (previous stops working now) / remove the managed secret |
-| `DELETE networks/{id}/members/{node}` | forget the member (address, routes, secret) |
-| `POST reload` | re-read `networks.d/`; any error leaves the old config running |
+| `POST networks/{id}/members` / `GET`/`PUT`/`DELETE …/members/{name}` | declare a member (returns its token), read, edit (the member re-joins), forget |
+| `GET`/`POST …/members/{name}/token` | show / regenerate (the previous stops working now) |
+| `POST …/members/{name}/disable` \| `enable` \| `reconnect` | durable flag (disable evicts); make it re-join now |
+| `GET export` / `POST import` | all configuration as JSON |
 
 Errors are `{error:{code,message}}` with codes `bad_credentials`
 (unknown id, wrong secret, or unknown network — indistinguishable),
 `client_disabled`, `prefix_conflict`, `address_in_use`, `pool_exhausted`,
 `unknown_pool`, `relay_unreachable`, `bad_request`, `rate_limited`. The
-**web UI** (`/ui`, dependency-free, embedded) is a client of this API
-and speaks in names and secrets; ids appear only as information.
+**web UI** (`/ui`, dependency-free, embedded, responsive, WebSocket-fed)
+is a client of this API: a wizard for networks and members, the token
+for each member with its ready-to-paste config, live topology and traffic
+matrix per network. It speaks in names and tokens; ids appear only as
+information.
 
 ## 4. Control plane: a generation-numbered view
 
@@ -493,100 +522,47 @@ override from the coordinator.
 ### coordinator.toml
 ```toml
 [listen]
-api  = "0.0.0.0:8443"          # HTTPS: /api/v1/* and /ui
+api  = "0.0.0.0:8443"          # HTTPS: /ui and /api/v1/*
 quic = "0.0.0.0:14433"         # QUIC control plane; published to members at join
+# public_url = "https://coord.example.com:8443"   # in every token; default: the browser's URL
 
 # [tls]                        # optional real certificate; unset = self-signed, generated
 # cert = "/etc/nqvpn/tls/fullchain.pem"
 # key  = "/etc/nqvpn/tls/privkey.pem"
 
 [state]
-dir = "/var/lib/nqvpn-coord"   # registries, signing keyring, secrets.toml (0600)
+dir = "/var/lib/nqvpn-coord"   # nqvpn.db (networks, members, secrets, registries), signing keyring
 
 [admin]
-bearer_token = "..."           # or bearer_token_file
+user = "admin"
+password_hash = "$argon2id$…"  # nqvpn-coord hash-password
+# session_hours = 12
+# bearer_token = "..."         # for scripts
 
 [limits]
 join_rate_per_min = 30
 ```
 
-### networks.d/acme-prod.toml
-```toml
-network_id = "acme-prod"
-cidrs = ["10.99.0.0/16", "fd99::/64"]
-
-[pools.default]
-cidr = "10.99.1.0/24"
-[pools.v6]
-cidr = "fd99::1:0/112"
-
-[settings]                     # defaults shown
-credential_ttl_mins = 15
-heartbeat_secs = 5
-offline_after = 3
-hold_down_secs = 60
-mtu = 1350
-relay_reachability = "warn"    # off | warn | deny
-transport = "stream"           # stream | datagram
-lanes = 1
-
-# A member is a name + a secret. A secret minted from the admin
-# API/UI (kept in the state dir) takes precedence over one written here.
-[relays.home]
-secret = "change-me-home"
-relay_addr = "203.0.113.7:4444"
-allowed_cidrs = ["192.168.1.0/24"]
-preferred_ip4 = "10.99.0.1"
-
-[relays.home-backup]           # overlapping CIDR = age-based failover
-secret = "change-me-backup"
-relay_addr = "203.0.113.8:4444"
-allowed_cidrs = ["192.168.1.0/24"]
-
-[clients.laptop-1]
-secret = "change-me-laptop"
-```
+Networks and members are not in any file: they are created in the UI
+and live in the database. `GET /api/v1/export` is their JSON form.
 
 ### relay.toml
 ```toml
-coordinator = "https://coord.example.com:8443"
+listen    = "0.0.0.0:4444"     # one QUIC socket: clients + mesh, every network
+state_dir = "/var/lib/nqvpn-relay"
 # trust_any_cert = true        # default; false + ca = verify
-listen     = "0.0.0.0:4444"    # one QUIC socket: clients + mesh, every network
-relay_addr = "home.example.com:4444"
-state_dir  = "/var/lib/nqvpn-relay"
 
 [limits]
-max_session_mbps = 200         # per attached client; 0 = unlimited
+max_session_mbps = 0           # per attached client; 0 = what the coordinator says
 workers = 0                    # 0 = one per core
 
-[[networks]]                   # any number
-network_id = "acme-prod"
-name = "home"                  # this relay's member name at the coordinator
-secret = "change-me-home"      # or secret_file
-local_cidrs = ["192.168.1.0/24"]   # gateway role; omit for a pure forwarder
-# want_vpn_ip = true
-
-[[networks]]
-network_id = "lab"
-name = "home"
-secret = "..."
-want_vpn_ip = false
+[[networks]]                   # one per network this relay serves
+token_file = "/etc/nqvpn/relay.token"
 ```
 
 ### client.toml
 ```toml
-coordinator = "https://coord.example.com:8443"
-# trust_any_cert = true
-network_id  = "acme-prod"
-name        = "laptop-1"
-secret      = "change-me-laptop"   # or secret_file
-state_dir   = "/var/lib/nqvpn-client"
-
-[relay]
-# preferred = "home"      # relay name; omit => lowest RTT
-
-[address]
-# pool = "default"
-# preferred_ip4 = "10.99.1.50"
-# want_vpn_ip = true
+token_file = "/etc/nqvpn/client.token"   # or: nqvpn-client --token "nqv1.…"
+state_dir  = "/var/lib/nqvpn-client"
+# tun_name = "nqvpn0"
 ```

@@ -7,8 +7,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use crate::control::KeyInfo;
 use crate::types::{NodeId, Role};
 
-fn default_true() -> bool {
-    true
+fn d_role() -> Role {
+    Role::Client
 }
 
 /// A join is the member's **entire current declaration**. Whatever it
@@ -16,30 +16,13 @@ fn default_true() -> bool {
 /// address requests, relay address. Renewal is the same request again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
-    pub network_id: String,
-    /// The member's name, as configured at the coordinator. Names are
-    /// what people use everywhere; the coordinator assigns the wire
-    /// identity (`node_id`) and returns it.
-    pub name: String,
+    /// The member's secret, from its token. The coordinator maps it to
+    /// the member (network, name, role) and to everything the operator
+    /// configured for it; the request carries nothing else about the
+    /// member because the machine does not know anything else.
     pub secret: String,
     /// X25519 public key, base64.
     pub pubkey: String,
-    pub role: Role,
-    /// Defaults to true for both roles (decision #1); headless opt-out.
-    #[serde(default = "default_true")]
-    pub want_vpn_ip: bool,
-    #[serde(default)]
-    pub pool: Option<String>,
-    #[serde(default)]
-    pub preferred_ip4: Option<Ipv4Addr>,
-    #[serde(default)]
-    pub preferred_ip6: Option<Ipv6Addr>,
-    /// Relays only: local CIDRs to register (⊆ allowed_cidrs).
-    #[serde(default)]
-    pub local_cidrs: Vec<IpNet>,
-    /// Relays only: the public address fleet and clients dial.
-    #[serde(default)]
-    pub relay_addr: Option<String>,
     /// SHA-256 of the member's self-signed TLS cert ("sha256:<hex>").
     pub cert_fingerprint: String,
 }
@@ -55,6 +38,11 @@ pub struct RelayEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinResponse {
     pub credential: String,
+    /// Which network and who the member is: the token said nothing.
+    #[serde(default)]
+    pub network_id: String,
+    #[serde(default = "d_role")]
+    pub role: Role,
     pub network_uuid: String,
     pub coordinator_signing_keys: Vec<KeyInfo>,
     pub node_id: NodeId,
@@ -75,6 +63,16 @@ pub struct JoinResponse {
     /// Granted route registrations (relays; empty for clients).
     #[serde(default)]
     pub granted_cidrs: Vec<IpNet>,
+    /// Relays: the address the fleet and clients dial, as the operator
+    /// configured it (resolved when it was "auto:<port>").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_addr: Option<String>,
+    /// Clients: the relay to attach to when reachable (non-binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_relay: Option<String>,
+    /// Relays: per attached-client cap to enforce; 0 = none.
+    #[serde(default)]
+    pub max_session_mbps: u32,
     pub relays: Vec<RelayEntry>,
     pub mtu: u16,
     pub keepalive_secs: u16,

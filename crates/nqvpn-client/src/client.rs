@@ -98,12 +98,13 @@ pub struct Client {
     pub identity: TlsIdentity,
     credential: Mutex<String>,
     routes: Arc<dyn RouteSink>,
-    mine: Vec<ipnet::IpNet>,
+    mine: Mutex<Vec<ipnet::IpNet>>,
     device: String,
     mode: Mode,
     lanes: u8,
     keepalive_secs: u64,
-    preferred_relay: Option<String>,
+    /// Configured at the coordinator; applied at every join.
+    preferred_relay: Mutex<Option<String>>,
     /// While attached to a fallback relay, how often to check whether
     /// the preferred one is reachable again.
     pub prefer_recheck: Mutex<Duration>,
@@ -150,12 +151,12 @@ impl Client {
             identity,
             credential: Mutex::new(joined.credential.clone()),
             routes,
-            mine: hosts,
+            mine: Mutex::new(hosts),
             device,
             mode: Mode::parse(&joined.transport),
             lanes: joined.lanes.max(1),
             keepalive_secs: joined.keepalive_secs.max(1) as u64,
-            preferred_relay,
+            preferred_relay: Mutex::new(preferred_relay.or_else(|| joined.preferred_relay.clone())),
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
             counters: ClientCounters::default(),
@@ -211,7 +212,8 @@ impl Client {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
-            let Some(entry) = choose_relay(&candidates, self.preferred_relay.as_deref(), &self.identity, self.keepalive_secs).await else {
+            let preferred = self.preferred_relay.lock().unwrap().clone();
+            let Some(entry) = choose_relay(&candidates, preferred.as_deref(), &self.identity, self.keepalive_secs).await else {
                 failures = failures.saturating_add(1);
                 let wait = nqvpn_proto::joinapi::retry_delay(false, failures);
                 tracing::warn!(retry_in_secs = wait.as_secs(), "no reachable relay");
@@ -235,8 +237,7 @@ impl Client {
                     let attached_at = std::time::Instant::now();
                     // Preferred but not attached to it: keep checking,
                     // and move as soon as it is reachable again.
-                    let _return_watch = self
-                        .preferred_relay
+                    let _return_watch = preferred
                         .as_deref()
                         .filter(|p| *p != entry.name)
                         .map(|_| AbortGuard(tokio::spawn(self.clone().watch_for_preferred(session.clone()))));
@@ -298,6 +299,9 @@ impl LocalFacts for Client {
 }
 
 impl MemberHooks for Client {
+    /// Every join is the coordinator's current word on who we are:
+    /// credential, address, preferred relay. Applied by diff, so a
+    /// join that changed nothing changes nothing.
     fn joined(&self, r: &JoinResponse) {
         *self.credential.lock().unwrap() = r.credential.clone();
         if let Some(s) = self.uplink.session() {
@@ -307,6 +311,57 @@ impl MemberHooks for Client {
                     tracing::debug!("refreshing uplink: {e}");
                 }
             });
+        }
+        self.apply_facts(r);
+    }
+}
+
+impl Client {
+    /// The addresses this client currently holds (as of its last join).
+    pub fn addresses(&self) -> Vec<ipnet::IpNet> {
+        self.mine.lock().unwrap().clone()
+    }
+
+    pub fn apply_facts(&self, r: &JoinResponse) {
+        let mut hosts = Vec::new();
+        if let Some(ip) = r.ip4 {
+            hosts.push(ipnet::IpNet::from(ipnet::Ipv4Net::new(ip, 32).expect("/32")));
+        }
+        if let Some(ip) = r.ip6 {
+            hosts.push(ipnet::IpNet::from(ipnet::Ipv6Net::new(ip, 128).expect("/128")));
+        }
+        let changed_addr = *self.mine.lock().unwrap() != hosts;
+        if changed_addr {
+            tracing::info!(addresses = ?hosts, "addresses changed at the coordinator; applying");
+            if let Err(e) = self.tun.set_addresses(&hosts) {
+                tracing::warn!("applying new addresses to the TUN: {e:#}");
+            }
+            self.engine.peers.lock().unwrap().set_mine(hosts.clone(), vec![]);
+            *self.mine.lock().unwrap() = hosts;
+        }
+        let mut pref = self.preferred_relay.lock().unwrap();
+        if *pref != r.preferred_relay {
+            tracing::info!(preferred = ?r.preferred_relay, "preferred relay changed at the coordinator");
+            *pref = r.preferred_relay.clone();
+            drop(pref);
+            // Attached somewhere the new preference does not point:
+            // the uplink loop re-evaluates when this session ends.
+            let attached = self.uplink.attached_to.lock().unwrap().clone();
+            let want = self.preferred_relay.lock().unwrap().clone();
+            if let (Some(a), Some(w)) = (attached, want) {
+                if a.name != w {
+                    if let Some(s) = self.uplink.session() {
+                        s.close(CLOSE_EVICTED, "preferred relay changed");
+                    }
+                }
+            }
+        } else {
+            drop(pref);
+        }
+        if changed_addr {
+            let view = self.view.get();
+            self.reconcile_view(&view);
+            self.link.kick();
         }
     }
 }
@@ -324,7 +379,14 @@ pub struct ClientReconciler(pub Arc<Client>);
 
 impl Reconcile for ClientReconciler {
     fn reconcile(&self, view: &Snapshot) {
-        let c = &self.0;
+        self.0.reconcile_view(view)
+    }
+}
+
+impl Client {
+    /// Peers, routes and the uplink, reconciled against the view.
+    pub fn reconcile_view(&self, view: &Snapshot) {
+        let c = self;
         {
             let mut peers = c.engine.peers.lock().unwrap();
             // A peer whose key changed must not keep using the old session.
@@ -343,7 +405,8 @@ impl Reconcile for ClientReconciler {
                 sessions.remove(id);
             }
         }
-        let wanted = wanted_routes(view, c.node_id, &c.mine);
+        let mine = c.mine.lock().unwrap().clone();
+        let wanted = wanted_routes(view, c.node_id, &mine);
         let local = nqvpn_endpoint::ifaces::local_prefixes(&c.device);
         let mut underlay = c.underlay.lock().unwrap().clone();
         // Relay addresses from the view, resolved once per address.
@@ -392,7 +455,7 @@ impl Client {
     /// Attached to a fallback while a preferred relay is named: go back
     /// to it once it answers. Preference is non-binding either way.
     async fn watch_for_preferred(self: Arc<Self>, session: Arc<Session>) {
-        let Some(name) = self.preferred_relay.clone() else { return };
+        let Some(name) = self.preferred_relay.lock().unwrap().clone() else { return };
         loop {
             let every = *self.prefer_recheck.lock().unwrap();
             tokio::time::sleep(every).await;

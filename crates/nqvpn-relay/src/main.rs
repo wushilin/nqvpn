@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nqvpn_relay::config::{NetworkCfg, RelayConfig};
+use nqvpn_relay::config::RelayConfig;
 use nqvpn_relay::endpoint::LocalEndpoint;
 use nqvpn_relay::net::{Fleet, RelayNet};
 
@@ -56,7 +56,27 @@ impl nqvpn_sync::link::MemberHooks for Hooks {
     fn joined(&self, r: &nqvpn_proto::api::JoinResponse) {
         self.net.set_credential(&r.credential);
         self.net.set_signing_keys(&r.coordinator_signing_keys);
+        // Facts the operator may have changed since the last join.
+        let hosts = host_prefixes(r);
+        match self.net.endpoint() {
+            Some(ep) => ep.set_facts(hosts, r.granted_cidrs.clone()),
+            None if !hosts.is_empty() || !r.granted_cidrs.is_empty() => {
+                tracing::warn!(network = %r.network_id, "this relay now has an endpoint role (an address or LAN prefixes); restart it to activate");
+            }
+            None => {}
+        }
     }
+}
+
+fn host_prefixes(r: &nqvpn_proto::api::JoinResponse) -> Vec<ipnet::IpNet> {
+    let mut hosts = Vec::new();
+    if let Some(ip) = r.ip4 {
+        hosts.push(ipnet::IpNet::from(ipnet::Ipv4Net::new(ip, 32).expect("/32")));
+    }
+    if let Some(ip) = r.ip6 {
+        hosts.push(ipnet::IpNet::from(ipnet::Ipv6Net::new(ip, 128).expect("/128")));
+    }
+    hosts
 }
 
 async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
@@ -78,40 +98,49 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
 
     let mut nets: HashMap<String, Arc<RelayNet>> = HashMap::new();
     let mut guards = Vec::new();
-    for ncfg in &cfg.networks {
-        let member = Arc::new(member_config(&cfg, ncfg)?);
+    for (i, ncfg) in cfg.networks.iter().enumerate() {
+        let member = Arc::new(MemberConfig::from_token(&ncfg.token()?, cfg.tls()));
         let joined = match nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await {
             Ok(j) => j,
             Err(e) => {
-                tracing::error!(network = %ncfg.network_id, "not joining: {e}");
+                tracing::error!(token = i, "not joining: {e}");
                 return Ok(nqvpn_sync::EXIT_REFUSED);
             }
         };
-        tracing::info!(network = %ncfg.network_id, node_id = joined.node_id, relays = joined.relays.len(), "joined");
+        if joined.role != Role::Relay {
+            tracing::error!(network = %joined.network_id, name = %joined.name, "this token belongs to a {} member, not a relay", joined.role);
+            return Ok(nqvpn_sync::EXIT_REFUSED);
+        }
+        let network_id = joined.network_id.clone();
+        tracing::info!(network = %network_id, name = %joined.name, node_id = joined.node_id, relay_addr = ?joined.relay_addr, relays = joined.relays.len(), "joined");
+        if let Some(addr) = &joined.relay_addr {
+            let advertised_port = addr.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+            if advertised_port.is_some() && advertised_port != Some(listen.port()) {
+                tracing::warn!(advertised = %addr, %listen, "the coordinator advertises a different port than this relay listens on");
+            }
+        }
+        if nets.contains_key(&network_id) {
+            anyhow::bail!("two tokens for network {network_id}");
+        }
 
+        let cap = if cfg.limits.max_session_mbps > 0 { cfg.limits.max_session_mbps } else { joined.max_session_mbps };
         let net = RelayNet::new(
-            ncfg.network_id.clone(),
+            network_id.clone(),
             joined.network_uuid.clone(),
             joined.node_id,
             identity.clone(),
             joined.credential.clone(),
             Mode::parse(&joined.transport),
             joined.lanes.max(1),
-            cfg.limits.max_session_mbps,
+            cap,
             joined.keepalive_secs.max(1) as u64,
         );
         net.set_signing_keys(&joined.coordinator_signing_keys);
 
         // Endpoint role: an address, or a LAN to front.
-        let mut hosts = Vec::new();
-        if let Some(ip) = joined.ip4 {
-            hosts.push(ipnet::IpNet::from(ipnet::Ipv4Net::new(ip, 32).expect("/32")));
-        }
-        if let Some(ip) = joined.ip6 {
-            hosts.push(ipnet::IpNet::from(ipnet::Ipv6Net::new(ip, 128).expect("/128")));
-        }
+        let hosts = host_prefixes(&joined);
         if !hosts.is_empty() || !joined.granted_cidrs.is_empty() {
-            guards.push(nqvpn_endpoint::endpoint_guard::EndpointGuard::acquire(&ncfg.network_id, &format!("relay node {}", joined.node_id))?);
+            guards.push(nqvpn_endpoint::endpoint_guard::EndpointGuard::acquire(&network_id, &format!("relay node {}", joined.node_id))?);
             let tun: Arc<dyn nqvpn_endpoint::tun::TunDevice> = {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
@@ -147,14 +176,14 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
             ep.bind(net.clone());
             ep.spawn_pumps();
             net.set_endpoint(ep);
-            tracing::info!(network = %ncfg.network_id, addresses = ?hosts, gateway_cidrs = ?joined.granted_cidrs, "endpoint role active");
+            tracing::info!(network = %network_id, addresses = ?hosts, gateway_cidrs = ?joined.granted_cidrs, "endpoint role active");
         } else {
-            tracing::info!(network = %ncfg.network_id, "pure forwarder: no address, no gateway prefixes, no TUN");
+            tracing::info!(network = %network_id, "pure forwarder: no address, no gateway prefixes, no TUN");
         }
 
         nqvpn_sync::spawn_reconciler(net.view.clone(), Arc::new(nqvpn_relay::net::NetReconciler(net.clone())), Duration::from_secs(20));
         tokio::spawn({
-            let (exit_tx, network_id) = (exit_tx.clone(), ncfg.network_id.clone());
+            let (exit_tx, network_id) = (exit_tx.clone(), network_id.clone());
             let member_loop = nqvpn_sync::run_member(
                 member,
                 identity.clone(),
@@ -170,7 +199,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 let _ = exit_tx.send((network_id, exit)).await;
             }
         });
-        nets.insert(ncfg.network_id.clone(), net);
+        nets.insert(network_id, net);
     }
 
     let fleet = Arc::new(Fleet { nets: nets.clone() });
@@ -209,23 +238,6 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
         }
         None => std::future::pending().await,
     }
-}
-
-fn member_config(cfg: &RelayConfig, n: &NetworkCfg) -> Result<MemberConfig> {
-    Ok(MemberConfig {
-        coordinator: cfg.coordinator.clone(),
-        network_id: n.network_id.clone(),
-        name: n.name.clone(),
-        secret: n.secret()?,
-        tls: cfg.tls(),
-        role: Role::Relay,
-        want_vpn_ip: n.want_vpn_ip,
-        pool: n.pool.clone(),
-        preferred_ip4: n.preferred_ip4,
-        preferred_ip6: n.preferred_ip6,
-        local_cidrs: n.local_cidrs.clone(),
-        relay_addr: Some(cfg.relay_addr.clone()),
-    })
 }
 
 /// A QUIC connection to ourselves, used only as a channel the endpoint

@@ -6,12 +6,14 @@
 
 use anyhow::Result;
 use nqvpn_client::client::{Client, ClientReconciler};
-use nqvpn_coord::config::{load_networks, CoordConfig};
+use nqvpn_coord::admin::MemberSpec;
+use nqvpn_coord::config::{CoordConfig, NetworkConfig};
+use nqvpn_coord::db::Db;
 use nqvpn_coord::registry::Registry;
 use nqvpn_coord::signer::Keyring;
 use nqvpn_coord::state::{now_unix, AppState, NetState};
 use nqvpn_endpoint::routes::{RecordingProgrammer, RouteSet};
-use nqvpn_endpoint::tun::FakeTun;
+use nqvpn_endpoint::tun::{FakeTun, TunDevice};
 use nqvpn_proto::api::JoinResponse;
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::seal::StaticKeys;
@@ -42,12 +44,17 @@ fn net_toml(relays: &[(NodeId, u16)], clients: &[NodeId]) -> String {
          [settings]\nheartbeat_secs = 1\noffline_after = 3\nhold_down_secs = 0\nallow_loopback_relays = true\ntransport = \"datagram\"\n"
     );
     for (id, p) in relays {
-        s.push_str(&format!("[relays.r{id}]\nsecret = \"{SECRET}\"\nrelay_addr = \"127.0.0.1:{p}\"\n"));
+        s.push_str(&format!("[relays.r{id}]\nsecret = \"{}\"\nrelay_addr = \"127.0.0.1:{p}\"\nwant_vpn_ip = false\n", secret_of(&format!("r{id}"))));
     }
     for id in clients {
-        s.push_str(&format!("[clients.c{id}]\nsecret = \"{SECRET}\"\n"));
+        s.push_str(&format!("[clients.c{id}]\nsecret = \"{}\"\n", secret_of(&format!("c{id}"))));
     }
     s
+}
+
+/// The secret is the lookup key, so every member has its own.
+fn secret_of(name: &str) -> String {
+    format!("{SECRET}-{name}")
 }
 
 struct Coord {
@@ -65,32 +72,28 @@ impl Coord {
                 .with_test_writer()
                 .try_init();
         });
-        let netd = dir.join("networks.d");
-        std::fs::create_dir_all(&netd).unwrap();
-        std::fs::write(netd.join(format!("{NET}.toml")), toml).unwrap();
-        let cfgs = load_networks(&netd).unwrap();
+        // The database is the coordinator's memory across restarts: the
+        // network is seeded into it once, and a restart reloads it.
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        nqvpn_coord::config::validate_network(&cfg).unwrap();
         let coord: CoordConfig = toml::from_str(&format!(
             "[listen]\napi = \"127.0.0.1:{api_port}\"\nquic = \"127.0.0.1:{quic_port}\"\n[state]\ndir = \"{}\"\n",
             dir.display()
         ))
         .unwrap();
         let keyring = Keyring::load_or_create(&dir.join("signing.json"), now_unix()).unwrap();
-        let mut networks = HashMap::new();
-        for cfg in cfgs {
-            let path = dir.join(format!("registry-{}.json", cfg.network_id));
-            networks.insert(cfg.network_id.clone(), Mutex::new(NetState::new(cfg, Registry::load_or_create(&path).unwrap(), path)));
+        let db = Arc::new(Db::open(&dir.join("nqvpn.db")).unwrap());
+        let state = Arc::new(AppState::new(coord, Some("tok".into()), keyring, db.clone(), quic_port));
+        let loaded = db.load_all().unwrap();
+        if loaded.is_empty() {
+            let reg = Registry::new();
+            db.save_network_and_registry(&cfg, &reg).unwrap();
+            state.add_network(cfg, reg);
+        } else {
+            for (cfg, reg) in loaded {
+                state.add_network(cfg, reg);
+            }
         }
-        let state = Arc::new(AppState {
-            coord,
-            admin_token: Some("tok".into()),
-            networks,
-            keyring,
-            join_rate: Mutex::new(Default::default()),
-            networks_dir: Some(netd),
-            secrets: Mutex::new(nqvpn_coord::secrets::SecretStore::default()),
-            secrets_path: dir.join("secrets.toml"),
-            control_port: quic_port,
-        });
         let identity = TlsIdentity::generate("coord").unwrap();
         let mut tasks = Vec::new();
         let ep = nqvpn_coord::control::bind(format!("127.0.0.1:{quic_port}").parse().unwrap(), &identity).unwrap();
@@ -113,7 +116,7 @@ impl Coord {
         for t in self.tasks {
             t.abort();
         }
-        for net in self.state.networks.values() {
+        for (_, net) in self.state.nets() {
             let ns = net.lock().unwrap();
             for s in ns.sessions.values() {
                 s.conn.close(0u32.into(), b"coordinator stopping");
@@ -121,38 +124,41 @@ impl Coord {
         }
     }
 
+    fn net(&self) -> Arc<Mutex<NetState>> {
+        self.state.net(NET).expect("the test network")
+    }
+
     fn attachment_of(&self, node: NodeId) -> Option<NodeId> {
-        self.state.networks[NET].lock().unwrap().directory.published.attachment_of(node)
+        self.net().lock().unwrap().directory.published.attachment_of(node)
     }
 
     fn online(&self, node: NodeId) -> bool {
-        self.state.networks[NET].lock().unwrap().leases.is_online(node)
+        self.net().lock().unwrap().leases.is_online(node)
     }
 
     fn gen(&self) -> u64 {
-        self.state.networks[NET].lock().unwrap().directory.gen
+        self.net().lock().unwrap().directory.gen
+    }
+
+    /// Edit a member as the UI would.
+    fn configure(&self, name: &str, f: impl FnOnce(&mut MemberSpec)) {
+        let mut spec = {
+            let net = self.net();
+            let ns = net.lock().unwrap();
+            MemberSpec::from_cfg(ns.cfg.member_by_name(name).expect("configured member").0)
+        };
+        f(&mut spec);
+        self.state.update_member(NET, name, &spec).expect("valid change");
     }
 }
 
-fn member(coord_url: &str, node_id: NodeId, role: Role, relay_addr: Option<String>) -> Arc<MemberConfig> {
+/// What a machine holds: the coordinator and its secret (its token).
+fn member(coord_url: &str, node_id: NodeId, role: Role) -> Arc<MemberConfig> {
     let name = match role {
         Role::Relay => format!("r{node_id}"),
         Role::Client => format!("c{node_id}"),
     };
-    Arc::new(MemberConfig {
-        coordinator: coord_url.to_string(),
-        network_id: NET.into(),
-        name,
-        secret: SECRET.into(),
-        tls: nqvpn_proto::joinapi::JoinTls::default(),
-        role,
-        want_vpn_ip: role == Role::Client,
-        pool: None,
-        preferred_ip4: None,
-        preferred_ip6: None,
-        local_cidrs: vec![],
-        relay_addr,
-    })
+    Arc::new(MemberConfig { coordinator: coord_url.to_string(), secret: secret_of(&name), tls: nqvpn_proto::joinapi::JoinTls::default() })
 }
 
 async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
@@ -184,7 +190,7 @@ impl RelayHandle {
     async fn start(coord_url: &str, node_id: NodeId, listen_port: u16) -> RelayHandle {
         let identity = TlsIdentity::generate(&format!("relay{node_id}")).unwrap();
         let keys = StaticKeys::generate().unwrap();
-        let cfg = member(coord_url, node_id, Role::Relay, Some(format!("127.0.0.1:{listen_port}")));
+        let cfg = member(coord_url, node_id, Role::Relay);
         let endpoint = quinn::Endpoint::server(
             nqvpn_proto::quic::server_config(&identity, 1).unwrap(),
             format!("127.0.0.1:{listen_port}").parse().unwrap(),
@@ -241,6 +247,7 @@ impl RelayHandle {
     }
 
     /// Crash: everything stops, all sessions die.
+    #[allow(dead_code)]
     fn kill(self) {
         for t in self.tasks {
             t.abort();
@@ -255,7 +262,7 @@ impl RelayHandle {
 struct ClientHandle {
     client: Arc<Client>,
     tun: Arc<FakeTun>,
-    ip4: Ipv4Addr,
+    routes: Arc<RouteSet<RecordingProgrammer>>,
     node_id: NodeId,
     /// Pumps and reconciler; they end with the handle.
     _tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -267,28 +274,40 @@ struct ClientHandle {
 
 impl ClientHandle {
     async fn start(coord_url: &str, node_id: NodeId) -> ClientHandle {
-        Self::start_preferring(coord_url, node_id, None).await
+        Self::start_inner(coord_url, node_id).await
     }
 
-    /// With a preferred relay (by name). The preference is re-checked
-    /// every 2 s here (30 s in production).
-    async fn start_preferring(coord_url: &str, node_id: NodeId, preferred: Option<&str>) -> ClientHandle {
+    /// With a preferred relay, configured at the coordinator as the UI
+    /// would. The preference is re-checked every 2 s here (30 s in
+    /// production).
+    async fn start_preferring(w: &World, node_id: NodeId, preferred: Option<&str>) -> ClientHandle {
+        w.coord().configure(&format!("c{node_id}"), |s| s.preferred_relay = preferred.map(str::to_string));
+        Self::start_inner(&w.url(), node_id).await
+    }
+
+    async fn start_inner(coord_url: &str, node_id: NodeId) -> ClientHandle {
+        Self::start_with_secret(coord_url, node_id, &secret_of(&format!("c{node_id}"))).await
+    }
+
+    /// With a specific token secret (after a rotation).
+    async fn start_with_secret(coord_url: &str, node_id: NodeId, secret: &str) -> ClientHandle {
         let identity = TlsIdentity::generate(&format!("client{node_id}")).unwrap();
         let keys = StaticKeys::generate().unwrap();
-        let cfg = member(coord_url, node_id, Role::Client, None);
+        let mut m = (*member(coord_url, node_id, Role::Client)).clone();
+        m.secret = secret.to_string();
+        let cfg = Arc::new(m);
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, preferred.map(str::to_string));
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None);
         *client.prefer_recheck.lock().unwrap() = Duration::from_secs(2);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
             tokio::spawn(client.clone().run_uplink()),
         ];
-        let ip4 = joined.ip4.expect("address");
         let node_id = joined.node_id;
-        let mut h = ClientHandle { client, tun, ip4, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
+        let mut h = ClientHandle { client, tun, routes, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
         h.start_sync(joined);
         h
     }
@@ -323,6 +342,18 @@ impl ClientHandle {
         self.client.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id)
     }
 
+    /// The client's current IPv4 address, as of its latest join.
+    fn ip4(&self) -> Ipv4Addr {
+        self.client
+            .addresses()
+            .iter()
+            .find_map(|n| match n {
+                ipnet::IpNet::V4(v) => Some(v.addr()),
+                _ => None,
+            })
+            .expect("client has an address")
+    }
+
     /// Set once this instance learned it was kicked out. A real process
     /// exits with `exit.exit_code()` at that point.
     fn stop_reason(&self) -> Option<MemberExit> {
@@ -354,7 +385,7 @@ fn v4_packet(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
 async fn ping(a: &ClientHandle, b: &ClientHandle, timeout: Duration) -> bool {
     static SEQ: AtomicU16 = AtomicU16::new(0);
     let tag = format!("ping-{}-{}-{}", a.node_id, b.node_id, SEQ.fetch_add(1, Ordering::Relaxed));
-    let pkt = v4_packet(a.ip4, b.ip4, tag.as_bytes());
+    let pkt = v4_packet(a.ip4(), b.ip4(), tag.as_bytes());
     let deadline = std::time::Instant::now() + timeout;
     loop {
         a.tun.inject(pkt.clone()).await;
@@ -407,7 +438,7 @@ impl World {
         let toml = net_toml(&relay_ports, clients);
         let coord = Coord::start(dir.path(), api_port, quic_port, &toml).await;
         // Skip the restart grace for the first start.
-        coord.state.networks[NET].lock().unwrap().started_at = 0;
+        coord.net().lock().unwrap().started_at = 0;
         (World { dir, coord: Some(coord), api_port, quic_port, toml }, relay_ports)
     }
 
@@ -603,13 +634,7 @@ async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
 
     let ends_before = a.uplink_ends();
-    {
-        let mut ns = w.coord().state.networks[NET].lock().unwrap();
-        ns.registry.members.get_mut(&a.node_id).unwrap().disabled = true;
-        ns.close_session(a.node_id, "disabled");
-        ns.leases.remove(a.node_id);
-        w.coord().state.publish(&mut ns);
-    }
+    w.coord().state.set_disabled(NET, "c10", true).unwrap();
     wait_until("a loses its uplink", Duration::from_secs(15), || a.uplink_ends() > ends_before).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!ping(&a, &b, Duration::from_secs(3)).await, "disabled member must not reach anyone");
@@ -663,25 +688,25 @@ impl ClientHandle {
     /// Restart the same member on the same machine (same keys): rejoin,
     /// new uplink, no replacement.
     async fn restart(self, coord_url: &str) -> ClientHandle {
-        let (identity, keys, name) = (self.identity.clone(), self.keys.clone(), self.cfg.name.clone());
-        self.kill();
-        let cfg = Arc::new(MemberConfig { name, ..(*member(coord_url, 0, Role::Client, None)).clone() });
+        let (identity, keys) = (self.identity.clone(), self.keys.clone());
+        // Same machine: same keys, same token.
+        let cfg = Arc::new(MemberConfig { coordinator: coord_url.to_string(), ..(*self.cfg).clone() });
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, None);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
             tokio::spawn(client.clone().run_uplink()),
         ];
-        let ip4 = joined.ip4.expect("address");
         let node_id = joined.node_id;
-        let mut h = ClientHandle { client, tun, ip4, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
+        let mut h = ClientHandle { client, tun, routes, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
         h.start_sync(joined);
         h
     }
 
+    #[allow(dead_code)]
     fn kill(self) {
         for t in self._tasks {
             t.abort();
@@ -725,13 +750,13 @@ async fn a_client_restart_on_the_same_machine_keeps_its_identity() -> Result<()>
     let a = ClientHandle::start(&w.url(), 10).await;
     let b = ClientHandle::start(&w.url(), 20).await;
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
-    let (id, ip) = (a.node_id, a.ip4);
-    let login_gen_before = w.coord().state.networks[NET].lock().unwrap().registry.members[&id].login_gen;
+    let (id, ip) = (a.node_id, a.ip4());
+    let login_gen_before = w.coord().net().lock().unwrap().registry.members[&id].login_gen;
 
     let a = a.restart(&w.url()).await;
     assert_eq!(a.node_id, id, "same name, same wire identity");
-    assert_eq!(a.ip4, ip, "same address");
-    let login_gen_after = w.coord().state.networks[NET].lock().unwrap().registry.members[&id].login_gen;
+    assert_eq!(a.ip4(), ip, "same address");
+    let login_gen_after = w.coord().net().lock().unwrap().registry.members[&id].login_gen;
     assert_eq!(login_gen_after, login_gen_before, "same keys: not a replacement");
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
     Ok(())
@@ -797,34 +822,22 @@ async fn nine_clients_three_relays_all_reach_each_other() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rotating_a_secret_evicts_the_holder_of_the_old_one_at_expiry() -> Result<()> {
-    // credential_ttl_mins is a whole-minute setting; with a 1-minute TTL the
-    // member renews at 40 s, is refused, and every session ends at 60 s.
-    let (w, rp) = World::new_with_ttl(&[1], &[10, 20], 1).await;
+async fn rotating_a_token_throws_the_old_holder_out_at_once() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
     let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
     let a = ClientHandle::start(&w.url(), 10).await;
     let b = ClientHandle::start(&w.url(), 20).await;
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
 
-    // Rotate a's secret: the running instance never learns the new one.
-    w.coord().state.secrets.lock().unwrap().mint(NET, "c10", 0);
-    let ends_before = a.uplink_ends();
-    wait_until("a's sessions end at credential expiry", Duration::from_secs(90), || a.uplink_ends() > ends_before && a.attached_to().is_none()).await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Rotate a's token: the running instance holds the old secret.
+    let new_secret = w.coord().state.rotate_member(NET, "c10").unwrap();
+    wait_until("the old holder is thrown out and stops", Duration::from_secs(15), || a.stop_reason().is_some() && a.attached_to().is_none()).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!ping(&a, &b, Duration::from_secs(3)).await, "the old secret's holder is out");
+    // A machine with the new token is that member again.
+    let a2 = ClientHandle::start_with_secret(&w.url(), 10, &new_secret).await;
+    all_pairs_reach(&[&a2, &b], Duration::from_secs(20)).await?;
     Ok(())
-}
-
-impl World {
-    async fn new_with_ttl(relays: &[NodeId], clients: &[NodeId], ttl_mins: u64) -> (World, Vec<(NodeId, u16)>) {
-        let dir = tempfile::tempdir().unwrap();
-        let (api_port, quic_port) = (port(), port());
-        let relay_ports: Vec<(NodeId, u16)> = relays.iter().map(|r| (*r, port())).collect();
-        let toml = net_toml(&relay_ports, clients).replace("[settings]\n", &format!("[settings]\ncredential_ttl_mins = {ttl_mins}\n"));
-        let coord = Coord::start(dir.path(), api_port, quic_port, &toml).await;
-        coord.state.networks[NET].lock().unwrap().started_at = 0;
-        (World { dir, coord: Some(coord), api_port, quic_port, toml }, relay_ports)
-    }
 }
 
 // ---- Kicked out: learn why, stop, never fight back ----
@@ -843,7 +856,10 @@ async fn a_relay_replaced_from_elsewhere_stops_and_its_clients_move() -> Result<
     // old process was never stopped and is still up and answering.
     let new_port = port();
     {
-        let mut ns = w.coord().state.networks[NET].lock().unwrap();
+        // Straight into the config, without the "re-join now" the UI
+        // path would send: the old process must not be told anything.
+        let net = w.coord().net();
+        let mut ns = net.lock().unwrap();
         ns.cfg.relays.get_mut("r1").unwrap().relay_addr = Some(format!("127.0.0.1:{new_port}"));
     }
     let r1b = RelayHandle::start(&w.url(), 1, new_port).await;
@@ -896,12 +912,15 @@ async fn a_preferred_relay_is_used_when_available_and_not_required() -> Result<(
     let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
     // r2 is configured but not running yet.
     let b = ClientHandle::start(&w.url(), 20).await;
-    let a = ClientHandle::start_preferring(&w.url(), 10, Some("r2")).await;
+    let a = ClientHandle::start_preferring(&w, 10, Some("r2")).await;
     // A preferred relay that does not exist at all is no different.
-    let c = ClientHandle::start_preferring(&w.url(), 30, Some("nope")).await;
+    let c = ClientHandle::start_preferring(&w, 30, None).await;
     all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
     assert_eq!(a.attached_to(), Some(r1.node_id), "falls back while the preferred relay is absent");
-    assert_eq!(c.attached_to(), Some(r1.node_id), "an unknown preference is ignored");
+    assert_eq!(c.attached_to(), Some(r1.node_id), "no preference: lowest RTT, which is the only relay");
+    // A preference for something that is not a relay cannot even be configured.
+    let bad = MemberSpec { preferred_relay: Some("nope".into()), ..Default::default() };
+    assert!(w.coord().state.update_member(NET, "c30", &bad).is_err());
 
     // The preferred relay shows up: a moves to it without being told.
     let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
@@ -957,5 +976,82 @@ async fn members_are_back_within_seconds_of_a_coordinator_restart() -> Result<()
     let up = std::time::Instant::now();
     wait_until("both back", Duration::from_secs(15), || w.coord().online(r1.node_id) && w.coord().online(a.node_id)).await?;
     assert!(up.elapsed() < Duration::from_secs(10), "reconnect took {:?}", up.elapsed());
+    Ok(())
+}
+
+// ---- Configuration lives at the coordinator; a change is applied live ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn editing_a_member_at_the_coordinator_reconfigures_it_live() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    let old_ip = a.ip4();
+
+    // A new address for a, outside the tunnel cidrs even. The
+    // coordinator tells a to re-join; a applies it to its device, and
+    // everyone routes the new host prefix.
+    let new_ip: Ipv4Addr = "172.20.0.7".parse().unwrap();
+    w.coord().configure("c10", |s| s.preferred_ip4 = Some(new_ip));
+    wait_until("a carries its new address", Duration::from_secs(15), || a.ip4() == new_ip).await?;
+    assert_eq!(a.tun.addresses(), vec![ipnet::IpNet::from(ipnet::Ipv4Net::new(new_ip, 32).unwrap())]);
+    wait_until("b routes a's new address", Duration::from_secs(15), || {
+        b.routes.installed().iter().any(|n| n.to_string() == "172.20.0.7/32")
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    assert!(!b.routes.installed().iter().any(|n| n.to_string() == format!("{old_ip}/32")), "the old address is gone");
+
+    // The relay starts fronting a LAN: every client learns the route.
+    w.coord().configure("r1", |s| s.local_cidrs = vec!["100.64.77.0/24".parse().unwrap()]);
+    wait_until("clients route the relay's LAN", Duration::from_secs(15), || {
+        [&a, &b].iter().all(|c| c.routes.installed().iter().any(|n| n.to_string() == "100.64.77.0/24"))
+    })
+    .await?;
+    // And stops: the route is withdrawn.
+    w.coord().configure("r1", |s| s.local_cidrs.clear());
+    wait_until("the route is withdrawn", Duration::from_secs(15), || {
+        [&a, &b].iter().all(|c| !c.routes.installed().iter().any(|n| n.to_string() == "100.64.77.0/24"))
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    assert!(a.stop_reason().is_none() && b.stop_reason().is_none(), "reconfiguration is not a kick-out");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_with_an_auto_address_is_dialed_where_it_joined_from() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    w.coord().configure("r1", |s| s.relay_addr = Some(format!("auto:{}", rp[0].1)));
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    assert_eq!(a.attached_to(), Some(r1.node_id));
+    let fleet = w.coord().net().lock().unwrap().directory.published.relays.clone();
+    assert_eq!(fleet[0].addr, format!("127.0.0.1:{}", rp[0].1), "resolved from the join's source address");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_coordinator_reloads_everything_from_its_database() -> Result<()> {
+    let (mut w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    // A member created in the UI, with a token, before the restart.
+    let secret = w.coord().state.create_member(NET, "c30", Role::Client, &MemberSpec::default()).unwrap();
+    let ip_a = a.ip4();
+
+    w.restart_coordinator().await;
+    // Members, addresses, secrets and node ids all came back from the
+    // database: the same identities, and the new member's token works.
+    wait_until("members reconnect", Duration::from_secs(15), || w.coord().online(a.node_id) && w.coord().online(b.node_id)).await?;
+    assert_eq!(a.ip4(), ip_a);
+    let c = ClientHandle::start_with_secret(&w.url(), 30, &secret).await;
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
     Ok(())
 }

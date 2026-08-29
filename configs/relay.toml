@@ -1,20 +1,19 @@
-# A pure forwarding relay: no address, no LAN, no TUN — it only carries
-# other members' traffic. Run as any user that may bind the port.
+# NetQ VPN relay. Everything about this relay's place in a network —
+# its advertised address, overlay address, the LANs it routes — is
+# configured at the coordinator and handed down at join. This file holds
+# only local facts and the token.
 
-coordinator = "https://coord.example.com:8443"
-# trust_any_cert = true             # default; false + ca = strict verification
+listen    = "0.0.0.0:4444"        # the port in this relay's address at the coordinator
+state_dir = "/var/lib/nqvpn-relay"
+# tun_name = "nqvpn0"             # only used when the relay has an endpoint role
+# trust_any_cert = true           # default; set false to verify the coordinator's cert
 # ca = "/etc/nqvpn/coord-ca.pem"
 
-listen     = "0.0.0.0:4444"         # one QUIC socket: clients + mesh
-relay_addr = "cloud.example.com:4444"   # what the coordinator's entry says
-state_dir  = "/var/lib/nqvpn-relay" # auto-generated cert + key; safe to delete
-
 [limits]
-max_session_mbps = 0                # per attached client; 0 = unlimited
-workers = 0                         # tokio threads; 0 = one per core
+# max_session_mbps = 0            # per attached client; 0 = what the coordinator says
+# workers = 0                     # tokio threads; 0 = one per core
 
-[[networks]]                        # a relay may serve several networks
-network_id  = "acme-prod"
-name        = "cloud"
-secret      = "change-me-cloud"     # or secret_file = "/etc/nqvpn/cloud.secret"
-want_vpn_ip = false                 # pure forwarder
+# One entry per network this relay serves; paste the token from the UI.
+[[networks]]
+token_file = "/etc/nqvpn/relay.token"
+# token = "nqv1.…"

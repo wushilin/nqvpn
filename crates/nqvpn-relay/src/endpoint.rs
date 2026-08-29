@@ -22,7 +22,7 @@ pub struct LocalEndpoint {
     pub tun: Arc<dyn TunDevice>,
     pub uplink: Arc<SelfUplink>,
     routes: Arc<dyn RouteSink>,
-    mine: Vec<ipnet::IpNet>,
+    mine: Mutex<Vec<ipnet::IpNet>>,
     /// Resolved relay addresses, so their routes are never captured.
     underlay: Mutex<HashMap<String, Vec<IpAddr>>>,
     device: String,
@@ -91,10 +91,21 @@ impl LocalEndpoint {
             tun,
             uplink: SelfUplink::new(loopback),
             routes,
-            mine: hosts.into_iter().chain(nets).collect(),
+            mine: Mutex::new(hosts.into_iter().chain(nets).collect()),
             underlay: Mutex::new(HashMap::new()),
             device,
         })
+    }
+
+    /// A re-join brought new facts: our addresses and the LANs we
+    /// front. Applied to the device, the ingress filter, and the
+    /// route exclusion set; the next reconcile does the rest.
+    pub fn set_facts(&self, hosts: Vec<ipnet::IpNet>, nets: Vec<ipnet::IpNet>) {
+        if let Err(e) = self.tun.set_addresses(&hosts) {
+            tracing::warn!("applying new addresses to the TUN: {e:#}");
+        }
+        self.engine.peers.lock().unwrap().set_mine(hosts.clone(), nets.clone());
+        *self.mine.lock().unwrap() = hosts.into_iter().chain(nets).collect();
     }
 
     /// Wire the uplink to its relay. Separate from `new` because the
@@ -111,7 +122,8 @@ impl LocalEndpoint {
     /// come back on the loopback channel and are drained here too.
     pub fn sync(&self, view: &Snapshot) {
         self.engine.peers.lock().unwrap().replace_all(view.members.clone());
-        let wanted = wanted_routes(view, self.engine.my_node_id, &self.mine);
+        let mine = self.mine.lock().unwrap().clone();
+        let wanted = wanted_routes(view, self.engine.my_node_id, &mine);
         let local = nqvpn_endpoint::ifaces::local_prefixes(&self.device);
         let underlay = self.underlay_addrs(view);
         let (keep, excluded) = exclude_local(wanted, &local, &underlay);

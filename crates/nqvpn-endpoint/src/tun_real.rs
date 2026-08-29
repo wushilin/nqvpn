@@ -26,6 +26,8 @@ pub struct RealTun {
     write_tx: mpsc::Sender<Vec<u8>>,
     mtu: u16,
     pub name: String,
+    dev: Arc<tun_rs::SyncDevice>,
+    addrs: Mutex<Vec<IpNet>>,
 }
 
 impl RealTun {
@@ -120,8 +122,16 @@ impl RealTun {
             })
             .context("spawning TUN writer")?;
 
-        Ok(Arc::new(RealTun { rx: Mutex::new(Some(rx)), write_tx, mtu, name }))
+        Ok(Arc::new(RealTun { rx: Mutex::new(Some(rx)), write_tx, mtu, name, dev, addrs: Mutex::new(addrs.to_vec()) }))
     }
+}
+
+fn add_addr(dev: &tun_rs::SyncDevice, a: &IpNet) -> Result<()> {
+    match a {
+        IpNet::V4(v4) => dev.add_address_v4(v4.addr(), v4.prefix_len()),
+        IpNet::V6(v6) => dev.add_address_v6(v6.addr(), v6.prefix_len()),
+    }
+    .with_context(|| format!("adding {a} to the TUN"))
 }
 
 /// The device takes bare IP packets: `tun-rs` owns the platform framing.
@@ -146,6 +156,28 @@ impl TunDevice for RealTun {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    /// Diff against what the device carries: remove what is gone, add
+    /// what is new. A re-join with the same addresses is a no-op.
+    fn set_addresses(&self, wanted: &[IpNet]) -> Result<()> {
+        let mut cur = self.addrs.lock().unwrap();
+        for old in cur.iter() {
+            if !wanted.contains(old) {
+                self.dev.remove_address(old.addr()).with_context(|| format!("removing {old} from the TUN"))?;
+            }
+        }
+        for new in wanted {
+            if !cur.contains(new) {
+                add_addr(&self.dev, new)?;
+            }
+        }
+        *cur = wanted.to_vec();
+        Ok(())
+    }
+
+    fn addresses(&self) -> Vec<IpNet> {
+        self.addrs.lock().unwrap().clone()
     }
 }
 

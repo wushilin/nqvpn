@@ -264,11 +264,19 @@ pub fn relay_endpoints(cfg: &NetworkConfig, reg: &Registry) -> Vec<RelayEndpoint
         if rec.disabled || rec.role != Role::Relay {
             continue;
         }
-        if let (Some(fp), Some(addr)) = (&rec.cert_fp, &m.relay_addr) {
+        // The address as resolved at its latest join; a relay that has
+        // not joined since its address was configured keeps the last
+        // resolved one, unless the configured one is concrete.
+        let addr = match (&rec.relay_addr, &m.relay_addr) {
+            (_, Some(c)) if !c.starts_with("auto:") => Some(c.clone()),
+            (Some(r), _) => Some(r.clone()),
+            _ => None,
+        };
+        if let (Some(fp), Some(addr)) = (&rec.cert_fp, addr) {
             out.push(RelayEndpoint {
                 relay_id: rec.node_id,
                 name: name.clone(),
-                addr: addr.clone(),
+                addr,
                 cert_fp: fp.clone(),
             });
         }
@@ -292,10 +300,10 @@ cidrs = ["10.99.0.0/16"]
 cidr = "10.99.1.0/24"
 [relays.old]
 relay_addr = "1.2.3.4:1"
-allowed_cidrs = ["192.168.1.0/24"]
+local_cidrs = ["192.168.1.0/24"]
 [relays.new]
 relay_addr = "5.6.7.8:1"
-allowed_cidrs = ["192.168.1.0/24"]
+local_cidrs = ["192.168.1.0/24"]
 [clients.c]
 "#,
         )

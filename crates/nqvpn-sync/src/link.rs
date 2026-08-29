@@ -109,6 +109,19 @@ pub struct LinkHandle {
     stop_notify: Notify,
 }
 
+/// The coordinator closed the session because this member's
+/// configuration changed: re-join now and apply the new facts.
+#[derive(Debug)]
+pub struct Reconfigured(pub String);
+
+impl std::fmt::Display for Reconfigured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reconfigured: {}", self.0)
+    }
+}
+
+impl std::error::Error for Reconfigured {}
+
 /// The control session must end because this member is done: carried
 /// as the error of `run_session`.
 #[derive(Debug)]
@@ -313,6 +326,9 @@ pub async fn run_session(
                         if code == nqvpn_proto::control::CLOSE_REPLACED {
                             break Err(Stop(MemberExit::Replaced(reason)).into());
                         }
+                        if code == nqvpn_proto::control::CLOSE_RECONFIGURED {
+                            break Err(Reconfigured(reason).into());
+                        }
                         break Err(anyhow!("coordinator closed the session (code {code}): {reason}"));
                     }
                     break Err(anyhow!("control stream ended: {e}"));
@@ -423,6 +439,7 @@ pub async fn run_member(
             return exit;
         }
         let started = std::time::Instant::now();
+        let mut reconfigured = false;
         let params = SessionParams {
             control_addr: control_addr.lock().unwrap().clone(),
             credential: credential.lock().unwrap().clone(),
@@ -436,14 +453,22 @@ pub async fn run_member(
                     handle.stop(exit.clone());
                     return exit.clone();
                 }
-                tracing::warn!("coordinator session lost: {e:#}")
+                if let Some(Reconfigured(why)) = e.downcast_ref::<Reconfigured>() {
+                    tracing::info!(%why, "coordinator asked for a re-join: applying new configuration");
+                    reconfigured = true;
+                } else {
+                    tracing::warn!("coordinator session lost: {e:#}")
+                }
             }
         }
         // Reset the backoff only after a session that actually lasted.
+        // A requested re-join is not a failure: no wait at all.
         let was_healthy = started.elapsed() >= Duration::from_secs(30);
-        tokio::time::sleep(delay).await;
+        if !reconfigured {
+            tokio::time::sleep(delay).await;
+        }
         // Tight: back within seconds of the coordinator being back.
-        delay = if was_healthy { Duration::from_secs(1) } else { (delay * 2).min(Duration::from_secs(5)) };
+        delay = if was_healthy || reconfigured { Duration::from_secs(1) } else { (delay * 2).min(Duration::from_secs(5)) };
         // Re-join: a fresh credential and a fresh declaration. The view
         // is kept; Hello says what we hold and the coordinator sends
         // only what changed. Never after a replacement: that join

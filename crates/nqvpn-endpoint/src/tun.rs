@@ -17,6 +17,15 @@ pub trait TunDevice: Send + Sync + 'static {
     /// one, not a guess (the kernel picks `utunN` on macOS and may
     /// rename on Linux).
     fn name(&self) -> String;
+    /// Make the device carry exactly these addresses (a re-join brought
+    /// new ones). Backends without address management accept silently.
+    fn set_addresses(&self, _addrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Addresses the device currently carries, where known.
+    fn addresses(&self) -> Vec<ipnet::IpNet> {
+        Vec::new()
+    }
 }
 
 /// A TUN handle whose underlying device can be replaced underneath every
@@ -115,6 +124,7 @@ pub struct FakeTun {
     write_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     mtu: u16,
     name: String,
+    addrs: Mutex<Vec<ipnet::IpNet>>,
 }
 
 impl FakeTun {
@@ -135,6 +145,7 @@ impl FakeTun {
             write_rx: Mutex::new(Some(write_rx)),
             mtu,
             name: name.to_string(),
+            addrs: Mutex::new(Vec::new()),
         })
     }
 
@@ -170,6 +181,15 @@ impl TunDevice for FakeTun {
 
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn set_addresses(&self, addrs: &[ipnet::IpNet]) -> anyhow::Result<()> {
+        *self.addrs.lock().unwrap() = addrs.to_vec();
+        Ok(())
+    }
+
+    fn addresses(&self) -> Vec<ipnet::IpNet> {
+        self.addrs.lock().unwrap().clone()
     }
 }
 

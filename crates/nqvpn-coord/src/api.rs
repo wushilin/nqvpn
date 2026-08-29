@@ -1,16 +1,21 @@
-//! Axum router: member realm (/join) + admin realm (§3.4).
-//! Admin auth is a bearer token from the coordinator config.
+//! Axum router: the member realm (`/join`) and the admin realm — the UI
+//! is a client of the admin API and nothing more. Admin auth is a
+//! bearer token from `coordinator.toml`.
 
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::HeaderMap;
-use axum::response::Html;
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use nqvpn_proto::api::*;
 use nqvpn_proto::types::{NodeId, Role};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::admin::{MemberSpec, NetworkSpec};
+use crate::config::NetworkConfig;
 use crate::error::ApiError;
 use crate::state::{now_unix, AppState};
 
@@ -25,40 +30,161 @@ async fn ui() -> Html<&'static str> {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/join", post(join))
+        .route("/api/v1/login", post(login))
+        .route("/api/v1/logout", post(logout))
+        .route("/api/v1/me", get(me))
+        .route("/api/v1/ws", get(ws_upgrade))
         .route("/api/v1/status", get(global_status))
-        .route("/api/v1/networks", get(list_networks))
+        .route("/api/v1/networks", get(list_networks).post(create_network))
+        .route("/api/v1/networks/{id}", put(update_network).delete(delete_network))
         .route("/api/v1/networks/{id}/status", get(network_status))
+        .route("/api/v1/networks/{id}/config", get(network_config))
+        .route("/api/v1/networks/{id}/members", post(create_member))
+        .route("/api/v1/networks/{id}/members/{name}", get(member_config).put(update_member).delete(delete_member))
         .route("/api/v1/networks/{id}/members/{name}/disable", post(|s, p| set_disabled(s, p, true)))
         .route("/api/v1/networks/{id}/members/{name}/enable", post(|s, p| set_disabled(s, p, false)))
-        .route(
-            "/api/v1/networks/{id}/members/{name}/secret",
-            get(show_secret).post(mint_secret).delete(delete_secret),
-        )
-        .route("/api/v1/networks/{id}/members/{name}", axum::routing::delete(delete_member))
-        .route("/api/v1/reload", post(reload))
+        .route("/api/v1/networks/{id}/members/{name}/token", get(member_token).post(rotate_member))
+        .route("/api/v1/networks/{id}/members/{name}/reconnect", post(reconnect_member))
+        .route("/api/v1/export", get(export))
+        .route("/api/v1/import", post(import))
         .route("/ui", get(ui))
         .route("/ui/", get(ui))
         .route("/", get(|| async { axum::response::Redirect::temporary("/ui") }))
         .with_state(state)
 }
 
+/// Admin access: a UI session (cookie, or the session token as a
+/// bearer) or the static bearer token from the config.
 fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let configured = state.admin_token.as_deref().ok_or_else(|| {
-        ApiError::new(
+    let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim().to_string());
+    if let Some(t) = &bearer {
+        if let Some(cfg) = state.admin_token.as_deref() {
+            if crate::secrets::constant_time_eq(t, cfg) {
+                return Ok(());
+            }
+        }
+        if state.auth.lookup(t).is_some() {
+            return Ok(());
+        }
+    }
+    if let Some(c) = crate::auth::cookie_token(headers) {
+        if state.auth.lookup(&c).is_some() {
+            return Ok(());
+        }
+    }
+    if state.admin_token.is_none() && state.coord.admin.password_hash.is_none() {
+        return Err(ApiError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             nqvpn_proto::errors::ErrorCode::Unknown("admin_disabled".into()),
-            "no admin bearer token configured",
-        )
-    })?;
-    let presented = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(ApiError::unauthorized_admin)?;
-    if !crate::secrets::constant_time_eq(presented.trim(), configured) {
-        return Err(ApiError::unauthorized_admin());
+            "no admin login configured: set [admin] user + password_hash (nqvpn-coord hash-password) or bearer_token",
+        ));
     }
-    Ok(())
+    Err(ApiError::unauthorized_admin())
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginReq {
+    user: String,
+    password: String,
+}
+
+/// UI login: argon2 check (on the blocking pool — it is meant to be
+/// slow), then a session cookie. Failures are throttled per address.
+async fn login(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginReq>,
+) -> Result<Response, ApiError> {
+    let ip = peer.ip().to_string();
+    if state.auth.throttled(&ip) {
+        return Err(ApiError::rate_limited());
+    }
+    let (user, hash) = match (&state.coord.admin.user, &state.coord.admin.password_hash) {
+        (Some(u), Some(h)) => (u.clone(), h.clone()),
+        _ => {
+            return Err(ApiError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                nqvpn_proto::errors::ErrorCode::Unknown("admin_disabled".into()),
+                "no admin login configured: set [admin] user and password_hash (nqvpn-coord hash-password)",
+            ))
+        }
+    };
+    let ok = user == req.user
+        && tokio::task::spawn_blocking(move || crate::auth::verify_password(&req.password, &hash))
+            .await
+            .unwrap_or(false);
+    if !ok {
+        state.auth.note_failure(&ip);
+        tracing::warn!(%ip, user = %req.user, "admin login failed");
+        return Err(ApiError::new(axum::http::StatusCode::UNAUTHORIZED, nqvpn_proto::errors::ErrorCode::AdminAuthRequired, "wrong user or password"));
+    }
+    let ttl = state.coord.admin.session_hours.max(1) * 3600;
+    let (token, expires) = state.auth.open(&user, ttl);
+    tracing::info!(%ip, %user, "admin logged in");
+    let cookie = format!("{}={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={ttl}", crate::auth::COOKIE);
+    let body = Json(serde_json::json!({ "ok": true, "user": user, "expires_unix": expires }));
+    Ok(([("set-cookie", cookie)], body).into_response())
+}
+
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(c) = crate::auth::cookie_token(&headers) {
+        state.auth.close(&c);
+    }
+    let cookie = format!("{}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0", crate::auth::COOKIE);
+    ([("set-cookie", cookie)], Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+/// Who am I (for the page to know whether it needs to log in).
+async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let user = crate::auth::cookie_token(&headers)
+        .and_then(|c| state.auth.lookup(&c))
+        .map(|s| s.user)
+        .unwrap_or_else(|| "token".into());
+    Ok(Json(serde_json::json!({ "user": user, "login_configured": state.coord.admin.password_hash.is_some() })))
+}
+
+async fn ws_upgrade(State(state): State<Arc<AppState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Result<Response, ApiError> {
+    check_admin(&state, &headers)?;
+    Ok(ws.on_upgrade(move |socket| crate::ws::serve(state, socket)))
+}
+
+/// One frame of the live feed: every network's summary and status.
+pub fn live_frame(state: &AppState) -> Result<String, ApiError> {
+    let mut networks = Vec::new();
+    let mut status = serde_json::Map::new();
+    for (id, net) in state.nets() {
+        let ns = net.lock().unwrap();
+        networks.push(NetworkSummary {
+            network_id: id.clone(),
+            members_total: ns.cfg.members().count(),
+            relays_total: ns.cfg.relays.len(),
+            members_online: ns.leases.online_nodes().len(),
+            gen: ns.directory.gen,
+        });
+        status.insert(id.clone(), serde_json::to_value(status_of(&ns, &id)).unwrap_or_default());
+    }
+    serde_json::to_string(&serde_json::json!({ "type": "status", "networks": networks, "status": status, "now_unix": now_unix() }))
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// The URL that goes into tokens: configured, else the one the admin's
+/// browser used to reach us — which is what members can reach too, in
+/// the common case.
+fn public_url(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> String {
+    if let Some(u) = &state.coord.listen.public_url {
+        return u.trim_end_matches('/').to_string();
+    }
+    // HTTP/1.1 carries the host in a header; HTTP/2 in the :authority
+    // pseudo-header, which hyper exposes on the URI.
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|a| a.to_string()))
+        .unwrap_or_else(|| "localhost".into());
+    format!("https://{host}")
 }
 
 async fn join(
@@ -74,55 +200,110 @@ async fn join(
         .await
         .map_err(|e| ApiError::internal(format!("join task: {e}")))??;
 
-    // A relay binds its listener before joining, so its *configured*
+    // A relay binds its listener before joining, so its advertised
     // address must answer by now. Probed only after authentication, and
-    // never the address the request named — that is what would make
-    // this an open port scanner.
-    if req.role == Role::Relay {
-        let (policy, addr) = {
-            let net = state.networks.get(&req.network_id).expect("joined");
-            let ns = net.lock().unwrap();
-            let addr = ns.cfg.member_by_name(&req.name).and_then(|(m, _)| m.relay_addr.clone());
-            (ns.cfg.settings.relay_reachability.clone(), addr)
-        };
-        if let (true, Some(addr)) = (policy != "off", addr) {
-            let (st, netid, node) = (state.clone(), req.network_id.clone(), resp.node_id);
-            tokio::spawn(async move {
-                let verdict = crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
-                if verdict == crate::reach::Reachability::Unreachable {
-                    tracing::warn!(network = %netid, node_id = node, %addr, "advertised relay address is not dialable from the coordinator");
-                }
-                if let Some(net) = st.networks.get(&netid) {
-                    net.lock().unwrap().directory.reachability.insert(node, verdict);
-                }
-            });
+    // only the address the *operator* configured — never one the
+    // request named — so this is not an open port scanner.
+    if resp.role == Role::Relay {
+        let policy = state.net(&resp.network_id).map(|n| n.lock().unwrap().cfg.settings.relay_reachability.clone());
+        if let (Some(policy), Some(addr)) = (policy, resp.relay_addr.clone()) {
+            if policy != "off" {
+                let (st, netid, node) = (state.clone(), resp.network_id.clone(), resp.node_id);
+                tokio::spawn(async move {
+                    let verdict = crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
+                    if verdict == crate::reach::Reachability::Unreachable {
+                        tracing::warn!(network = %netid, node_id = node, %addr, "advertised relay address is not dialable from the coordinator");
+                    }
+                    if let Some(net) = st.net(&netid) {
+                        net.lock().unwrap().directory.reachability.insert(node, verdict);
+                    }
+                });
+            }
         }
     }
     Ok(Json(resp))
 }
 
-async fn global_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<GlobalStatus>, ApiError> {
+async fn global_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<GlobalStatus>, ApiError> {
     check_admin(&state, &headers)?;
     let mut networks = Vec::new();
-    for (id, net) in &state.networks {
+    for (id, net) in state.nets() {
         let ns = net.lock().unwrap();
         networks.push(NetworkSummary {
             network_id: id.clone(),
-            members_total: ns.registry.members.len(),
-            relays_total: ns.registry.members.values().filter(|m| m.role == Role::Relay).count(),
+            members_total: ns.cfg.members().count(),
+            relays_total: ns.cfg.relays.len(),
             members_online: ns.leases.online_nodes().len(),
             gen: ns.directory.gen,
         });
     }
-    networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
     Ok(Json(GlobalStatus { networks }))
 }
 
 async fn list_networks(state: State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<GlobalStatus>, ApiError> {
     global_status(state, headers).await
+}
+
+async fn create_network(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(spec): Json<NetworkSpec>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let id = spec.network_id.clone();
+    state.create_network(spec)?;
+    Ok(Json(serde_json::json!({ "ok": true, "network_id": id })))
+}
+
+async fn update_network(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(spec): Json<NetworkSpec>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    state.update_network(&id, spec)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_network(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    state.delete_network(&id)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The network's configuration as the UI edits it. Secrets are not
+/// included; tokens have their own endpoint.
+async fn network_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let net = state.net(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
+    let ns = net.lock().unwrap();
+    let c = &ns.cfg;
+    let members: Vec<serde_json::Value> = c
+        .members()
+        .map(|(name, m, role)| {
+            let mut v = serde_json::to_value(MemberSpec::from_cfg(m)).unwrap_or_default();
+            v["name"] = serde_json::Value::String(name.clone());
+            v["role"] = serde_json::Value::String(role.to_string());
+            v["has_secret"] = serde_json::Value::Bool(m.secret.is_some());
+            v
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "network_id": c.network_id,
+        "cidrs": c.cidrs,
+        "pools": c.pools,
+        "settings": c.settings,
+        "members": members,
+    })))
 }
 
 async fn network_status(
@@ -131,8 +312,12 @@ async fn network_status(
     Path(id): Path<String>,
 ) -> Result<Json<NetworkStatus>, ApiError> {
     check_admin(&state, &headers)?;
-    let net = state.networks.get(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
+    let net = state.net(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
     let ns = net.lock().unwrap();
+    Ok(Json(status_of(&ns, &id)))
+}
+
+pub fn status_of(ns: &crate::state::NetState, id: &str) -> NetworkStatus {
     let now = now_unix();
     let attachments = ns.leases.attachments();
     let name_of = |node_id: NodeId| -> String {
@@ -140,30 +325,34 @@ async fn network_status(
     };
 
     let mut members = Vec::new();
-    for (node_id, rec) in &ns.registry.members {
-        let report = ns.leases.report(*node_id);
+    // Every configured member, joined or not; plus registry-only
+    // leftovers (a member deleted from config but not yet forgotten).
+    for (name, m, role) in ns.cfg.members() {
+        let rec = ns.registry.by_name(name);
+        let node_id = rec.map(|r| r.node_id).unwrap_or(0);
+        let report = ns.leases.report(node_id);
         members.push(MemberStatus {
-            name: rec.name.clone(),
-            node_id: *node_id,
-            role: rec.role,
-            online: ns.leases.is_online(*node_id),
-            disabled: rec.disabled,
-            ip4: rec.ip4,
-            ip6: rec.ip6,
-            registered_cidrs: rec.routes.iter().map(|r| r.cidr).collect(),
-            attached_relay: attachments.get(node_id).map(|r| name_of(*r)),
-            advertised_reachable: (rec.role == Role::Relay)
-                .then(|| ns.directory.reachability.get(node_id).copied())
+            name: name.clone(),
+            node_id,
+            role,
+            online: rec.is_some() && ns.leases.is_online(node_id),
+            disabled: rec.map(|r| r.disabled).unwrap_or(false),
+            ip4: rec.and_then(|r| r.ip4).or(m.preferred_ip4),
+            ip6: rec.and_then(|r| r.ip6).or(m.preferred_ip6),
+            registered_cidrs: rec.map(|r| r.routes.iter().map(|x| x.cidr).collect()).unwrap_or_else(|| m.local_cidrs.clone()),
+            attached_relay: attachments.get(&node_id).map(|r| name_of(*r)),
+            advertised_reachable: (role == Role::Relay)
+                .then(|| ns.directory.reachability.get(&node_id).copied())
                 .flatten()
                 .map(|r| r.as_str().to_string()),
-            last_join_unix: rec.last_join_unix,
-            last_join_from: rec.last_join_from.clone(),
-            login_gen: rec.login_gen,
-            replaced_unix: rec.replaced_unix,
-            replaced_from: rec.replaced_from.clone(),
+            last_join_unix: rec.and_then(|r| r.last_join_unix),
+            last_join_from: rec.and_then(|r| r.last_join_from.clone()),
+            login_gen: rec.map(|r| r.login_gen).unwrap_or(0),
+            replaced_unix: rec.and_then(|r| r.replaced_unix),
+            replaced_from: rec.and_then(|r| r.replaced_from.clone()),
             reported_gen: report.map(|r| r.gen),
             digest_ok: report.map(|r| r.gen == ns.directory.gen && r.digest == ns.directory.published_digest).unwrap_or(false),
-            last_heartbeat_unix: ns.leases.last_seen(*node_id).map(|ms| ms / 1000),
+            last_heartbeat_unix: ns.leases.last_seen(node_id).map(|ms| ms / 1000),
         });
     }
 
@@ -228,8 +417,8 @@ async fn network_status(
         .collect();
     relay_traffic.sort_by_key(|r| r.node_id);
 
-    Ok(Json(NetworkStatus {
-        network_id: id.clone(),
+    NetworkStatus {
+        network_id: id.to_string(),
         network_uuid: ns.registry.network_uuid.to_string(),
         gen: ns.directory.gen,
         members,
@@ -237,14 +426,66 @@ async fn network_status(
         relay_traffic,
         transport: ns.cfg.settings.transport.clone(),
         lanes: ns.cfg.settings.lanes,
-    }))
+    }
 }
 
 type MemberPath = Path<(String, String)>;
 
-/// Members are addressed by name in the API; the registry resolves it.
-fn node_of(ns: &crate::state::NetState, name: &str) -> Result<NodeId, ApiError> {
-    ns.registry.id_of(name).ok_or_else(|| ApiError::not_found(format!("member {name:?} has never joined")))
+#[derive(Debug, Deserialize)]
+struct NewMember {
+    name: String,
+    role: Role,
+    #[serde(flatten)]
+    spec: MemberSpec,
+}
+
+fn token_json(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri, id: &str, name: &str) -> Result<serde_json::Value, ApiError> {
+    let endpoint = public_url(state, headers, uri);
+    let (token, role) = state.member_token(id, name, &endpoint)?;
+    Ok(serde_json::json!({
+        "network_id": id, "name": name, "role": role.to_string(),
+        "token": token.encode(), "coordinator": token.coordinator,
+    }))
+}
+
+/// Declare a member and hand back its token.
+async fn create_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    Path(id): Path<String>,
+    Json(m): Json<NewMember>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    state.create_member(&id, &m.name, m.role, &m.spec)?;
+    Ok(Json(token_json(&state, &headers, &uri, &id, &m.name)?))
+}
+
+async fn member_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, name)): MemberPath,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let net = state.net(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
+    let ns = net.lock().unwrap();
+    let (m, role) = ns.cfg.member_by_name(&name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
+    let mut v = serde_json::to_value(MemberSpec::from_cfg(m)).unwrap_or_default();
+    v["name"] = serde_json::Value::String(name.clone());
+    v["role"] = serde_json::Value::String(role.to_string());
+    Ok(Json(v))
+}
+
+/// Change a member's facts; a connected member re-joins and applies.
+async fn update_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, name)): MemberPath,
+    Json(spec): Json<MemberSpec>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    state.update_member(&id, &name, &spec)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn set_disabled(
@@ -254,161 +495,70 @@ async fn set_disabled(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let State(state) = state;
     check_admin(&state, &headers)?;
-    let net = state.networks.get(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-    let mut ns = net.lock().unwrap();
-    let node = node_of(&ns, &name)?;
-    let rec = ns.registry.members.get_mut(&node).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
-    rec.disabled = disabled;
-    let role = rec.role;
-    ns.commit()?;
-    if disabled {
-        // Evict now: the control session, the lease, its declarations.
-        // Relays and peers drop it as soon as the delta arrives; its
-        // credential stops renewing at the API.
-        ns.close_session(node, "member disabled");
-        if role == Role::Relay {
-            ns.leases.remove_relay(node);
-        } else {
-            ns.leases.remove(node);
-        }
-    }
-    state.publish(&mut ns);
+    state.set_disabled(&id, &name, disabled)?;
     Ok(Json(serde_json::json!({ "ok": true, "disabled": disabled })))
 }
 
-/// Forget a member: registry record, address, routes, and any managed
-/// secret. It can join again only if its config entry survives.
 async fn delete_member(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((id, name)): MemberPath,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
-    let net = state.networks.get(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-    let (freed4, freed6, still_configured) = {
-        let mut ns = net.lock().unwrap();
-        let node = node_of(&ns, &name)?;
-        let rec = ns.registry.members.remove(&node).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
-        ns.commit()?;
-        ns.close_session(node, "member deleted");
-        ns.leases.remove_relay(node);
-        ns.directory.traffic.remove(&node);
-        ns.directory.reported_mtu.remove(&node);
-        state.publish(&mut ns);
-        (rec.ip4, rec.ip6, ns.cfg.member_by_name(&name).is_some())
-    };
-    let secret_removed = {
-        let mut store = state.secrets.lock().unwrap();
-        let removed = store.remove(&id, &name);
-        if removed {
-            store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
-        }
-        removed
-    };
-    tracing::info!(network = %id, member = %name, still_configured, "member deleted");
-    Ok(Json(serde_json::json!({
-        "ok": true, "freed_ip4": freed4, "freed_ip6": freed6,
-        "secret_removed": secret_removed, "still_in_config": still_configured,
-    })))
-}
-
-fn member_exists(state: &AppState, id: &str, name: &str) -> Result<(), ApiError> {
-    let net = state.networks.get(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-    let ns = net.lock().unwrap();
-    if ns.cfg.member_by_name(name).is_none() {
-        return Err(ApiError::not_found(format!("member {name:?} is not configured in {id:?}")));
-    }
-    Ok(())
-}
-
-/// The member's current secret: the managed one if minted, else what
-/// the network config says. Shown, not hashed — see `secrets.rs`.
-async fn show_secret(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, name)): MemberPath,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    check_admin(&state, &headers)?;
-    member_exists(&state, &id, &name)?;
-    let managed = state.secrets.lock().unwrap().find(&id, &name).cloned();
-    let (secret, source, disabled) = match managed {
-        Some(m) => (Some(m.secret), "managed", m.disabled),
-        None => {
-            let ns = state.networks[&id].lock().unwrap();
-            let s = ns.cfg.member_by_name(&name).and_then(|(m, _)| m.secret.clone());
-            (s, "config", false)
-        }
-    };
-    Ok(Json(serde_json::json!({ "name": name, "secret": secret, "source": source, "disabled": disabled })))
-}
-
-/// Mint (or replace) a member's secret. Replacing is rotation: the
-/// previous secret stops working immediately; running sessions end at
-/// their credential's expiry.
-async fn mint_secret(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, name)): MemberPath,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    check_admin(&state, &headers)?;
-    member_exists(&state, &id, &name)?;
-    let secret = {
-        let mut store = state.secrets.lock().unwrap();
-        let s = store.mint(&id, &name, now_unix());
-        store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
-        s
-    };
-    tracing::info!(network = %id, member = %name, "secret minted");
-    Ok(Json(serde_json::json!({ "ok": true, "name": name, "secret": secret })))
-}
-
-/// Remove the managed secret; the member falls back to its config
-/// secret if it has one, otherwise it can no longer join.
-async fn delete_secret(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((id, name)): MemberPath,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    check_admin(&state, &headers)?;
-    let mut store = state.secrets.lock().unwrap();
-    if !store.remove(&id, &name) {
-        return Err(ApiError::not_found(format!("no managed secret for {name:?}")));
-    }
-    store.commit(&state.secrets_path).map_err(|e| ApiError::internal(format!("secrets commit: {e:#}")))?;
+    state.delete_member(&id, &name)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// Config reload as an atomic reconciliation (§3.3): validate everything
-/// first — any error leaves the running config untouched — then swap in
-/// the new per-network config and republish.
-async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+/// The member's token, shown again for a new machine.
+async fn member_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    Path((id, name)): MemberPath,
+) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin(&state, &headers)?;
-    let dir = state.networks_dir.clone().ok_or_else(|| ApiError::internal("networks dir unknown"))?;
-    let cfgs = crate::config::load_networks(&dir)
-        .map_err(|e| ApiError::bad_request(format!("reload rejected, old config still running: {e:#}")))?;
-    let mut applied = Vec::new();
-    let mut warnings = Vec::new();
-    let mut unknown = Vec::new();
-    for cfg in cfgs {
-        match state.networks.get(&cfg.network_id) {
-            Some(net) => {
-                let mut ns = net.lock().unwrap();
-                warnings.extend(
-                    crate::state::config_matches_registry(&cfg, &ns.registry)
-                        .into_iter()
-                        .map(|w| format!("{}: {w}", cfg.network_id)),
-                );
-                ns.directory.hold_down_secs = cfg.settings.hold_down_secs;
-                applied.push(cfg.network_id.clone());
-                ns.cfg = cfg;
-                state.publish(&mut ns);
-            }
-            None => unknown.push(cfg.network_id.clone()),
-        }
-    }
-    Ok(Json(serde_json::json!({
-        "ok": true, "reloaded": applied,
-        "ignored_new_networks": unknown, // adding a network needs a restart in v1
-        "warnings": warnings,
-    })))
+    Ok(Json(token_json(&state, &headers, &uri, &id, &name)?))
+}
+
+/// Rotate: a new token; the old one stops working immediately and its
+/// holder is thrown off.
+async fn rotate_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    Path((id, name)): MemberPath,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    state.rotate_member(&id, &name)?;
+    Ok(Json(token_json(&state, &headers, &uri, &id, &name)?))
+}
+
+/// Make a member re-join now (it applies whatever is configured).
+async fn reconnect_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((id, name)): MemberPath,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let net = state.net(&id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
+    let mut ns = net.lock().unwrap();
+    let node = ns.registry.id_of(&name).ok_or_else(|| ApiError::not_found(format!("member {name:?} has never joined")))?;
+    let connected = ns.sessions.contains_key(&node);
+    ns.reconfigure(node, "reconnect requested");
+    Ok(Json(serde_json::json!({ "ok": true, "was_connected": connected })))
+}
+
+async fn export(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Json<Vec<NetworkConfig>>, ApiError> {
+    check_admin(&state, &headers)?;
+    Ok(Json(state.export()))
+}
+
+async fn import(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cfgs): Json<Vec<NetworkConfig>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_admin(&state, &headers)?;
+    let applied = state.import(cfgs)?;
+    Ok(Json(serde_json::json!({ "ok": true, "applied": applied })))
 }

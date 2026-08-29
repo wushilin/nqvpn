@@ -1,27 +1,28 @@
 //! Relay configuration. One process, one listening socket, any number
-//! of networks — each joined with its own node id and secret.
+//! of networks — each joined with its own token. Everything about the
+//! relay's place in a network (its advertised address, its overlay
+//! address, the LANs it routes) is configured at the coordinator and
+//! handed down at join; this file holds only local facts.
 
 use anyhow::{Context, Result};
-use ipnet::IpNet;
 use nqvpn_proto::joinapi::JoinTls;
+use nqvpn_proto::token::Token;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
-    /// `https://host[:port]` of the coordinator.
-    pub coordinator: String,
     /// Accept any coordinator certificate (default). Set false to
     /// verify against system roots plus `ca`.
     #[serde(default = "d_true")]
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
-    /// One QUIC socket serves attached clients and the relay mesh.
+    /// One QUIC socket serves attached clients and the relay mesh. Its
+    /// port must be the one in the coordinator's relay address.
+    #[serde(default = "d_listen")]
     pub listen: String,
-    /// What this relay advertises; must match its coordinator entry.
-    pub relay_addr: String,
     /// Where the auto-generated TLS certificate and X25519 key live.
     /// Safe to delete: the next join records the new ones.
     #[serde(default = "d_state")]
@@ -34,34 +35,20 @@ pub struct RelayConfig {
     pub networks: Vec<NetworkCfg>,
 }
 
+/// One network: its token, nothing else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkCfg {
-    pub network_id: String,
-    /// This relay's member name at the coordinator.
-    pub name: String,
     #[serde(default)]
-    pub secret: Option<String>,
+    pub token: Option<String>,
     #[serde(default)]
-    pub secret_file: Option<PathBuf>,
-    /// Take a VPN address so the relay is reachable in-network.
-    #[serde(default = "d_true")]
-    pub want_vpn_ip: bool,
-    /// Gateway role: LAN prefixes this relay fronts (⊆ allowed_cidrs).
-    #[serde(default)]
-    pub local_cidrs: Vec<IpNet>,
-    #[serde(default)]
-    pub pool: Option<String>,
-    #[serde(default)]
-    pub preferred_ip4: Option<std::net::Ipv4Addr>,
-    #[serde(default)]
-    pub preferred_ip6: Option<std::net::Ipv6Addr>,
+    pub token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsCfg {
-    /// Per attached-client session cap; 0 = unlimited.
+    /// Per attached-client session cap; 0 = what the coordinator says.
     #[serde(default)]
     pub max_session_mbps: u32,
     /// tokio worker threads; 0 = one per core.
@@ -71,6 +58,10 @@ pub struct LimitsCfg {
 
 fn d_true() -> bool {
     true
+}
+
+fn d_listen() -> String {
+    "0.0.0.0:4444".to_string()
 }
 
 fn d_state() -> PathBuf {
@@ -83,7 +74,7 @@ impl RelayConfig {
         let cfg: RelayConfig = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         anyhow::ensure!(!cfg.networks.is_empty(), "{}: at least one [[networks]] entry is required", path.display());
         for n in &cfg.networks {
-            n.secret()?;
+            n.token()?;
         }
         Ok(cfg)
     }
@@ -94,14 +85,15 @@ impl RelayConfig {
 }
 
 impl NetworkCfg {
-    pub fn secret(&self) -> Result<String> {
-        if let Some(s) = &self.secret {
-            return Ok(s.trim().to_string());
-        }
-        if let Some(f) = &self.secret_file {
-            return Ok(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?.trim().to_string());
-        }
-        anyhow::bail!("network {}: set secret or secret_file", self.network_id)
+    pub fn token(&self) -> Result<Token> {
+        let raw = if let Some(t) = &self.token {
+            t.clone()
+        } else if let Some(f) = &self.token_file {
+            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?
+        } else {
+            anyhow::bail!("each [[networks]] entry needs token or token_file")
+        };
+        Token::parse(&raw).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -109,42 +101,38 @@ impl NetworkCfg {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_shipped_sample_configs_are_valid() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
-        let plain = RelayConfig::load(&root.join("relay.toml")).expect("relay.toml");
-        assert!(!plain.networks[0].want_vpn_ip);
-        let gw = RelayConfig::load(&root.join("relay-gateway.toml"));
-        // The gateway sample reads its secret from a file that only exists
-        // on a real host; everything else must parse.
-        assert!(gw.unwrap_err().to_string().contains("home.secret"));
+    fn tok(secret: &str) -> String {
+        Token { coordinator: "https://coord.example:8443".into(), secret: secret.into() }.encode()
     }
 
     #[test]
     fn parses_a_multi_network_relay() {
-        let cfg: RelayConfig = toml::from_str(
-            r#"
-coordinator = "https://coord.example:8443"
-listen = "0.0.0.0:4444"
-relay_addr = "home.example:4444"
-[[networks]]
-network_id = "acme"
-name = "home"
-secret = "s"
-local_cidrs = ["192.168.1.0/24"]
-[[networks]]
-network_id = "lab"
-name = "home"
-secret = "t"
-want_vpn_ip = false
-"#,
-        )
+        let cfg: RelayConfig = toml::from_str(&format!(
+            "listen = \"0.0.0.0:4444\"\n[[networks]]\ntoken = \"{}\"\n[[networks]]\ntoken = \"{}\"\n",
+            tok("a"),
+            tok("b")
+        ))
         .unwrap();
         assert!(cfg.trust_any_cert, "the simple default");
         assert_eq!(cfg.networks.len(), 2);
-        assert_eq!(cfg.networks[0].secret().unwrap(), "s");
-        assert!(cfg.networks[0].want_vpn_ip);
-        assert!(!cfg.networks[1].want_vpn_ip);
+        assert_eq!(cfg.networks[0].token().unwrap().secret, "a");
+        assert_eq!(cfg.networks[1].token().unwrap().coordinator, "https://coord.example:8443");
         assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/nqvpn-relay"));
+    }
+
+    #[test]
+    fn a_bad_token_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("relay.toml");
+        std::fs::write(&p, "[[networks]]\ntoken = \"nope\"\n").unwrap();
+        assert!(RelayConfig::load(&p).unwrap_err().to_string().contains("prefix"));
+    }
+
+    #[test]
+    fn the_shipped_sample_config_parses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let raw = std::fs::read_to_string(root.join("relay.toml")).unwrap();
+        let cfg: RelayConfig = toml::from_str(&raw).expect("relay.toml");
+        assert_eq!(cfg.networks.len(), 1);
     }
 }

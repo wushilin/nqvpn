@@ -348,6 +348,9 @@ pub struct LinkTraffic {
 /// identity back, and the two instances would replace each other
 /// forever. It exits instead (see `nqvpn_sync::EXIT_REPLACED`).
 pub const CLOSE_REPLACED: u32 = 7;
+/// The member's configuration changed at the coordinator: re-join now
+/// and apply what the new join response says. Not a kick-out.
+pub const CLOSE_RECONFIGURED: u32 = 8;
 
 #[cfg(test)]
 mod tests {

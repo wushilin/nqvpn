@@ -14,8 +14,10 @@ dir = "/var/lib/nqvpn-coord" # nqvpn.db (networks, members, secrets, registries)
 
 [admin]
 user = "admin"
-# nqvpn-coord hash-password        (prints an argon2 hash for the password you type)
+# Either a hash (nqvpn-coord hash-password prints one) or, simpler, the
+# password itself; a clear-text password is hashed in memory at startup.
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$replace-me$replace-me"
+# password = "change-me"
 # session_hours = 12
 # bearer_token = "..."            # optional: a static token for scripts (curl)
 # bearer_token_file = "/etc/nqvpn/admin-token"

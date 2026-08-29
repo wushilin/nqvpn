@@ -535,7 +535,7 @@ dir = "/var/lib/nqvpn-coord"   # nqvpn.db (networks, members, secrets, registrie
 
 [admin]
 user = "admin"
-password_hash = "$argon2id$…"  # nqvpn-coord hash-password
+password_hash = "$argon2id$…"  # nqvpn-coord hash-password; or password = "…" (hashed at startup)
 # session_hours = 12
 # bearer_token = "..."         # for scripts
 

@@ -71,12 +71,15 @@ pub struct StateCfg {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminCfg {
-    /// UI login. The hash is an argon2 PHC string, from
-    /// `nqvpn-coord hash-password`.
+    /// UI login. Either the argon2 hash (`nqvpn-coord hash-password`)
+    /// or, for convenience, the password in the clear; the clear one is
+    /// hashed in memory at startup and never used directly.
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
     pub password_hash: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
     /// A static token for scripts (`Authorization: Bearer ...`).
     #[serde(default)]
     pub bearer_token: Option<String>,
@@ -517,6 +520,25 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
     Ok(())
 }
 
+/// Resolve a clear-text `password` into `password_hash` so the rest of
+/// the coordinator only ever sees a hash. The hash wins if both exist.
+pub fn resolve_admin_password(cfg: &mut AdminCfg) -> Result<()> {
+    if cfg.password_hash.is_some() {
+        if cfg.password.is_some() {
+            tracing::warn!("[admin] has both password and password_hash; using password_hash");
+        }
+        return Ok(());
+    }
+    if let Some(pw) = cfg.password.take() {
+        if pw.trim().is_empty() {
+            bail!("[admin] password must not be empty");
+        }
+        tracing::warn!("[admin] password is in the clear in the config; prefer password_hash (nqvpn-coord hash-password)");
+        cfg.password_hash = Some(crate::auth::hash_password(&pw).map_err(|e| anyhow::anyhow!("hashing admin password: {e}"))?);
+    }
+    Ok(())
+}
+
 pub fn read_bearer_token(cfg: &AdminCfg) -> Result<Option<String>> {
     if let Some(t) = &cfg.bearer_token {
         return Ok(Some(t.trim().to_string()));
@@ -673,6 +695,16 @@ pool = "default"
         let back: NetworkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.relays["r1"].local_cidrs, cfg.relays["r1"].local_cidrs);
         assert_eq!(back.settings.mtu, cfg.settings.mtu);
+    }
+
+    #[test]
+    fn a_clear_text_admin_password_becomes_a_hash() {
+        let mut a = AdminCfg { user: Some("admin".into()), password: Some("hunter2".into()), ..Default::default() };
+        resolve_admin_password(&mut a).unwrap();
+        assert!(a.password.is_none(), "the clear text is dropped");
+        assert!(crate::auth::verify_password("hunter2", a.password_hash.as_deref().unwrap()));
+        let mut e = AdminCfg { password: Some("  ".into()), ..Default::default() };
+        assert!(resolve_admin_password(&mut e).is_err());
     }
 
     #[test]

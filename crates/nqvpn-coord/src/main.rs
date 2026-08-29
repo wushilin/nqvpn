@@ -63,7 +63,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
-    let coord = load_coord_config(&config_path)?;
+    let mut coord = load_coord_config(&config_path)?;
+    nqvpn_coord::config::resolve_admin_password(&mut coord.admin)?;
     let state_dir = PathBuf::from(&coord.state.dir);
     std::fs::create_dir_all(&state_dir).with_context(|| format!("creating state dir {}", state_dir.display()))?;
 

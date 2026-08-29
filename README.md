@@ -180,11 +180,10 @@ quic = "0.0.0.0:14433"       # control plane; published to members at join
 dir = "/var/lib/nqvpn-coord" # nqvpn.db, signing key, self-signed certificate
 [admin]
 user = "admin"
-password_hash = "$argon2id$…" # nqvpn-coord hash-password
+password = "change-me"       # or password_hash = "$argon2id$…" from nqvpn-coord hash-password
 ```
 
 ```sh
-nqvpn-coord hash-password             # paste the output into [admin] password_hash
 nqvpn-coord run --config configs/coordinator.toml
 ```
 

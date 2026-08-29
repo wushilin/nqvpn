@@ -69,6 +69,16 @@ pub fn flow_hash(packet: &[u8]) -> Option<u64> {
     Some(h)
 }
 
+/// A per-flow trace id for the frame header: the same hash folded to 32
+/// bits, so every packet of a connection carries the same id and a
+/// trace of one flow can be told apart from its neighbours.
+pub fn trace_id(packet: &[u8]) -> u32 {
+    match flow_hash(packet) {
+        Some(h) => ((h >> 32) ^ h) as u32,
+        None => 0,
+    }
+}
+
 /// Pick a lane for an inner packet. `lanes == 0` or `1` always yields 0.
 pub fn lane_for(packet: &[u8], lanes: u8) -> u8 {
     if lanes <= 1 {

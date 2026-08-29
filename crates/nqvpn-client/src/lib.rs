@@ -1,13 +1,6 @@
-//! Client library — exposed for the binary and integration tests.
+//! `nqvpn-client` — a leaf: one TUN, one upstream relay, one control
+//! link. The library exposes the pieces so an in-process harness can run
+//! many clients on fake TUNs for chaos tests.
 
+pub mod client;
 pub mod config;
-pub mod coordlink;
-pub mod uplink;
-pub mod endpoint_guard;
-pub mod engine;
-pub mod routes;
-pub mod peers;
-pub mod tun;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod tun_real;

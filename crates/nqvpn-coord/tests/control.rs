@@ -362,17 +362,13 @@ async fn a_relay_losing_its_control_link_keeps_its_attachments() -> Result<()> {
     assert_eq!(ns.directory.published.attachment_of(c), Some(1), "so its attachment outlives the relay's lease");
     drop(ns);
 
-    // Once the client itself goes silent, the attachment goes with it.
+    // The client's own control link going silent changes nothing either:
+    // the relay holds its session, and only the relay's word ends it.
     drop(client);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        r2.until(&mut v2, |_| true).await.ok();
-        if env.state.networks["n1"].lock().unwrap().directory.published.attachment_of(c).is_none() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "attachment never expired with the client");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let ns = env.state.networks["n1"].lock().unwrap();
+    assert!(!ns.leases.is_online(c));
+    assert_eq!(ns.directory.published.attachment_of(c), Some(1), "still attached: the relay never stopped declaring it");
     Ok(())
 }
 

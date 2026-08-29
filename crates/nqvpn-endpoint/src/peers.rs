@@ -31,8 +31,10 @@ pub struct PeerTable {
     peers: HashMap<NodeId, PeerInfo>,
     /// prefix -> owning node id, for outbound routing.
     lpm: LpmTable,
-    /// Prefixes this node owns (inner destinations we will accept).
-    mine: Vec<IpNet>,
+    /// Our own host addresses (/32, /128): looped back, and accepted.
+    mine_hosts: Vec<IpNet>,
+    /// LANs we front as a gateway: accepted, never looped back.
+    mine_nets: Vec<IpNet>,
     my_node_id: NodeId,
 }
 
@@ -41,8 +43,16 @@ impl PeerTable {
         PeerTable { my_node_id, ..Default::default() }
     }
 
-    pub fn set_mine(&mut self, prefixes: Vec<IpNet>) {
-        self.mine = prefixes;
+    /// What this node answers for: its host addresses and, for a
+    /// gateway, the LANs behind it.
+    pub fn set_mine(&mut self, hosts: Vec<IpNet>, nets: Vec<IpNet>) {
+        self.mine_hosts = hosts;
+        self.mine_nets = nets;
+    }
+
+    /// Everything this node owns, for route exclusion.
+    pub fn mine(&self) -> Vec<IpNet> {
+        self.mine_hosts.iter().chain(self.mine_nets.iter()).copied().collect()
     }
 
     pub fn upsert(&mut self, p: PeerInfo) {
@@ -85,12 +95,17 @@ impl PeerTable {
         self.lpm.lookup(addr)
     }
 
-    /// Is this one of our own addresses? macOS routes a host's own
+    /// Is this one of our own host addresses? macOS routes a host's own
     /// tunnel address *into* the utun rather than looping it back in the
-    /// kernel, so without this a node cannot ping itself: the packet
-    /// enters the TUN, matches no peer prefix, and is dropped.
-    pub fn is_mine(&self, addr: IpAddr) -> bool {
-        self.mine.iter().any(|n| n.contains(&addr))
+    /// kernel, so without this a node cannot ping itself.
+    pub fn is_mine_host(&self, addr: IpAddr) -> bool {
+        self.mine_hosts.iter().any(|n| n.contains(&addr))
+    }
+
+    /// Is this address ours to accept: a host address, or inside a LAN
+    /// we front?
+    pub fn owns(&self, addr: IpAddr) -> bool {
+        self.is_mine_host(addr) || self.mine_nets.iter().any(|n| n.contains(&addr))
     }
 
     pub fn get(&self, id: NodeId) -> Option<&PeerInfo> {
@@ -129,7 +144,7 @@ impl PeerTable {
         }
         // The inner destination must be ours, or we would be acting as
         // an unwitting router for someone else's traffic.
-        if !self.mine.iter().any(|n| n.contains(&dst)) {
+        if !self.owns(dst) {
             return IngressVerdict::Drop("inner_dst_not_mine");
         }
         IngressVerdict::Accept
@@ -162,6 +177,9 @@ pub struct SessionTable {
     /// Packets waiting for a handshake to complete (§6: bounded, never
     /// unbounded buffering).
     pending: HashMap<NodeId, Vec<Vec<u8>>>,
+    /// Newest initiator timestamp accepted per peer: a replayed msg1
+    /// carries an older one and is refused.
+    last_handshake_ts: HashMap<NodeId, u64>,
 }
 
 pub const PENDING_LIMIT: usize = 64;
@@ -201,6 +219,19 @@ impl SessionTable {
 
     pub fn take_pending(&mut self, peer: NodeId) -> Vec<Vec<u8>> {
         self.pending.remove(&peer).unwrap_or_default()
+    }
+
+    /// Accept an initiator timestamp if it is newer than the last one
+    /// seen from this peer. A restarted peer's clock still moves forward,
+    /// so this only ever refuses a replay.
+    pub fn accept_handshake_ts(&mut self, peer: NodeId, ts: u64) -> bool {
+        match self.last_handshake_ts.get(&peer) {
+            Some(last) if ts <= *last => false,
+            _ => {
+                self.last_handshake_ts.insert(peer, ts);
+                true
+            }
+        }
     }
 
     /// Start a session toward `peer`, returning the handshake message.
@@ -246,9 +277,11 @@ mod tests {
         PeerInfo {
             node_id: id,
             name: format!("n{id}"),
+            role: nqvpn_proto::types::Role::Client,
             prefixes: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
             pubkey: pubkey.into(),
             online: true,
+            login_gen: 0,
         }
     }
 
@@ -262,7 +295,7 @@ mod tests {
 
     fn table() -> PeerTable {
         let mut t = PeerTable::new(1);
-        t.set_mine(vec!["10.99.1.1/32".parse().unwrap()]);
+        t.set_mine(vec!["10.99.1.1/32".parse().unwrap()], vec![]);
         t.upsert(peer(2, &["10.99.1.2/32"], ""));
         t.upsert(peer(3, &["10.99.1.3/32", "192.168.7.0/24"], ""));
         t
@@ -336,6 +369,29 @@ mod tests {
         let q = s.take_pending(7);
         assert_eq!(q.len(), PENDING_LIMIT);
         assert_eq!(q[0], vec![10u8], "oldest packets were dropped first");
+    }
+
+    #[test]
+    fn a_gateway_accepts_its_lan_but_does_not_loop_it_back() {
+        let mut t = PeerTable::new(1);
+        t.set_mine(vec!["10.99.0.1/32".parse().unwrap()], vec!["192.168.1.0/24".parse().unwrap()]);
+        t.upsert(peer(2, &["10.99.1.2/32"], ""));
+        let lan_host: IpAddr = "192.168.1.50".parse().unwrap();
+        assert!(t.owns(lan_host));
+        assert!(!t.is_mine_host(lan_host), "a LAN packet must leave via the LAN, not re-enter the TUN");
+        assert!(t.is_mine_host("10.99.0.1".parse().unwrap()));
+        let pkt = v4([10, 99, 1, 2], [192, 168, 1, 50]);
+        assert_eq!(t.check_ingress(2, &pkt), IngressVerdict::Accept);
+    }
+
+    #[test]
+    fn a_replayed_handshake_timestamp_is_refused() {
+        let mut s = SessionTable::default();
+        assert!(s.accept_handshake_ts(7, 100));
+        assert!(!s.accept_handshake_ts(7, 100), "same msg1 again");
+        assert!(!s.accept_handshake_ts(7, 50), "older");
+        assert!(s.accept_handshake_ts(7, 101));
+        assert!(s.accept_handshake_ts(8, 1), "per peer");
     }
 
     #[test]

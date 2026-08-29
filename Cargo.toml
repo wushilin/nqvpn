@@ -5,7 +5,9 @@ members = [
     "crates/nqvpn-coord",
     "crates/nqvpn-relay",
     "crates/nqvpn-client",
-    "crates/nqvpn-probe",
+    "crates/nqvpn-endpoint",
+    "crates/nqvpn-session",
+    "crates/nqvpn-sync",
 ]
 
 [workspace.package]
@@ -16,6 +18,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 libc = "0.2"
 nqvpn-proto = { path = "crates/nqvpn-proto" }
+nqvpn-endpoint = { path = "crates/nqvpn-endpoint" }
+nqvpn-session = { path = "crates/nqvpn-session" }
+nqvpn-sync = { path = "crates/nqvpn-sync" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -57,7 +57,7 @@ impl LinearScan {
         for g in 0..(members / 20).max(1) {
             entries.push((format!("192.168.{}.0/24", g % 256).parse().unwrap(), 100_000 + g));
         }
-        entries.sort_by(|a, b| b.0.prefix_len().cmp(&a.0.prefix_len()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0.prefix_len()));
         LinearScan { entries }
     }
     fn lookup(&self, ip: IpAddr) -> Option<NodeId> {

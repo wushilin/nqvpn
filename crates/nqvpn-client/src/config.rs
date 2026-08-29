@@ -1,8 +1,10 @@
-//! Client configuration (DESIGN.md §13 appendix) — deliberately tiny:
-//! everything else (addresses, MTU, keepalive, relay fleet) is handed
-//! down by the coordinator at join time.
+//! Client configuration — deliberately tiny: everything else
+//! (addresses, MTU, relay fleet, control port) is handed down by the
+//! coordinator at join time.
 
 use anyhow::{Context, Result};
+use nqvpn_proto::joinapi::JoinTls;
+use nqvpn_proto::types::NodeId;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -10,56 +12,39 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
+    /// `https://host[:port]` of the coordinator.
     pub coordinator: String,
-    /// Coordinator QUIC control address (host:port).
-    pub coordinator_quic: String,
+    /// Accept any coordinator certificate (default). Set false to
+    /// verify against system roots plus `ca`.
+    #[serde(default = "d_true")]
+    pub trust_any_cert: bool,
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
     pub network_id: String,
-    pub client_id: String,
+    pub node_id: NodeId,
     #[serde(default)]
-    pub client_secret: Option<String>,
+    pub secret: Option<String>,
     #[serde(default)]
-    pub client_secret_file: Option<String>,
-    /// Pin the coordinator's control certificate (sha256:...).
-    #[serde(default)]
-    pub coordinator_fp: Option<String>,
-    /// Replace this client's TLS identity once it has been in use for
-    /// this many days, registering the new one over the authenticated
-    /// control session. 0 (the default) disables it.
-    ///
-    /// Nothing dials a client, so unlike a relay it can rotate freely.
-    #[serde(default)]
-    pub rotate_identity_after_days: u64,
-    /// Requested TUN device name. Linux accepts any name up to 15
-    /// characters; macOS only accepts `utunN`. Left unset, the OS picks.
+    pub secret_file: Option<PathBuf>,
+    /// Where the auto-generated TLS certificate and X25519 key live.
+    /// Safe to delete: the next join records the new ones.
+    #[serde(default = "d_state")]
+    pub state_dir: PathBuf,
+    /// Requested TUN device name (Linux: any; macOS: `utunN`).
     #[serde(default)]
     pub tun_name: Option<String>,
-    #[serde(default)]
-    pub identity: IdentityCfg,
     #[serde(default)]
     pub relay: RelayCfg,
     #[serde(default)]
     pub address: AddressCfg,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityCfg {
-    pub dir: PathBuf,
-}
-
-impl Default for IdentityCfg {
-    fn default() -> Self {
-        IdentityCfg { dir: PathBuf::from("/var/lib/nqvpn-client") }
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayCfg {
-    /// Attach here when reachable; otherwise pick by measured RTT
-    /// (decision #3).
+    /// Attach here when reachable; otherwise pick by measured RTT.
     #[serde(default)]
-    pub preferred_relay_id: Option<String>,
+    pub preferred: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -76,24 +61,51 @@ pub struct AddressCfg {
     pub want_vpn_ip: Option<bool>,
 }
 
+fn d_true() -> bool {
+    true
+}
+
+fn d_state() -> PathBuf {
+    PathBuf::from("/var/lib/nqvpn-client")
+}
+
 impl ClientConfig {
     pub fn load(path: &Path) -> Result<ClientConfig> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: ClientConfig = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.secret()?;
+        Ok(cfg)
     }
 
     pub fn secret(&self) -> Result<String> {
-        if let Some(s) = &self.client_secret {
+        if let Some(s) = &self.secret {
             return Ok(s.trim().to_string());
         }
-        if let Some(f) = &self.client_secret_file {
-            return Ok(std::fs::read_to_string(f)
-                .with_context(|| format!("reading {f}"))?
-                .trim()
-                .to_string());
+        if let Some(f) = &self.secret_file {
+            return Ok(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?.trim().to_string());
         }
-        anyhow::bail!("config must set client_secret or client_secret_file")
+        anyhow::bail!("config must set secret or secret_file")
+    }
+
+    pub fn tls(&self) -> JoinTls {
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone() }
+    }
+
+    pub fn member(&self) -> Result<nqvpn_sync::MemberConfig> {
+        Ok(nqvpn_sync::MemberConfig {
+            coordinator: self.coordinator.clone(),
+            network_id: self.network_id.clone(),
+            node_id: self.node_id,
+            secret: self.secret()?,
+            tls: self.tls(),
+            role: nqvpn_proto::types::Role::Client,
+            want_vpn_ip: self.address.want_vpn_ip.unwrap_or(true),
+            pool: self.address.pool.clone(),
+            preferred_ip4: self.address.preferred_ip4,
+            preferred_ip6: self.address.preferred_ip6,
+            local_cidrs: vec![],
+            relay_addr: None,
+        })
     }
 }
 
@@ -102,77 +114,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimal_config_parses() {
+    fn minimal_config_parses_with_the_simple_defaults() {
         let c: ClientConfig = toml::from_str(
             r#"
 coordinator = "https://coord.example:8443"
-coordinator_quic = "coord.example:4433"
 network_id = "acme"
-client_id = "laptop-1"
-client_secret = "s"
+node_id = 10
+secret = "s"
 "#,
         )
         .unwrap();
         assert_eq!(c.secret().unwrap(), "s");
-        assert!(c.relay.preferred_relay_id.is_none());
-        assert!(c.address.pool.is_none());
+        assert!(c.trust_any_cert);
+        assert!(c.relay.preferred.is_none());
+        assert_eq!(c.member().unwrap().node_id, 10);
     }
 
     #[test]
     fn full_config_parses() {
         let c: ClientConfig = toml::from_str(
             r#"
-coordinator = "coord.example:8443"
-coordinator_quic = "coord.example:4433"
+coordinator = "https://coord.example:8443"
+trust_any_cert = false
+ca = "/etc/nqvpn/coord-ca.pem"
 network_id = "acme"
-client_id = "laptop-1"
-client_secret = "s"
-coordinator_fp = "sha256:aa"
-[identity]
-dir = "/tmp/x"
+node_id = 10
+secret = "s"
+tun_name = "nqvpn0"
+state_dir = "/tmp/x"
 [relay]
-preferred_relay_id = "home"
+preferred = "home"
 [address]
 pool = "default"
 preferred_ip4 = "10.99.1.50"
 "#,
         )
         .unwrap();
-        assert_eq!(c.relay.preferred_relay_id.as_deref(), Some("home"));
-        assert_eq!(c.address.preferred_ip4.unwrap().to_string(), "10.99.1.50");
-    }
-
-    #[test]
-    fn tun_name_is_optional_and_round_trips() {
-        // Absent means "let the OS pick", which must stay the default so
-        // existing configs keep working untouched.
-        let base = r#"
-coordinator = "https://c.example:8443"
-coordinator_quic = "c.example:14433"
-network_id = "n"
-client_id = "c"
-client_secret = "s"
-[identity]
-dir = "/tmp/x"
-"#;
-        let cfg: ClientConfig = toml::from_str(base).expect("parses without tun_name");
-        assert_eq!(cfg.tun_name, None);
-
-        // tun_name is a top-level key, so in TOML it must appear before
-        // any [section] header. Appended after one it is parsed as a
-        // member of that section and rejected — an easy mistake to make
-        // when editing an existing config, so pin both behaviours.
-        let named: ClientConfig = toml::from_str(
-            "tun_name = \"nqvpn0\"\n\
-             coordinator = \"https://c.example:8443\"\n\
-             coordinator_quic = \"c.example:14433\"\n\
-             network_id = \"n\"\nclient_id = \"c\"\nclient_secret = \"s\"\n\
-             [identity]\ndir = \"/tmp/x\"\n",
-        )
-        .expect("parses with tun_name before the first section");
-        assert_eq!(named.tun_name.as_deref(), Some("nqvpn0"));
-
-        let misplaced = toml::from_str::<ClientConfig>(&format!("{base}tun_name = \"nqvpn0\"\n"));
-        assert!(misplaced.is_err(), "after a section header it belongs to that section");
+        assert_eq!(c.relay.preferred.as_deref(), Some("home"));
+        assert!(!c.trust_any_cert);
+        assert_eq!(c.tls().ca_pem, Some(PathBuf::from("/etc/nqvpn/coord-ca.pem")));
     }
 }

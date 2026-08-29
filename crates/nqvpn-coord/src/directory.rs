@@ -344,11 +344,9 @@ node_id = 10
         // A member at 1001 catches up with two deltas; at 1000 with three.
         let chain = d.deltas_since(1001).unwrap();
         assert_eq!(chain.len(), 2);
-        let mut copy = Snapshot { gen: 1001, ..Snapshot::default() };
         // Reconstruct: apply d1 onto empty at 1000, then the chain.
-        let mut from_scratch = Snapshot { gen: 1000, ..Snapshot::default() };
-        from_scratch.apply(&d1).unwrap();
-        copy = from_scratch;
+        let mut copy = Snapshot { gen: 1000, ..Snapshot::default() };
+        copy.apply(&d1).unwrap();
         for dl in &chain {
             copy.apply(dl).unwrap();
         }

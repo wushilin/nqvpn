@@ -1,0 +1,22 @@
+[package]
+name = "nqvpn-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The member side of the control plane, shared by client and relay:
+# join + renewal, the generation protocol (snapshot / delta / resync /
+# heartbeat), and the reconciler driver that turns a view into actions.
+
+[dependencies]
+nqvpn-proto.workspace = true
+anyhow.workspace = true
+ipnet.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

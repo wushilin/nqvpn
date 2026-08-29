@@ -219,6 +219,17 @@ impl PacketChannel {
         self.mode
     }
 
+    /// Close the underlying connection. Every reader ends, so whoever is
+    /// pumping this channel sees `recv()` return `None` and runs its
+    /// ordinary teardown — the one path a session ever leaves by.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.conn.close(code.into(), reason);
+    }
+
+    pub fn connection(&self) -> &quinn::Connection {
+        &self.conn
+    }
+
     /// Outbound lanes in use. 0 in datagram mode, which has no streams.
     pub fn lane_count(&self) -> usize {
         self.lanes.len()

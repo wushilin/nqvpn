@@ -1,0 +1,23 @@
+[package]
+name = "nqvpn-endpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Everything that terminates traffic: the Noise engine, the peer table
+# and ingress filter, the TUN device, OS route programming, and the
+# one-endpoint-per-host guard. Shared by the client and by a relay in
+# its gateway role. Depends on nothing but the protocol crate.
+
+[dependencies]
+nqvpn-proto.workspace = true
+anyhow.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+tokio.workspace = true
+tun-rs.workspace = true
+tracing.workspace = true
+getifaddrs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

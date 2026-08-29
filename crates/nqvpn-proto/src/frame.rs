@@ -5,7 +5,7 @@
 //! 0x02 Handshake  [type 1][src_id 4][dst_id 4][flags 1][hop 1][trace 4][noise handshake message]
 //! 0xF1 Probe      [type 1][seq 8][t_sent 8]      hop-local, never forwarded
 //! 0xF2 Reply      probe echoed by the far end of the hop
-//! 0xF3 TraceNote  [type 1][trace 4][hop 1][relay_id 4][decision 1][detail 4]
+//! 0xF3 TraceNote  [type 1][origin 4][trace 4][hop 1][relay_id 4][decision 1][detail 4]
 //!                 sent by a relay back on the session a traced frame
 //!                 arrived on, so the origin can reconstruct the path
 //! ```
@@ -32,8 +32,8 @@ pub const T_TRACE_NOTE: u8 = 0xF3;
 pub const ROUTED_HEADER_LEN: usize = 15;
 /// type + seq + t_sent
 pub const PROBE_LEN: usize = 17;
-/// type + trace + hop + relay_id + decision + detail
-pub const TRACE_NOTE_LEN: usize = 15;
+/// type + origin + trace + hop + relay_id + decision + detail
+pub const TRACE_NOTE_LEN: usize = 19;
 
 /// Ask every relay on the path to report what it did with this frame.
 pub const FLAG_TRACE: u8 = 0x01;
@@ -217,10 +217,14 @@ impl Decision {
 }
 
 /// A relay's report about one traced frame, sent back on the session
-/// the frame arrived on. `detail` is the next-hop relay id for a forward,
-/// the delivered node id for a local delivery, and 0 otherwise.
+/// the frame arrived on; a relay receiving one from the mesh passes it
+/// on to `origin` if that client is attached to it. `detail` is the
+/// next-hop relay id for a forward, the delivered node id for a local
+/// delivery, and 0 otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceNote {
+    /// The node that sent the traced frame.
+    pub origin: NodeId,
     pub trace: u32,
     pub hop: u8,
     pub relay_id: NodeId,
@@ -232,6 +236,7 @@ impl TraceNote {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(TRACE_NOTE_LEN);
         out.push(T_TRACE_NOTE);
+        out.extend_from_slice(&self.origin.to_be_bytes());
         out.extend_from_slice(&self.trace.to_be_bytes());
         out.push(self.hop);
         out.extend_from_slice(&self.relay_id.to_be_bytes());
@@ -245,11 +250,12 @@ impl TraceNote {
             return None;
         }
         Some(TraceNote {
-            trace: u32::from_be_bytes(buf[1..5].try_into().ok()?),
-            hop: buf[5],
-            relay_id: u32::from_be_bytes(buf[6..10].try_into().ok()?),
-            decision: Decision::from_u8(buf[10])?,
-            detail: u32::from_be_bytes(buf[11..15].try_into().ok()?),
+            origin: u32::from_be_bytes(buf[1..5].try_into().ok()?),
+            trace: u32::from_be_bytes(buf[5..9].try_into().ok()?),
+            hop: buf[9],
+            relay_id: u32::from_be_bytes(buf[10..14].try_into().ok()?),
+            decision: Decision::from_u8(buf[14])?,
+            detail: u32::from_be_bytes(buf[15..19].try_into().ok()?),
         })
     }
 }
@@ -309,7 +315,7 @@ mod tests {
 
     #[test]
     fn trace_note_roundtrip() {
-        let n = TraceNote { trace: 77, hop: 2, relay_id: 5, decision: Decision::ForwardMesh, detail: 9 };
+        let n = TraceNote { origin: 3, trace: 77, hop: 2, relay_id: 5, decision: Decision::ForwardMesh, detail: 9 };
         let back = TraceNote::parse(&n.encode()).unwrap();
         assert_eq!(back, n);
         // Not a routed frame: a relay must not try to forward it.

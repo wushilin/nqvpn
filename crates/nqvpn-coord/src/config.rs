@@ -137,6 +137,10 @@ pub struct SettingsCfg {
     /// Default per-client bandwidth cap applied by relays; 0 = none.
     #[serde(default)]
     pub max_session_mbps: u32,
+    /// Let relays advertise loopback addresses. Only for running a whole
+    /// network on one machine (tests, demos); never in production.
+    #[serde(default)]
+    pub allow_loopback_relays: bool,
 }
 
 impl Default for SettingsCfg {
@@ -151,6 +155,7 @@ impl Default for SettingsCfg {
             transport: d_transport(),
             lanes: d_lanes(),
             max_session_mbps: 0,
+            allow_loopback_relays: false,
         }
     }
 }
@@ -463,6 +468,9 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
         }
     };
     for ip in ips {
+        if cfg.settings.allow_loopback_relays && ip.is_loopback() {
+            continue;
+        }
         if unroutable(ip) {
             bail!("relay {name}: relay_addr {addr:?} resolves to an unroutable address {ip}");
         }

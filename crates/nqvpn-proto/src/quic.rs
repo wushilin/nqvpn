@@ -280,7 +280,7 @@ mod tests {
             "initial_mtu {INITIAL_MTU} is {on_wire_v6} bytes on an IPv6 path; \
              a 1500-byte Ethernet path would black-hole it"
         );
-        assert!(INITIAL_MTU > MIN_MTU, "discovery must be able to correct downward");
+        const { assert!(INITIAL_MTU > MIN_MTU, "discovery must be able to correct downward") };
     }
 
     #[test]

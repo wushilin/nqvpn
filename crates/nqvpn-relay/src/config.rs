@@ -1,80 +1,67 @@
-//! Relay configuration (DESIGN.md §13 appendix).
+//! Relay configuration. One process, one listening socket, any number
+//! of networks — each joined with its own node id and secret.
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
+use nqvpn_proto::joinapi::JoinTls;
+use nqvpn_proto::types::NodeId;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
+    /// `https://host[:port]` of the coordinator.
     pub coordinator: String,
-    pub network_id: String,
-    pub client_id: String,
+    /// Accept any coordinator certificate (default). Set false to
+    /// verify against system roots plus `ca`.
+    #[serde(default = "d_true")]
+    pub trust_any_cert: bool,
     #[serde(default)]
-    pub client_secret: Option<String>,
-    #[serde(default)]
-    pub client_secret_file: Option<String>,
-    /// One QUIC socket serves both attached clients and the relay mesh.
+    pub ca: Option<PathBuf>,
+    /// One QUIC socket serves attached clients and the relay mesh.
     pub listen: String,
-    /// What this relay advertises; must match its coordinator config entry.
+    /// What this relay advertises; must match its coordinator entry.
     pub relay_addr: String,
-    /// Pin the coordinator's control certificate (sha256:...).
-    #[serde(default)]
-    pub coordinator_fp: Option<String>,
-    #[serde(default)]
-    pub identity: IdentityCfg,
-    /// Optional: this relay is also its site's gateway.
-    #[serde(default)]
-    pub gateway: Option<GatewayCfg>,
-    /// Take a VPN address so the relay itself is reachable in-network
-    /// (SSH, metrics, admin). Set false for a pure forwarder that should
-    /// only carry other members' traffic (§3.1).
-    #[serde(default)]
-    pub want_vpn_ip: Option<bool>,
-    #[serde(default)]
-    pub limits: LimitsCfg,
-    /// Replace this relay's TLS identity once it has been in use for
-    /// this many days, registering the new one over the authenticated
-    /// control session. 0 (the default) disables it.
-    ///
-    /// Relays need care here: their pinned fingerprint is what dialers
-    /// verify against, so the fleet must learn the new one before the
-    /// relay starts presenting it. The coordinator republishes the relay
-    /// list on rotation, but leave this off unless you have verified
-    /// that propagation in your deployment.
-    #[serde(default)]
-    pub rotate_identity_after_days: u64,
-    /// Requested TUN device name for the endpoint role. Linux accepts any
-    /// name up to 15 characters; macOS only accepts `utunN`. Unset lets
-    /// the OS pick. Ignored by a pure forwarder, which has no TUN.
+    /// Where the auto-generated TLS certificate and X25519 key live.
+    /// Safe to delete: the next join records the new ones.
+    #[serde(default = "d_state")]
+    pub state_dir: PathBuf,
+    /// Requested TUN device name for the endpoint role.
     #[serde(default)]
     pub tun_name: Option<String>,
+    #[serde(default)]
+    pub limits: LimitsCfg,
+    pub networks: Vec<NetworkCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IdentityCfg {
-    pub dir: PathBuf,
-}
-
-impl Default for IdentityCfg {
-    fn default() -> Self {
-        IdentityCfg { dir: PathBuf::from("/var/lib/nqvpn-relay") }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GatewayCfg {
-    /// Must be a subset of this relay's `allowed_cidrs` at the coordinator.
+pub struct NetworkCfg {
+    pub network_id: String,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
+    /// Take a VPN address so the relay is reachable in-network.
+    #[serde(default = "d_true")]
+    pub want_vpn_ip: bool,
+    /// Gateway role: LAN prefixes this relay fronts (⊆ allowed_cidrs).
+    #[serde(default)]
     pub local_cidrs: Vec<IpNet>,
+    #[serde(default)]
+    pub pool: Option<String>,
+    #[serde(default)]
+    pub preferred_ip4: Option<std::net::Ipv4Addr>,
+    #[serde(default)]
+    pub preferred_ip6: Option<std::net::Ipv6Addr>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsCfg {
-    /// Per attached-client session cap; 0 = unlimited (decision #6).
+    /// Per attached-client session cap; 0 = unlimited.
     #[serde(default)]
     pub max_session_mbps: u32,
     /// tokio worker threads; 0 = one per core.
@@ -82,40 +69,39 @@ pub struct LimitsCfg {
     pub workers: usize,
 }
 
-impl Default for LimitsCfg {
-    fn default() -> Self {
-        LimitsCfg { max_session_mbps: 0, workers: 0 }
-    }
+fn d_true() -> bool {
+    true
+}
+
+fn d_state() -> PathBuf {
+    PathBuf::from("/var/lib/nqvpn-relay")
 }
 
 impl RelayConfig {
     pub fn load(path: &Path) -> Result<RelayConfig> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: RelayConfig = toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: RelayConfig = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        anyhow::ensure!(!cfg.networks.is_empty(), "{}: at least one [[networks]] entry is required", path.display());
+        for n in &cfg.networks {
+            n.secret()?;
+        }
         Ok(cfg)
     }
 
+    pub fn tls(&self) -> JoinTls {
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone() }
+    }
+}
+
+impl NetworkCfg {
     pub fn secret(&self) -> Result<String> {
-        if let Some(s) = &self.client_secret {
+        if let Some(s) = &self.secret {
             return Ok(s.trim().to_string());
         }
-        if let Some(f) = &self.client_secret_file {
-            return Ok(std::fs::read_to_string(f)
-                .with_context(|| format!("reading {f}"))?
-                .trim()
-                .to_string());
+        if let Some(f) = &self.secret_file {
+            return Ok(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?.trim().to_string());
         }
-        anyhow::bail!("config must set client_secret or client_secret_file")
-    }
-
-    pub fn local_cidrs(&self) -> Vec<IpNet> {
-        self.gateway.as_ref().map(|g| g.local_cidrs.clone()).unwrap_or_default()
-    }
-
-    pub fn wants_address(&self) -> bool {
-        self.want_vpn_ip.unwrap_or(true)
+        anyhow::bail!("network {}: set secret or secret_file", self.network_id)
     }
 }
 
@@ -124,43 +110,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_minimal_pure_forwarder() {
+    fn parses_a_multi_network_relay() {
         let cfg: RelayConfig = toml::from_str(
             r#"
 coordinator = "https://coord.example:8443"
-network_id = "acme"
-client_id = "home"
-client_secret = "s"
 listen = "0.0.0.0:4444"
 relay_addr = "home.example:4444"
-"#,
-        )
-        .unwrap();
-        assert!(cfg.gateway.is_none());
-        assert!(cfg.local_cidrs().is_empty());
-        assert!(cfg.wants_address(), "relays are addressable by default");
-        assert_eq!(cfg.limits.max_session_mbps, 0);
-        assert_eq!(cfg.secret().unwrap(), "s");
-    }
-
-    #[test]
-    fn parses_gateway_relay() {
-        let cfg: RelayConfig = toml::from_str(
-            r#"
-coordinator = "coord.example:8443"
+[[networks]]
 network_id = "acme"
-client_id = "home"
-client_secret = "s"
-listen = "0.0.0.0:4444"
-relay_addr = "home.example:4444"
-[gateway]
+node_id = 1
+secret = "s"
 local_cidrs = ["192.168.1.0/24"]
-[limits]
-max_session_mbps = 200
+[[networks]]
+network_id = "lab"
+node_id = 7
+secret = "t"
+want_vpn_ip = false
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.local_cidrs().len(), 1);
-        assert_eq!(cfg.limits.max_session_mbps, 200);
+        assert!(cfg.trust_any_cert, "the simple default");
+        assert_eq!(cfg.networks.len(), 2);
+        assert_eq!(cfg.networks[0].secret().unwrap(), "s");
+        assert!(cfg.networks[0].want_vpn_ip);
+        assert!(!cfg.networks[1].want_vpn_ip);
+        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/nqvpn-relay"));
     }
 }

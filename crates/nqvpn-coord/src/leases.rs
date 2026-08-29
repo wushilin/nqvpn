@@ -6,9 +6,11 @@
 //! the whole set of clients it holds; the attachment table is derived
 //! from those declarations by one rule — **the most recent declaration
 //! wins** — and an entry disappears only when the relay stops declaring
-//! it, the client's own lease expires, or the member is removed. A
-//! relay's *own* lease expiring does not detach its clients: a relay
-//! that cannot reach the coordinator can still forward for them.
+//! it or the member is removed. Neither side's *control* lease matters:
+//! a relay that cannot reach the coordinator can still forward for its
+//! clients, and a client that cannot reach the coordinator is still
+//! attached to its relay. The relay's own session with the client is
+//! the truth, and the relay reports it for as long as it lasts.
 //!
 //! All timestamps here are **milliseconds**: two relays can declare the
 //! same client within one second during a move, and the later one must
@@ -99,8 +101,8 @@ impl Leases {
     }
 
     /// Expire members silent for longer than `window`. Returns the ones
-    /// that just went offline; their own declarations and any claims on
-    /// them are dropped.
+    /// that just went offline. Claims are untouched: the relay holding
+    /// the session keeps reporting it for as long as it lasts.
     pub fn expire(&mut self, now: u64, window: u64) -> Vec<NodeId> {
         let gone: Vec<NodeId> = self
             .last_seen
@@ -109,21 +111,16 @@ impl Leases {
             .map(|(n, _)| *n)
             .collect();
         for n in &gone {
-            self.remove(*n);
+            self.offline(*n);
         }
         gone
     }
 
-    /// Forget a member entirely (deleted, disabled, or offline).
+    /// Forget a member entirely (deleted or disabled): its liveness and
+    /// every claim on it.
     pub fn remove(&mut self, node: NodeId) {
-        self.last_seen.remove(&node);
-        self.online_since.remove(&node);
-        self.attached_to.remove(&node);
-        self.mesh_up.remove(&node);
+        self.offline(node);
         self.reported.remove(&node);
-        // As a relay: its declarations were only as good as its word.
-        // A relay that is *offline to us* keeps its declarations; this
-        // is the explicit-removal path (delete/disable).
         for claims in self.declared.values_mut() {
             claims.remove(&node);
         }
@@ -136,16 +133,12 @@ impl Leases {
         self.remove(relay);
     }
 
-    /// Going offline as a *client* removes claims on it; going offline as
-    /// a relay deliberately keeps them (see module docs).
+    /// The control link is gone. Liveness ends; attachments do not.
     pub fn offline(&mut self, node: NodeId) {
         self.last_seen.remove(&node);
         self.online_since.remove(&node);
         self.attached_to.remove(&node);
         self.mesh_up.remove(&node);
-        for claims in self.declared.values_mut() {
-            claims.remove(&node);
-        }
     }
 
     pub fn is_online(&self, node: NodeId) -> bool {
@@ -227,7 +220,7 @@ mod tests {
         assert_eq!(l.attachments().get(&10), Some(&1));
         // A lost "detach" cannot exist: the next declaration omits 11.
         assert!(l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 105));
-        assert!(l.attachments().get(&11).is_none());
+        assert!(!l.attachments().contains_key(&11));
         // Re-declaring the same set changes nothing.
         assert!(!l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 110));
     }
@@ -249,22 +242,24 @@ mod tests {
     }
 
     #[test]
-    fn a_relays_own_lease_expiring_keeps_its_attachments() {
+    fn control_leases_expiring_do_not_detach_anyone() {
         let mut l = Leases::default();
         l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100);
         l.seen(10, 100);
         let mut gone = l.expire(200, 15);
         gone.sort();
         assert_eq!(gone, vec![1, 10]);
-        // Relay 1 went silent to us, but its clients were not detached...
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100);
-        l.seen(10, 300);
-        l.expire(310, 15); // relay 1 expires, client 10 is fine
-        assert!(!l.is_online(1));
-        assert_eq!(l.attachments().get(&10), Some(&1), "the relay can still forward for it");
-        // ...until the *client's* lease expires.
-        l.expire(400, 15);
-        assert!(l.attachments().get(&10).is_none());
+        assert!(!l.is_online(1) && !l.is_online(10));
+        // Neither the relay's nor the client's silence to *us* changes
+        // the fact that the relay holds the client's session.
+        assert_eq!(l.attachments().get(&10), Some(&1));
+        // The relay stops declaring it: now it is gone.
+        l.heartbeat(1, Role::Relay, &hb(&[]), 300);
+        assert!(!l.attachments().contains_key(&10));
+        // Explicit removal drops claims at once.
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 400);
+        l.remove(10);
+        assert!(!l.attachments().contains_key(&10));
     }
 
     #[test]

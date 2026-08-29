@@ -1316,9 +1316,11 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "ipnet",
- "libc",
+ "nqvpn-endpoint",
  "nqvpn-proto",
  "nqvpn-relay",
+ "nqvpn-session",
+ "nqvpn-sync",
  "quinn",
  "rand 0.8.7",
  "serde",
@@ -1328,7 +1330,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "tun-rs",
 ]
 
 [[package]]
@@ -1360,15 +1361,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "nqvpn-probe"
+name = "nqvpn-endpoint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
+ "getifaddrs",
+ "ipnet",
+ "libc",
  "nqvpn-proto",
- "quinn",
- "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
+ "tun-rs",
 ]
 
 [[package]]
@@ -1411,17 +1415,49 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "ipnet",
- "nqvpn-client",
+ "nqvpn-endpoint",
  "nqvpn-proto",
+ "nqvpn-session",
+ "nqvpn-sync",
  "quinn",
  "rand 0.8.7",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nqvpn-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "ed25519-dalek",
+ "nqvpn-proto",
+ "quinn",
+ "rand 0.8.7",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nqvpn-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ipnet",
+ "nqvpn-proto",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

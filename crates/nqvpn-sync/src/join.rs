@@ -64,15 +64,39 @@ pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &Stat
 /// would pin the runtime's shutdown). Every attempt itself runs on the
 /// blocking pool.
 pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> JoinResponse {
+    join_with_backoff_reporting(cfg, identity, keys, |_| {}).await
+}
+
+/// As `join_with_backoff_async`, telling the owner when the coordinator
+/// starts and stops refusing it (`on_refused(true)` on the first
+/// refusal, `on_refused(false)` when accepted again). A refused member
+/// must not keep carrying traffic on stale facts; the owner decides
+/// what to suspend.
+pub async fn join_with_backoff_reporting(
+    cfg: Arc<MemberConfig>,
+    identity: TlsIdentity,
+    keys: StaticKeys,
+    on_refused: impl Fn(bool),
+) -> JoinResponse {
     let mut state = Retry::default();
     loop {
         let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
         let wait = match tokio::task::spawn_blocking(move || join_once(&c, &i, &k)).await {
             Ok(Ok(r)) => {
+                if state.refused > 0 {
+                    on_refused(false);
+                }
                 state.accepted();
                 return r;
             }
-            Ok(Err(e)) => state.failed(&e),
+            Ok(Err(e)) => {
+                let first_refusal = e.is_terminal() && state.refused == 0;
+                let wait = state.failed(&e);
+                if first_refusal {
+                    on_refused(true);
+                }
+                wait
+            }
             Err(e) => {
                 tracing::error!("join task failed: {e}");
                 Duration::from_secs(5)

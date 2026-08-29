@@ -66,6 +66,20 @@ impl nqvpn_sync::link::MemberHooks for Hooks {
             None => {}
         }
     }
+
+    fn refused(&self, refused: bool) {
+        self.on_refused(refused);
+    }
+}
+
+impl Hooks {
+    fn on_refused(&self, refused: bool) {
+        if refused {
+            self.net.suspend("relay refused by the coordinator (disabled, deleted, or token regenerated)");
+        } else {
+            tracing::info!(network = %self.net.network_id, "accepted again; serving");
+        }
+    }
 }
 
 fn host_prefixes(r: &nqvpn_proto::api::JoinResponse) -> Vec<ipnet::IpNet> {

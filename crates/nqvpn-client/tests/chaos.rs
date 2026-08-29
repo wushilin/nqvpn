@@ -626,6 +626,43 @@ async fn a_different_machine_joining_as_the_same_node_replaces_it() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_a_relay_moves_its_clients_and_reenabling_brings_it_back() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Disable whichever relay `a` is attached to. The relay keeps its
+    // process (disable is a lever) but must stop carrying traffic, and
+    // `a` must move to the survivor quickly — not wait for a session to
+    // time out.
+    let disabled_id = a.attached_to().expect("attached");
+    let disabled = format!("r{disabled_id}");
+    w.coord().state.set_disabled(NET, &disabled, true).unwrap();
+    wait_until("clients leave the disabled relay", Duration::from_secs(15), || {
+        a.attached_to() != Some(disabled_id) && b.attached_to() != Some(disabled_id)
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    // The disabled relay is refused, not stopped: it keeps retrying.
+    assert!(r1.stop_reason().is_none() && r2.stop_reason().is_none());
+
+    // Enable it again: it is accepted, serves once more, and clients may
+    // attach to it — nobody restarted anything.
+    w.coord().state.set_disabled(NET, &disabled, false).unwrap();
+    wait_until("the relay is dialable again", Duration::from_secs(30), || {
+        w.coord().net().lock().unwrap().directory.published.relays.iter().any(|r| r.name == disabled)
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    std::mem::forget(r1);
+    std::mem::forget(r2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
     let (w, rp) = World::new(&[1], &[10, 20]).await;
     let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;

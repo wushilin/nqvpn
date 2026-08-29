@@ -14,6 +14,6 @@ pub mod join;
 pub mod link;
 pub mod reconcile;
 
-pub use join::{join_with_backoff, join_with_backoff_async, MemberConfig};
+pub use join::{join_with_backoff, join_with_backoff_async, join_with_backoff_reporting, MemberConfig};
 pub use link::{run_member, run_session, LinkHandle, LocalFacts, MemberExit, SessionParams, View, EXIT_REPLACED};
 pub use reconcile::{spawn_reconciler, Reconcile};

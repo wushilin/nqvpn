@@ -135,6 +135,19 @@ impl RelayNet {
 
     /// Close the mesh link to `peer` from this side, as a link failure
     /// would. The dialer (whichever side dials) re-establishes it.
+    /// The coordinator refuses this relay (disabled, deleted, token
+    /// regenerated): everything it knows is stale, so it carries nothing
+    /// until accepted again — every session is closed and new ones are
+    /// refused at `verify`. Members re-attach elsewhere at once.
+    pub fn suspend(&self, why: &str) {
+        let clients: Vec<Arc<Session>> = self.clients.read().unwrap().values().map(|h| h.session.clone()).collect();
+        let mesh: Vec<Arc<Session>> = self.mesh.read().unwrap().values().map(|h| h.session.clone()).collect();
+        tracing::warn!(network = %self.network_id, clients = clients.len(), mesh = mesh.len(), "suspending: {why}");
+        for s in clients.into_iter().chain(mesh) {
+            s.close(CLOSE_EVICTED, why);
+        }
+    }
+
     pub fn close_mesh(&self, peer: NodeId) -> bool {
         match self.mesh.read().unwrap().get(&peer) {
             Some(h) => {
@@ -475,6 +488,7 @@ impl Verifier for RelayNet {
         .map_err(|e| anyhow!("credential rejected: {e}"))?;
         anyhow::ensure!(claims.cert_fp == presented_fp, "cert_fp mismatch: credential {} vs TLS {presented_fp}", claims.cert_fp);
         anyhow::ensure!(claims.node_id != self.my_node_id, "a member may not connect to itself");
+        anyhow::ensure!(!self.link.is_refused(), "this relay is currently refused by the coordinator");
         // The view is the authority once we have one: a node it does not
         // list (deleted, disabled, or simply not yet pushed — the member
         // retries in a second) is refused, and one it lists with a newer

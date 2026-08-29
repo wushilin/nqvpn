@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
-use crate::join::{join_with_backoff_async, renew_after, MemberConfig};
+use crate::join::{join_with_backoff_reporting, renew_after, MemberConfig};
 
 /// The member's copy of the network view. Pure data: replaced by a
 /// snapshot, mutated by a delta, read by everyone else.
@@ -107,6 +107,9 @@ pub struct LinkHandle {
     refresh: Mutex<Option<String>>,
     stop: Mutex<Option<MemberExit>>,
     stop_notify: Notify,
+    /// The coordinator is currently refusing this member (disabled,
+    /// deleted, token regenerated). Cleared when a join is accepted.
+    refused: std::sync::atomic::AtomicBool,
 }
 
 /// The coordinator closed the session because this member's
@@ -187,6 +190,16 @@ impl LinkHandle {
     /// Set once this member has been kicked out; never cleared.
     pub fn stop_reason(&self) -> Option<MemberExit> {
         self.stop.lock().unwrap().clone()
+    }
+
+    pub fn set_refused(&self, refused: bool) {
+        self.refused.store(refused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While true the member must not carry traffic: whatever it knows
+    /// about the network is stale, and the coordinator says it is out.
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// A local fact changed: heartbeat now instead of at the next tick.
@@ -354,6 +367,13 @@ pub trait MemberHooks: Send + Sync {
     /// installs addresses, updates relay lists it dials, and passes the
     /// renewed credential to its data sessions.
     fn joined(&self, r: &JoinResponse);
+
+    /// The coordinator started (`true`) or stopped (`false`) refusing
+    /// this member. While refused, the owner must suspend its data
+    /// plane: a relay drops every session it holds and accepts none, a
+    /// client drops its uplink. `LinkHandle::is_refused` says the same
+    /// for code paths that run later.
+    fn refused(&self, _refused: bool) {}
 }
 
 /// The whole member control loop: join, hold a session, reconnect with
@@ -393,7 +413,11 @@ pub async fn run_member(
                 if handle.stop_reason().is_some() {
                     return;
                 }
-                let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
+                let r = join_with_backoff_reporting(cfg.clone(), identity.clone(), keys.clone(), |refused| {
+                    handle.set_refused(refused);
+                    hooks.refused(refused);
+                })
+                .await;
                 wait = renew_after(&r.credential);
                 *credential.lock().unwrap() = r.credential.clone();
                 if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
@@ -454,7 +478,11 @@ pub async fn run_member(
         if let Some(exit) = handle.stop_reason() {
             return exit;
         }
-        let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
+        let r = join_with_backoff_reporting(cfg.clone(), identity.clone(), keys.clone(), |refused| {
+            handle.set_refused(refused);
+            hooks.refused(refused);
+        })
+        .await;
         *credential.lock().unwrap() = r.credential.clone();
         if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
             *control_addr.lock().unwrap() = a;

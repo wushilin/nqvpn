@@ -205,6 +205,12 @@ impl Client {
                 // Replaced by another instance: the process exits.
                 return;
             }
+            if self.link.is_refused() {
+                // Disabled (or similar) at the coordinator: nothing to
+                // attach to until it accepts us again.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
             let candidates: Vec<RelayEntry> = self.view.with(|s| {
                 s.relays.iter().map(|r| RelayEntry { relay_id: r.relay_id, name: r.name.clone(), addr: r.addr.clone(), cert_fp: r.cert_fp.clone() }).collect()
             });
@@ -299,6 +305,16 @@ impl LocalFacts for Client {
 }
 
 impl MemberHooks for Client {
+    fn refused(&self, refused: bool) {
+        if refused {
+            tracing::warn!("refused by the coordinator; dropping the uplink until accepted again");
+            self.uplink.set(None, None);
+            if let Some(s) = self.uplink.session() {
+                s.close(CLOSE_EVICTED, "refused by the coordinator");
+            }
+        }
+    }
+
     /// Every join is the coordinator's current word on who we are:
     /// credential, address, preferred relay. Applied by diff, so a
     /// join that changed nothing changes nothing.
@@ -429,14 +445,21 @@ impl Client {
         // coordinator no longer lists me behind it. Drop it; the
         // uplink loop re-attaches to the fleet as published. A relay
         // that merely left the fleet closes its sessions itself.
+        // Likewise a relay the coordinator no longer lists at all
+        // (disabled, deleted): it may still answer, but nothing routes
+        // through it any more. The fleet list does not depend on a
+        // relay's liveness, so "gone" is never a transient.
         let attached = c.uplink.attached_to.lock().unwrap().clone();
         if let Some(a) = attached {
-            if let Some(r) = view.relays.iter().find(|r| r.relay_id == a.relay_id) {
-                if r.addr != a.addr || r.cert_fp != a.cert_fp {
-                    tracing::warn!(relay = %a.name, old = %a.addr, new = %r.addr, "attached relay re-registered elsewhere; re-attaching");
-                    if let Some(s) = c.uplink.session() {
-                        s.close(CLOSE_EVICTED, "relay re-registered elsewhere");
-                    }
+            let stale = match view.relays.iter().find(|r| r.relay_id == a.relay_id) {
+                Some(r) if r.addr != a.addr || r.cert_fp != a.cert_fp => Some("relay re-registered elsewhere"),
+                None if !view.members.is_empty() => Some("relay left the fleet"),
+                _ => None,
+            };
+            if let Some(why) = stale {
+                tracing::warn!(relay = %a.name, %why, "re-attaching");
+                if let Some(s) = c.uplink.session() {
+                    s.close(CLOSE_EVICTED, why);
                 }
             }
         }

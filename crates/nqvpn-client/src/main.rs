@@ -46,10 +46,7 @@ async fn run(cli: Cli) -> Result<()> {
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
-    let joined = {
-        let (m, i, k) = (member.clone(), identity.clone(), keys.clone());
-        tokio::task::spawn_blocking(move || nqvpn_sync::join_with_backoff(&m, &i, &k)).await?
-    };
+    let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
     tracing::info!(node_id = joined.node_id, name = %joined.name, ip4 = ?joined.ip4, relays = joined.relays.len(), "joined {}", cfg.network_id);
 
     let _guard = if cli.dry_run {

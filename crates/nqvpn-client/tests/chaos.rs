@@ -1,0 +1,598 @@
+//! Whole-system chaos tests: a real coordinator (HTTPS join + QUIC
+//! control), real relays, and many clients on fake TUNs, all in one
+//! process. Nothing touches the kernel. Each test breaks something and
+//! checks that traffic converges back without anyone being restarted by
+//! hand — the property the design is built around.
+
+use anyhow::Result;
+use nqvpn_client::client::{Client, ClientReconciler};
+use nqvpn_coord::config::{load_networks, CoordConfig};
+use nqvpn_coord::registry::Registry;
+use nqvpn_coord::signer::Keyring;
+use nqvpn_coord::state::{now_unix, AppState, NetState};
+use nqvpn_endpoint::routes::{RecordingProgrammer, RouteSet};
+use nqvpn_endpoint::tun::FakeTun;
+use nqvpn_proto::api::JoinResponse;
+use nqvpn_proto::identity::TlsIdentity;
+use nqvpn_proto::seal::StaticKeys;
+use nqvpn_proto::transport::Mode;
+use nqvpn_proto::types::{NodeId, Role};
+use nqvpn_relay::net::{Fleet, NetReconciler, RelayNet};
+use nqvpn_sync::join::MemberConfig;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const NET: &str = "n1";
+const SECRET: &str = "chaos-secret";
+
+/// Ports are allocated from a moving base so tests can run in parallel
+/// and a restarted coordinator can rebind the same ones.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(24000);
+fn port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn net_toml(relays: &[(NodeId, u16)], clients: &[NodeId]) -> String {
+    let mut s = format!(
+        "network_id = \"{NET}\"\ncidrs = [\"10.99.0.0/16\"]\n[pools.default]\ncidr = \"10.99.1.0/24\"\n\
+         [settings]\nheartbeat_secs = 1\noffline_after = 3\nhold_down_secs = 0\nallow_loopback_relays = true\ntransport = \"datagram\"\n"
+    );
+    for (id, p) in relays {
+        s.push_str(&format!("[relays.r{id}]\nnode_id = {id}\nsecret = \"{SECRET}\"\nrelay_addr = \"127.0.0.1:{p}\"\n"));
+    }
+    for id in clients {
+        s.push_str(&format!("[clients.c{id}]\nnode_id = {id}\nsecret = \"{SECRET}\"\n"));
+    }
+    s
+}
+
+struct Coord {
+    state: Arc<AppState>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Coord {
+    async fn start(dir: &Path, api_port: u16, quic_port: u16, toml: &str) -> Coord {
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+                .with_test_writer()
+                .try_init();
+        });
+        let netd = dir.join("networks.d");
+        std::fs::create_dir_all(&netd).unwrap();
+        std::fs::write(netd.join(format!("{NET}.toml")), toml).unwrap();
+        let cfgs = load_networks(&netd).unwrap();
+        let coord: CoordConfig = toml::from_str(&format!(
+            "[listen]\napi = \"127.0.0.1:{api_port}\"\nquic = \"127.0.0.1:{quic_port}\"\n[state]\ndir = \"{}\"\n",
+            dir.display()
+        ))
+        .unwrap();
+        let keyring = Keyring::load_or_create(&dir.join("signing.json"), now_unix()).unwrap();
+        let mut networks = HashMap::new();
+        for cfg in cfgs {
+            let path = dir.join(format!("registry-{}.json", cfg.network_id));
+            networks.insert(cfg.network_id.clone(), Mutex::new(NetState::new(cfg, Registry::load_or_create(&path).unwrap(), path)));
+        }
+        let state = Arc::new(AppState {
+            coord,
+            admin_token: Some("tok".into()),
+            networks,
+            keyring,
+            join_rate: Mutex::new(Default::default()),
+            networks_dir: Some(netd),
+            secrets: Mutex::new(nqvpn_coord::secrets::SecretStore::default()),
+            secrets_path: dir.join("secrets.toml"),
+            control_port: quic_port,
+        });
+        let identity = TlsIdentity::generate("coord").unwrap();
+        let mut tasks = Vec::new();
+        let ep = nqvpn_coord::control::bind(format!("127.0.0.1:{quic_port}").parse().unwrap(), &identity).unwrap();
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = nqvpn_coord::control::serve(s, ep).await;
+        }));
+        tasks.push(tokio::spawn(nqvpn_coord::control::liveness_sweep(state.clone())));
+        let app = nqvpn_coord::api::router(state.clone());
+        let tls = axum_server::tls_rustls::RustlsConfig::from_der(vec![identity.cert_der.clone()], identity.private_key().secret_der().to_vec()).await.unwrap();
+        let listener = std::net::TcpListener::bind(format!("127.0.0.1:{api_port}")).unwrap();
+        tasks.push(tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, tls).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await;
+        }));
+        Coord { state, tasks }
+    }
+
+    /// Stop everything: sessions drop, ports free.
+    fn stop(self) {
+        for t in self.tasks {
+            t.abort();
+        }
+        for net in self.state.networks.values() {
+            let ns = net.lock().unwrap();
+            for s in ns.sessions.values() {
+                s.conn.close(0u32.into(), b"coordinator stopping");
+            }
+        }
+    }
+
+    fn attachment_of(&self, node: NodeId) -> Option<NodeId> {
+        self.state.networks[NET].lock().unwrap().directory.published.attachment_of(node)
+    }
+
+    fn online(&self, node: NodeId) -> bool {
+        self.state.networks[NET].lock().unwrap().leases.is_online(node)
+    }
+
+    fn gen(&self) -> u64 {
+        self.state.networks[NET].lock().unwrap().directory.gen
+    }
+}
+
+fn member(coord_url: &str, node_id: NodeId, role: Role, relay_addr: Option<String>) -> Arc<MemberConfig> {
+    Arc::new(MemberConfig {
+        coordinator: coord_url.to_string(),
+        network_id: NET.into(),
+        node_id,
+        secret: SECRET.into(),
+        tls: nqvpn_proto::joinapi::JoinTls::default(),
+        role,
+        want_vpn_ip: role == Role::Client,
+        pool: None,
+        preferred_ip4: None,
+        preferred_ip6: None,
+        local_cidrs: vec![],
+        relay_addr,
+    })
+}
+
+async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
+    nqvpn_sync::join_with_backoff_async(cfg.clone(), id.clone(), keys.clone()).await
+}
+
+struct RelayHandle {
+    net: Arc<RelayNet>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    sync: Option<tokio::task::JoinHandle<()>>,
+    endpoint: quinn::Endpoint,
+    cfg: Arc<MemberConfig>,
+    identity: TlsIdentity,
+    keys: StaticKeys,
+}
+
+struct RelayHooks(Arc<RelayNet>);
+impl nqvpn_sync::link::MemberHooks for RelayHooks {
+    fn joined(&self, r: &JoinResponse) {
+        self.0.set_credential(&r.credential);
+        self.0.set_signing_keys(&r.coordinator_signing_keys);
+    }
+}
+
+impl RelayHandle {
+    async fn start(coord_url: &str, node_id: NodeId, listen_port: u16) -> RelayHandle {
+        let identity = TlsIdentity::generate(&format!("relay{node_id}")).unwrap();
+        let keys = StaticKeys::generate().unwrap();
+        let cfg = member(coord_url, node_id, Role::Relay, Some(format!("127.0.0.1:{listen_port}")));
+        let endpoint = quinn::Endpoint::server(
+            nqvpn_proto::quic::server_config(&identity, 1).unwrap(),
+            format!("127.0.0.1:{listen_port}").parse().unwrap(),
+        )
+        .unwrap();
+        let joined = join(&cfg, &identity, &keys).await;
+        let net = RelayNet::new(NET.into(), joined.network_uuid.clone(), node_id, identity.clone(), joined.credential.clone(), Mode::parse(&joined.transport), 1, 0, 1);
+        net.set_signing_keys(&joined.coordinator_signing_keys);
+        let mut nets = HashMap::new();
+        nets.insert(NET.to_string(), net.clone());
+        let tasks = vec![
+            tokio::spawn(Arc::new(Fleet { nets }).accept_loop(endpoint.clone())),
+            nqvpn_sync::spawn_reconciler(net.view.clone(), Arc::new(NetReconciler(net.clone())), Duration::from_secs(1)),
+        ];
+        let mut h = RelayHandle { net, tasks, sync: None, endpoint, cfg, identity, keys };
+        h.start_sync(joined);
+        h
+    }
+
+    fn start_sync(&mut self, joined: JoinResponse) {
+        let net = self.net.clone();
+        self.sync = Some(tokio::spawn(nqvpn_sync::run_member(
+            self.cfg.clone(),
+            self.identity.clone(),
+            self.keys.clone(),
+            joined,
+            net.view.clone(),
+            net.clone(),
+            net.link.clone(),
+            Arc::new(RelayHooks(net.clone())),
+        )));
+    }
+
+    /// Cut the relay's control link (its data plane keeps running).
+    fn cut_control(&mut self) {
+        if let Some(t) = self.sync.take() {
+            t.abort();
+        }
+    }
+
+    async fn restore_control(&mut self) {
+        let joined = join(&self.cfg, &self.identity, &self.keys).await;
+        self.net.set_credential(&joined.credential);
+        self.start_sync(joined);
+    }
+
+    /// Crash: everything stops, all sessions die.
+    fn kill(self) {
+        for t in self.tasks {
+            t.abort();
+        }
+        if let Some(t) = self.sync {
+            t.abort();
+        }
+        self.endpoint.close(0u32.into(), b"relay killed");
+    }
+}
+
+struct ClientHandle {
+    client: Arc<Client>,
+    tun: Arc<FakeTun>,
+    ip4: Ipv4Addr,
+    node_id: NodeId,
+    /// Pumps and reconciler; they end with the handle.
+    _tasks: Vec<tokio::task::JoinHandle<()>>,
+    sync: Option<tokio::task::JoinHandle<()>>,
+    cfg: Arc<MemberConfig>,
+    identity: TlsIdentity,
+    keys: StaticKeys,
+}
+
+impl ClientHandle {
+    async fn start(coord_url: &str, node_id: NodeId) -> ClientHandle {
+        let identity = TlsIdentity::generate(&format!("client{node_id}")).unwrap();
+        let keys = StaticKeys::generate().unwrap();
+        let cfg = member(coord_url, node_id, Role::Client, None);
+        let joined = join(&cfg, &identity, &keys).await;
+        let tun = FakeTun::new(joined.mtu);
+        let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes, None);
+        client.spawn_pumps();
+        let tasks = vec![
+            nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
+            tokio::spawn(client.clone().run_uplink()),
+        ];
+        let ip4 = joined.ip4.expect("address");
+        let mut h = ClientHandle { client, tun, ip4, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
+        h.start_sync(joined);
+        h
+    }
+
+    fn start_sync(&mut self, joined: JoinResponse) {
+        let c = self.client.clone();
+        self.sync = Some(tokio::spawn(nqvpn_sync::run_member(
+            self.cfg.clone(),
+            self.identity.clone(),
+            self.keys.clone(),
+            joined,
+            c.view.clone(),
+            c.clone(),
+            c.link.clone(),
+            c.clone(),
+        )));
+    }
+
+    /// Cut the control link; the uplink and its traffic are untouched.
+    fn cut_control(&mut self) {
+        if let Some(t) = self.sync.take() {
+            t.abort();
+        }
+    }
+
+    async fn restore_control(&mut self) {
+        let joined = join(&self.cfg, &self.identity, &self.keys).await;
+        self.start_sync(joined);
+    }
+
+    fn attached_to(&self) -> Option<NodeId> {
+        self.client.uplink.attached_to.lock().unwrap().as_ref().map(|(id, _)| *id)
+    }
+
+    fn uplink_ends(&self) -> u64 {
+        self.client.counters.uplink_ends.load(Ordering::Relaxed)
+    }
+}
+
+fn v4_packet(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 20];
+    p[0] = 0x45;
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    p.extend_from_slice(payload);
+    p
+}
+
+/// One packet from `a` to `b`, delivered within `timeout`? Retries the
+/// send every 300 ms: during a handshake or a re-attach the first ones
+/// are queued or dropped by design.
+async fn ping(a: &ClientHandle, b: &ClientHandle, timeout: Duration) -> bool {
+    static SEQ: AtomicU16 = AtomicU16::new(0);
+    let tag = format!("ping-{}-{}-{}", a.node_id, b.node_id, SEQ.fetch_add(1, Ordering::Relaxed));
+    let pkt = v4_packet(a.ip4, b.ip4, tag.as_bytes());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        a.tun.inject(pkt.clone()).await;
+        let step = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < step {
+            if b.tun.written().iter().any(|w| w.ends_with(tag.as_bytes())) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+    }
+}
+
+async fn all_pairs_reach(clients: &[&ClientHandle], timeout: Duration) -> Result<()> {
+    for a in clients {
+        for b in clients {
+            if a.node_id != b.node_id {
+                anyhow::ensure!(ping(a, b, timeout).await, "{} -> {} never arrived", a.node_id, b.node_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wait_until(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !f() {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+struct World {
+    dir: tempfile::TempDir,
+    coord: Option<Coord>,
+    api_port: u16,
+    quic_port: u16,
+    toml: String,
+}
+
+impl World {
+    async fn new(relays: &[NodeId], clients: &[NodeId]) -> (World, Vec<(NodeId, u16)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (api_port, quic_port) = (port(), port());
+        let relay_ports: Vec<(NodeId, u16)> = relays.iter().map(|r| (*r, port())).collect();
+        let toml = net_toml(&relay_ports, clients);
+        let coord = Coord::start(dir.path(), api_port, quic_port, &toml).await;
+        // Skip the restart grace for the first start.
+        coord.state.networks[NET].lock().unwrap().started_at = 0;
+        (World { dir, coord: Some(coord), api_port, quic_port, toml }, relay_ports)
+    }
+
+    fn url(&self) -> String {
+        format!("https://127.0.0.1:{}", self.api_port)
+    }
+
+    fn coord(&self) -> &Coord {
+        self.coord.as_ref().expect("coordinator running")
+    }
+
+    async fn restart_coordinator(&mut self) {
+        if let Some(c) = self.coord.take() {
+            c.stop();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.coord = Some(Coord::start(self.dir.path(), self.api_port, self.quic_port, &self.toml).await);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_clients_across_two_relays_all_reach_each_other() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 11, 20, 21]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let clients = [
+        ClientHandle::start(&w.url(), 10).await,
+        ClientHandle::start(&w.url(), 11).await,
+        ClientHandle::start(&w.url(), 20).await,
+        ClientHandle::start(&w.url(), 21).await,
+    ];
+    let refs: Vec<&ClientHandle> = clients.iter().collect();
+    all_pairs_reach(&refs, Duration::from_secs(20)).await?;
+    wait_until("coordinator and clients agree on attachments", Duration::from_secs(10), || {
+        clients.iter().all(|c| w.coord().attachment_of(c.node_id) == c.attached_to() && c.attached_to().is_some())
+    })
+    .await?;
+    wait_until("mesh formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![2] && r2.net.mesh_peers() == vec![1]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_crash_moves_its_clients_and_traffic_resumes() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Kill whichever relay `a` is on.
+    let dead = a.attached_to().expect("attached");
+    if dead == 1 {
+        r1.kill();
+        std::mem::forget(r2);
+    } else {
+        r2.kill();
+        std::mem::forget(r1);
+    }
+    wait_until("clients leave the dead relay", Duration::from_secs(30), || a.attached_to() != Some(dead) && b.attached_to() != Some(dead)).await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(30)).await?;
+    wait_until("coordinator sees the new attachments", Duration::from_secs(10), || {
+        w.coord().attachment_of(10) == a.attached_to() && w.coord().attachment_of(20) == b.attached_to()
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_loses_its_coordinator_link_keeps_forwarding_both_ways() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let _r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let mut a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    a.cut_control();
+    wait_until("coordinator marks a offline", Duration::from_secs(15), || !w.coord().online(10)).await?;
+    // The scenario that used to end in permanent one-way traffic.
+    for _ in 0..3 {
+        assert!(ping(&a, &b, Duration::from_secs(5)).await, "a -> b while a's control link is down");
+        assert!(ping(&b, &a, Duration::from_secs(5)).await, "b -> a while a's control link is down");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(w.coord().attachment_of(10), a.attached_to(), "the relay's declaration outlives the client's lease");
+    a.restore_control().await;
+    wait_until("a is back online", Duration::from_secs(15), || w.coord().online(10)).await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_that_lose_their_coordinator_link_keep_forwarding() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let mut r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let mut r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Cut *both* relays' control links: the coordinator now hears nothing
+    // from the data plane at all.
+    r1.cut_control();
+    r2.cut_control();
+    wait_until("coordinator marks both relays offline", Duration::from_secs(15), || !w.coord().online(1) && !w.coord().online(2)).await?;
+    for _ in 0..3 {
+        all_pairs_reach(&[&a, &b], Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(w.coord().attachment_of(10).is_some(), "attachments survive a relay's lease expiring");
+    r1.restore_control().await;
+    r2.restore_control().await;
+    wait_until("relays back online", Duration::from_secs(15), || w.coord().online(1) && w.coord().online(2)).await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_coordinator_restart_never_interrupts_traffic() -> Result<()> {
+    let (mut w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let _r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    let gen_before = w.coord().gen();
+
+    w.restart_coordinator().await;
+    // While members reconnect and the new coordinator collects, the data
+    // plane must not notice.
+    for _ in 0..6 {
+        all_pairs_reach(&[&a, &b], Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    wait_until("everyone re-registered with the new coordinator", Duration::from_secs(30), || {
+        w.coord().online(1) && w.coord().online(2) && w.coord().online(10) && w.coord().online(20)
+            && w.coord().attachment_of(10).is_some() && w.coord().attachment_of(20).is_some()
+    })
+    .await?;
+    assert!(w.coord().gen() > gen_before, "generations never go backwards across a restart");
+    wait_until("views converge", Duration::from_secs(15), || {
+        let g = w.coord().gen();
+        a.client.view.gen() == g && b.client.view.gen() == g
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_different_machine_joining_as_the_same_node_replaces_it() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let mut a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // Stop the old instance renewing (or the two would take turns
+    // replacing each other every renewal — by design), keep its uplink.
+    a.cut_control();
+    let ends_before = a.uplink_ends();
+    // Same node id and secret, from a machine with different keys.
+    let a2 = ClientHandle::start(&w.url(), 10).await;
+    wait_until("the old instance is thrown off its relay", Duration::from_secs(15), || a.uplink_ends() > ends_before).await?;
+    all_pairs_reach(&[&a2, &b], Duration::from_secs(20)).await?;
+    // The old instance keeps trying with its stale credential and is
+    // refused; it never carries traffic again.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!ping(&a, &b, Duration::from_secs(3)).await, "the replaced instance must not keep forwarding");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_a_member_evicts_it_from_the_data_plane() -> Result<()> {
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    let ends_before = a.uplink_ends();
+    {
+        let mut ns = w.coord().state.networks[NET].lock().unwrap();
+        ns.registry.members.get_mut(&10).unwrap().disabled = true;
+        ns.close_session(10, "disabled");
+        ns.leases.remove(10);
+        w.coord().state.publish(&mut ns);
+    }
+    wait_until("a loses its uplink", Duration::from_secs(15), || a.uplink_ends() > ends_before).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!ping(&a, &b, Duration::from_secs(3)).await, "disabled member must not reach anyone");
+    assert!(!ping(&b, &a, Duration::from_secs(3)).await, "nor be reachable");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_flapping_converges() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20, 30]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let _r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    let c = ClientHandle::start(&w.url(), 30).await;
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+
+    // r1 crashes and comes back twice, under load.
+    let mut r1 = Some(r1);
+    for _ in 0..2 {
+        r1.take().unwrap().kill();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        r1 = Some(RelayHandle::start(&w.url(), 1, rp[0].1).await);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    all_pairs_reach(&[&a, &b, &c], Duration::from_secs(30)).await?;
+    wait_until("the coordinator's attachments match the clients'", Duration::from_secs(15), || {
+        [&a, &b, &c].iter().all(|x| w.coord().attachment_of(x.node_id) == x.attached_to() && x.attached_to().is_some())
+    })
+    .await?;
+    let r1 = r1.take().unwrap();
+    wait_until("mesh re-formed", Duration::from_secs(10), || r1.net.mesh_peers() == vec![2]).await?;
+    Ok(())
+}

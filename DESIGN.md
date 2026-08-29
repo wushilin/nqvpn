@@ -169,6 +169,11 @@ reissued immediately. Relays use the identical mechanism.
   requires the peer's live certificate to equal the credential's
   `cert_fp`: a stolen credential is useless without the private key. This
   binds a session to a join; it can never refuse a join.
+- A relay admits a session only for a node its current view lists (or
+  any node while it has no view yet); a node the view does not list —
+  deleted, disabled, or simply not pushed yet — is refused and retries a
+  second later. Once admitted, a session is evicted only by `reconcile`
+  when the view drops the node or shows a newer `login_gen`.
 - **HTTPS by default, `trust_any_cert = true` by default.** The
   coordinator serves a self-signed certificate it generates on first
   start (the same identity as its QUIC control port) unless `[tls]` names
@@ -393,14 +398,17 @@ session id) with a sequence number, and for each client **the most
 recent declaration wins** — a sequence, not a clock, so a move that
 completes within a millisecond still has exactly one winner; a relay's
 own session id makes a re-attach a new declaration. An attachment goes
-away only when no relay declares it, or when the client's lease expires,
-or when the member is deleted/disabled. **A relay's own lease expiring
-does not detach its clients**: a relay that cannot reach the coordinator
-can still forward for them.
+away only when no relay declares it, or when the member is
+deleted/disabled. **Neither side's control lease matters**: a relay that
+cannot reach the coordinator still forwards for its clients, and a
+client that cannot reach the coordinator is still attached to its relay
+— the relay holds the session, and reports it for as long as it lasts
+(a dead client's session ends at the relay's QUIC idle timeout, and the
+declaration with it).
 
 | Scenario | What happens |
 |---|---|
-| Client loses its coordinator path, relay fine | Lease expires → offline, routes withdrawn. Its relay session is untouched (nothing evicts a live session from outside); back on the next heartbeat. Zero data-plane effect. |
+| Client loses its coordinator path, relay fine | Lease expires → offline, routes withdrawn. Its relay session and its attachment are untouched (nothing evicts a live session from outside; the relay keeps declaring it); back on the next heartbeat. Zero data-plane effect, in both directions. |
 | Relay loses its coordinator path | Its lease expires; its clients' attachments outlive it; mesh peers keep forwarding to it. It reconnects with `have_gen` and catches up by deltas. |
 | Coordinator restart | Members keep their views; the coordinator collects heartbeats for 2×`heartbeat_secs`, then publishes; generations continue above the old ones. |
 | Relay dies | Its clients' probes fail within ~10 s → re-attach elsewhere → new declarations win. Mesh peers' probes fail → dialers reconnect with backoff. Its routes withdraw at lease expiry; a standby gateway takes over. |

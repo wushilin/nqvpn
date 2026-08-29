@@ -71,8 +71,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<()> {
     let mut guards = Vec::new();
     for ncfg in &cfg.networks {
         let member = Arc::new(member_config(&cfg, ncfg)?);
-        let (m, i, k) = (member.clone(), identity.clone(), keys.clone());
-        let joined = tokio::task::spawn_blocking(move || nqvpn_sync::join_with_backoff(&m, &i, &k)).await?;
+        let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
         tracing::info!(network = %ncfg.network_id, node_id = joined.node_id, relays = joined.relays.len(), "joined");
 
         let net = RelayNet::new(

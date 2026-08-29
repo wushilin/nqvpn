@@ -234,9 +234,12 @@ async fn a_change_is_pushed_as_a_delta_that_applies_cleanly() -> Result<()> {
     let cid = TlsIdentity::generate("c1")?;
     let (_, c_node) = join_as(&env, 10, Role::Client, &cid, vec![]);
     relay.until(&mut view, |v| v.member(c_node).is_some()).await?;
-    let ns = env.state.networks["n1"].lock().unwrap();
-    assert_eq!(view.gen, ns.directory.gen);
-    assert_eq!(view.digest(), ns.directory.published_digest, "deltas reproduce the coordinator's view exactly");
+    let (gen, digest) = {
+        let ns = env.state.networks["n1"].lock().unwrap();
+        (ns.directory.gen, ns.directory.published_digest)
+    };
+    assert_eq!(view.gen, gen);
+    assert_eq!(view.digest(), digest, "deltas reproduce the coordinator's view exactly");
     Ok(())
 }
 
@@ -271,9 +274,10 @@ async fn a_relay_declares_attachments_as_a_set_and_moves_win_by_recency() -> Res
     h.attached = attached(&[(c, 1)]);
     r1.heartbeat(&h).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let ns = env.state.networks["n1"].lock().unwrap();
-    assert_eq!(ns.directory.published.attachment_of(c), Some(2), "a repeated stale declaration does not win");
-    drop(ns);
+    {
+        let ns = env.state.networks["n1"].lock().unwrap();
+        assert_eq!(ns.directory.published.attachment_of(c), Some(2), "a repeated stale declaration does not win");
+    }
 
     // r1's stale session ends: it simply stops declaring. Nothing to detach.
     let mut h = hb_of(&v1);
@@ -356,19 +360,23 @@ async fn a_relay_losing_its_control_link_keeps_its_attachments() -> Result<()> {
         // drain pushes so the client's view stays current
         client.until(&mut cv, |_| true).await?;
     }
-    let ns = env.state.networks["n1"].lock().unwrap();
-    assert!(!ns.leases.is_online(1), "the relay is offline to the coordinator");
-    assert!(ns.leases.is_online(c), "the client is not");
-    assert_eq!(ns.directory.published.attachment_of(c), Some(1), "so its attachment outlives the relay's lease");
-    drop(ns);
+    {
+        let ns = env.state.networks["n1"].lock().unwrap();
+        assert!(!ns.leases.is_online(1), "the relay is offline to the coordinator");
+        assert!(ns.leases.is_online(c), "the client is not");
+        assert_eq!(ns.directory.published.attachment_of(c), Some(1), "so its attachment outlives the relay's lease");
+    }
 
     // The client's own control link going silent changes nothing either:
     // the relay holds its session, and only the relay's word ends it.
     drop(client);
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let ns = env.state.networks["n1"].lock().unwrap();
-    assert!(!ns.leases.is_online(c));
-    assert_eq!(ns.directory.published.attachment_of(c), Some(1), "still attached: the relay never stopped declaring it");
+    let (online, att) = {
+        let ns = env.state.networks["n1"].lock().unwrap();
+        (ns.leases.is_online(c), ns.directory.published.attachment_of(c))
+    };
+    assert!(!online);
+    assert_eq!(att, Some(1), "still attached: the relay never stopped declaring it");
     Ok(())
 }
 

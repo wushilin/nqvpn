@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
-use crate::join::{join_with_backoff, renew_after, MemberConfig};
+use crate::join::{join_with_backoff_async, renew_after, MemberConfig};
 
 /// The member's copy of the network view. Pure data: replaced by a
 /// snapshot, mutated by a delta, read by everyone else.
@@ -85,6 +85,18 @@ pub trait LocalFacts: Send + Sync {
     /// Filled in whole on every heartbeat; `gen`/`digest` are added by
     /// the link.
     fn heartbeat(&self) -> Heartbeat;
+}
+
+/// A task that must not outlive the future that spawned it. Dropping
+/// the guard — including when the owning future is cancelled — aborts
+/// the task, so a torn-down session never leaves a writer behind still
+/// heartbeating on its behalf.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<(), nqvpn_proto::stream::StreamError>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The link's inbox: a local change to report now, or a renewed
@@ -169,7 +181,7 @@ pub async fn run_session(
 
     // Writer: heartbeats on a timer and on kick; Refresh when handed one.
     let (resync_tx, mut resync_rx) = tokio::sync::mpsc::channel::<u64>(4);
-    let writer = {
+    let writer = AbortOnDrop({
         let (view, facts, handle) = (view.clone(), facts.clone(), handle.clone());
         let period = Duration::from_secs(params.heartbeat_secs.max(1));
         tokio::spawn(async move {
@@ -197,7 +209,7 @@ pub async fn run_session(
             #[allow(unreachable_code)]
             Ok::<_, nqvpn_proto::stream::StreamError>(())
         })
-    };
+    });
 
     let result = loop {
         let env = match read_envelope(&mut rx).await {
@@ -224,7 +236,7 @@ pub async fn run_session(
             other => tracing::debug!(kind = other, "ignoring control message"),
         }
     };
-    writer.abort();
+    drop(writer);
     conn.close(0u32.into(), b"session ended");
     result
 }
@@ -268,15 +280,7 @@ pub async fn run_member(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(wait).await;
-                let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
-                let r = match tokio::task::spawn_blocking(move || join_with_backoff(&c, &i, &k)).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("renewal task failed: {e}");
-                        wait = Duration::from_secs(60);
-                        continue;
-                    }
-                };
+                let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
                 wait = renew_after(&r.credential);
                 *credential.lock().unwrap() = r.credential.clone();
                 if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
@@ -309,14 +313,12 @@ pub async fn run_member(
         // Re-join: a fresh credential and a fresh declaration. The view
         // is kept; Hello says what we hold and the coordinator sends
         // only what changed.
-        let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
-        if let Ok(r) = tokio::task::spawn_blocking(move || join_with_backoff(&c, &i, &k)).await {
-            *credential.lock().unwrap() = r.credential.clone();
-            if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
-                *control_addr.lock().unwrap() = a;
-            }
-            hooks.joined(&r);
+        let r = join_with_backoff_async(cfg.clone(), identity.clone(), keys.clone()).await;
+        *credential.lock().unwrap() = r.credential.clone();
+        if let Ok(a) = nqvpn_proto::joinapi::control_addr(&cfg.coordinator, r.control_port) {
+            *control_addr.lock().unwrap() = a;
         }
+        hooks.joined(&r);
     }
 }
 

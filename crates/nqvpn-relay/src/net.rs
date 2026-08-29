@@ -416,12 +416,15 @@ impl Verifier for RelayNet {
         .map_err(|e| anyhow!("credential rejected: {e}"))?;
         anyhow::ensure!(claims.cert_fp == presented_fp, "cert_fp mismatch: credential {} vs TLS {presented_fp}", claims.cert_fp);
         anyhow::ensure!(claims.node_id != self.my_node_id, "a member may not connect to itself");
-        // A member the view knows with a newer login generation is a
-        // replaced instance; one the view does not know at all is still
-        // admitted (our view may simply be behind) and evicted by the
-        // next reconcile if the coordinator disagrees.
-        if let Some(m) = self.view.with(|s| s.member(claims.node_id).cloned()) {
-            anyhow::ensure!(claims.login_gen >= m.login_gen, "node {} was replaced by a newer join", claims.node_id);
+        // The view is the authority once we have one: a node it does not
+        // list (deleted, disabled, or simply not yet pushed — the member
+        // retries in a second) is refused, and one it lists with a newer
+        // login generation is a replaced instance.
+        let (known, member) = self.view.with(|s| (!s.members.is_empty(), s.member(claims.node_id).cloned()));
+        match member {
+            Some(m) => anyhow::ensure!(claims.login_gen >= m.login_gen, "node {} was replaced by a newer join", claims.node_id),
+            None if known => anyhow::bail!("node {} is not in the network view", claims.node_id),
+            None => {}
         }
         Ok(claims)
     }

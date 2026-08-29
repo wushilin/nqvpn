@@ -9,6 +9,7 @@ use nqvpn_proto::joinapi::{self, JoinError, JoinTls};
 use nqvpn_proto::seal::StaticKeys;
 use nqvpn_proto::types::{NodeId, Role};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Everything a member declares about itself.
@@ -75,6 +76,37 @@ pub fn join_with_backoff(cfg: &MemberConfig, identity: &TlsIdentity, keys: &Stat
                 std::thread::sleep(wait);
             }
         }
+    }
+}
+
+/// As `join_with_backoff`, but the waits are async so the task can be
+/// cancelled between attempts (a blocking sleep in a `spawn_blocking`
+/// would pin the runtime's shutdown). Every attempt itself runs on the
+/// blocking pool.
+pub async fn join_with_backoff_async(cfg: Arc<MemberConfig>, identity: TlsIdentity, keys: StaticKeys) -> JoinResponse {
+    let mut consecutive: u32 = 0;
+    loop {
+        let (c, i, k) = (cfg.clone(), identity.clone(), keys.clone());
+        let attempt = tokio::task::spawn_blocking(move || join_once(&c, &i, &k)).await;
+        let wait = match attempt {
+            Ok(Ok(r)) => return r,
+            Ok(Err(e)) if e.is_terminal() => {
+                let wait = joinapi::retry_delay(true, 1);
+                tracing::error!(retry_in_secs = wait.as_secs(), "join rejected: {e} — fix this at the coordinator; retrying until then");
+                wait
+            }
+            Ok(Err(e)) => {
+                consecutive = consecutive.saturating_add(1);
+                let wait = joinapi::retry_delay(false, consecutive);
+                tracing::warn!("join failed ({e}); retrying in {wait:?}");
+                wait
+            }
+            Err(e) => {
+                tracing::error!("join task failed: {e}");
+                Duration::from_secs(5)
+            }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 

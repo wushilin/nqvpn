@@ -1311,11 +1311,14 @@ name = "nqvpn-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "axum-server",
  "base64",
  "bytes",
  "clap",
  "ed25519-dalek",
  "ipnet",
+ "nqvpn-coord",
  "nqvpn-endpoint",
  "nqvpn-proto",
  "nqvpn-relay",
@@ -1323,6 +1326,7 @@ dependencies = [
  "nqvpn-sync",
  "quinn",
  "rand 0.8.7",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

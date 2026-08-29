@@ -19,7 +19,7 @@
 set -euo pipefail
 
 TARGET=x86_64-unknown-linux-musl
-BINS=(nqvpn-coord nqvpn-relay nqvpn-client nqvpn-probe)
+BINS=(nqvpn-coord nqvpn-relay nqvpn-client)
 OUT=dist/x86_64-musl
 REMOTE_DIR=${NQVPN_REMOTE_DIR:-/tmp}
 

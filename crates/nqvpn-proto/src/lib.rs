@@ -12,7 +12,6 @@ pub mod identity;
 pub mod joinapi;
 pub mod lpm;
 pub mod quic;
-pub mod rotation;
 pub mod rpc;
 pub mod seal;
 pub mod stream;

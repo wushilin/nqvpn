@@ -1,4 +1,4 @@
-//! REST request/response types for the coordinator HTTP API (§3.2, §3.4).
+//! REST request/response types for the coordinator HTTPS API (§3.2, §3.4).
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,14 @@ fn default_true() -> bool {
     true
 }
 
+/// A join is the member's **entire current declaration**. Whatever it
+/// says replaces whatever the coordinator recorded before: keys, routes,
+/// address requests, relay address. Renewal is the same request again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub network_id: String,
-    pub client_id: String,
-    pub client_secret: String,
+    pub node_id: NodeId,
+    pub secret: String,
     /// X25519 public key, base64.
     pub pubkey: String,
     pub role: Role,
@@ -38,7 +41,7 @@ pub struct JoinRequest {
     pub cert_fingerprint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayEntry {
     pub relay_id: NodeId,
     pub name: String,
@@ -52,6 +55,12 @@ pub struct JoinResponse {
     pub network_uuid: String,
     pub coordinator_signing_keys: Vec<KeyInfo>,
     pub node_id: NodeId,
+    /// The member's name, from the coordinator's config.
+    #[serde(default)]
+    pub name: String,
+    /// See `Claims::login_gen`.
+    #[serde(default)]
+    pub login_gen: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip4: Option<Ipv4Addr>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +70,7 @@ pub struct JoinResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subnet6: Option<IpNet>,
     /// Granted route registrations (relays; empty for clients).
+    #[serde(default)]
     pub granted_cidrs: Vec<IpNet>,
     pub relays: Vec<RelayEntry>,
     pub mtu: u16,
@@ -68,10 +78,17 @@ pub struct JoinResponse {
     /// Packet transport for this network: "datagram" or "stream".
     #[serde(default)]
     pub transport: String,
-    /// Parallel stream lanes to spread flows across. Absent or 0 from an
-    /// older coordinator means one lane, i.e. the original behaviour.
+    /// Parallel stream lanes to spread flows across. 0 means one.
     #[serde(default)]
     pub lanes: u8,
+    /// UDP port of the coordinator's QUIC control plane, on the same host
+    /// the member reached this API at. One URL in the member's config.
+    #[serde(default)]
+    pub control_port: u16,
+    /// Seconds between heartbeats; the coordinator's liveness window is a
+    /// small multiple of this.
+    #[serde(default)]
+    pub heartbeat_secs: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,18 +115,23 @@ pub struct NetworkSummary {
     pub members_total: usize,
     pub relays_total: usize,
     pub members_online: usize,
+    /// Current directory generation, so an operator can compare it with
+    /// what members report.
+    #[serde(default)]
+    pub gen: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkStatus {
     pub network_id: String,
     pub network_uuid: String,
+    #[serde(default)]
+    pub gen: u64,
     pub members: Vec<MemberStatus>,
     pub prefix_table: Vec<PrefixOwner>,
     /// Fleet traffic matrix, one row per reporting relay.
     #[serde(default)]
     pub relay_traffic: Vec<RelayTraffic>,
-    /// Transport in force, echoed so the UI can explain what it shows.
     #[serde(default)]
     pub transport: String,
     #[serde(default)]
@@ -130,29 +152,31 @@ pub struct MemberStatus {
     pub registered_cidrs: Vec<IpNet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached_relay: Option<String>,
-    pub pinned: bool,
     /// Relays only: can the coordinator dial the address this member
     /// advertises? "reachable" | "unreachable" | "unknown" (§3.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertised_reachable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_join_unix: Option<u64>,
-    /// Pinned identities. More than one means a rotation is in flight:
-    /// the member registered a new key and the previous one still works
-    /// until its overlap ends.
-    #[serde(default)]
-    pub pins: Vec<PinStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PinStatus {
-    /// "pubkey" or "cert_fp".
-    pub kind: String,
-    /// Truncated: enough to recognise, not enough to fill a table.
-    pub key: String,
-    /// None for the current pin; otherwise when it stops being accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retires_unix: Option<u64>,
+    pub last_join_from: Option<String>,
+    /// How many times a *different* machine has joined as this node.
+    #[serde(default)]
+    pub login_gen: u64,
+    /// When and from where the previous instance was replaced, if ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_from: Option<String>,
+    /// The generation this member last reported holding, and whether its
+    /// digest agreed with ours at that generation. A member behind for
+    /// more than a heartbeat or two, or disagreeing, is a bug to look at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_gen: Option<u64>,
+    #[serde(default)]
+    pub digest_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_unix: Option<u64>,
 }
 
 /// One relay's row of the fleet traffic matrix.
@@ -163,7 +187,6 @@ pub struct RelayTraffic {
     /// Seconds since this report arrived; a stale row is not a live one.
     pub age_secs: u64,
     pub links: Vec<RelayLink>,
-    /// Diagonal: switched between two members attached to this relay.
     pub local_bytes: u64,
     pub local_pkts: u64,
     pub terminated_bytes: u64,
@@ -178,8 +201,6 @@ pub struct RelayLink {
     pub tx_pkts: u64,
     pub rx_bytes: u64,
     pub rx_pkts: u64,
-    /// Derived from the previous sample, so the view shows what is
-    /// happening now rather than only what has happened since boot.
     pub tx_bps: u64,
     pub rx_bps: u64,
     pub up: bool,

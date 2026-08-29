@@ -1,16 +1,24 @@
-//! Member-side join client (§3.2). Deliberately dependency-free: a
-//! blocking HTTP/1.1 POST, since join happens at startup and at renewal,
-//! never on a hot path.
+//! Member-side join client (§3.2): one HTTPS POST at startup and at
+//! every renewal, never on a hot path. Dependency-light on purpose — a
+//! hand-written HTTP/1.1 request over a rustls stream.
 //!
-//! v1 talks plain HTTP and expects the coordinator to sit behind a TLS
-//! terminator; the `https://` scheme is accepted and stripped so configs
-//! don't have to change when native TLS lands.
+//! TLS is always on. By default any server certificate is accepted
+//! (`trust_any_cert = true`): the coordinator generates a self-signed
+//! certificate on first start, and the join is still protected against
+//! passive listeners. Set `trust_any_cert = false` to verify against the
+//! system roots (or a `ca` file) — the strict mode for deployments that
+//! do not trust the path to the coordinator.
 
 use crate::api::{ErrorBody, JoinRequest, JoinResponse};
 use crate::errors::ErrorCode;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Largest response we will read. Join responses are a few KB.
+const MAX_RESPONSE: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
@@ -18,8 +26,16 @@ pub enum JoinError {
     Io(#[from] std::io::Error),
     #[error("cannot resolve {0}")]
     Resolve(String),
+    #[error("could not connect to any address of {0}: {1}")]
+    Connect(String, String),
+    #[error("coordinator URL must start with https:// (got {0:?})")]
+    BadUrl(String),
+    #[error("tls: {0}")]
+    Tls(String),
     #[error("malformed HTTP response")]
     Malformed,
+    #[error("response larger than {MAX_RESPONSE} bytes")]
+    TooLarge,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     /// The coordinator rejected the join with a structured error. The
@@ -29,9 +45,7 @@ pub enum JoinError {
 }
 
 impl JoinError {
-    /// Retrying will never help: stop and tell the operator (§9 startup).
-    /// The decision lives on `ErrorCode` so server and members cannot
-    /// disagree about which failures are fatal.
+    /// Retrying will never help by itself: an operator must act.
     pub fn is_terminal(&self) -> bool {
         matches!(self, JoinError::Rejected { code, .. } if code.is_terminal())
     }
@@ -44,33 +58,153 @@ impl JoinError {
     }
 }
 
-pub fn strip_scheme(url: &str) -> &str {
-    url.strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url)
-        .trim_end_matches('/')
+/// How the member verifies the coordinator's HTTPS certificate.
+#[derive(Debug, Clone)]
+pub struct JoinTls {
+    /// Accept any certificate. The default, so a fresh deployment works
+    /// with the coordinator's auto-generated certificate.
+    pub trust_any_cert: bool,
+    /// Extra PEM roots to trust when verifying (self-signed coordinator
+    /// certificate, private CA). Only used when `trust_any_cert` is off.
+    pub ca_pem: Option<PathBuf>,
 }
 
-pub fn join(api: &str, req: &JoinRequest) -> Result<JoinResponse, JoinError> {
-    let host_port = strip_scheme(api);
-    let body = serde_json::to_string(req)?;
-    let addr: SocketAddr = host_port
+impl Default for JoinTls {
+    fn default() -> Self {
+        JoinTls { trust_any_cert: true, ca_pem: None }
+    }
+}
+
+/// `https://host[:port][/...]` -> (host, port). Only https is accepted:
+/// the secret travels in this request.
+pub fn parse_url(url: &str) -> Result<(String, u16), JoinError> {
+    let rest = url.strip_prefix("https://").ok_or_else(|| JoinError::BadUrl(url.to_string()))?;
+    let host_port = rest.split('/').next().unwrap_or_default();
+    if host_port.is_empty() {
+        return Err(JoinError::BadUrl(url.to_string()));
+    }
+    // `[v6]:port`, `v6`, `host:port`, `host`.
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']').ok_or_else(|| JoinError::BadUrl(url.to_string()))?;
+        let port = tail.strip_prefix(':').map(|p| p.parse::<u16>()).transpose()
+            .map_err(|_| JoinError::BadUrl(url.to_string()))?;
+        (h.to_string(), port.unwrap_or(443))
+    } else if host_port.matches(':').count() == 1 {
+        let (h, p) = host_port.split_once(':').expect("one colon");
+        (h.to_string(), p.parse().map_err(|_| JoinError::BadUrl(url.to_string()))?)
+    } else if host_port.contains(':') {
+        (host_port.to_string(), 443) // bare IPv6 literal
+    } else {
+        (host_port.to_string(), 443)
+    };
+    Ok((host, port))
+}
+
+/// The address a member dials for the QUIC control plane: the API host
+/// with the port the join response announced.
+pub fn control_addr(api_url: &str, control_port: u16) -> Result<String, JoinError> {
+    let (host, _) = parse_url(api_url)?;
+    Ok(if host.contains(':') { format!("[{host}]:{control_port}") } else { format!("{host}:{control_port}") })
+}
+
+fn tls_config(tls: &JoinTls) -> Result<Arc<rustls::ClientConfig>, JoinError> {
+    let provider = crate::quic::provider();
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| JoinError::Tls(e.to_string()))?;
+    let cfg = if tls.trust_any_cert {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::quic::PinnedServerCert {
+                expected_fp: None,
+                supported: provider.signature_verification_algorithms,
+            }))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = &tls.ca_pem {
+            let pem = std::fs::read(path)?;
+            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                let cert = cert.map_err(|e| JoinError::Tls(format!("reading {}: {e}", path.display())))?;
+                roots.add(cert).map_err(|e| JoinError::Tls(e.to_string()))?;
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(Arc::new(cfg))
+}
+
+/// Connect to the first address of `host:port` that answers, rather
+/// than only the first one resolution happens to return.
+fn connect_any(host: &str, port: u16) -> Result<TcpStream, JoinError> {
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|_| JoinError::Resolve(host_port.to_string()))?
-        .next()
-        .ok_or_else(|| JoinError::Resolve(host_port.to_string()))?;
-    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
+        .map_err(|_| JoinError::Resolve(format!("{host}:{port}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(JoinError::Resolve(format!("{host}:{port}")));
+    }
+    let mut last = String::new();
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    Err(JoinError::Connect(format!("{host}:{port}"), last))
+}
+
+pub fn join(api: &str, req: &JoinRequest, tls: &JoinTls) -> Result<JoinResponse, JoinError> {
+    let (host, port) = parse_url(api)?;
+    let body = serde_json::to_string(req)?;
+    let sock = connect_any(&host, port)?;
     sock.set_read_timeout(Some(Duration::from_secs(20)))?;
-    let host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
+    sock.set_write_timeout(Some(Duration::from_secs(20)))?;
+
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|e| JoinError::Tls(format!("server name {host:?}: {e}")))?;
+    let conn = rustls::ClientConnection::new(tls_config(tls)?, server_name)
+        .map_err(|e| JoinError::Tls(e.to_string()))?;
+    let mut stream = rustls::StreamOwned::new(conn, sock);
+
     let request = format!(
         "POST /api/v1/join HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    sock.write_all(request.as_bytes())?;
+    stream.write_all(request.as_bytes()).map_err(tls_io)?;
+
     let mut raw = Vec::new();
-    sock.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > MAX_RESPONSE {
+                    return Err(JoinError::TooLarge);
+                }
+            }
+            // rustls reports a peer that closed without close_notify as
+            // an error; with Connection: close that is the normal end.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(tls_io(e)),
+        }
+    }
+    parse_response(&raw)
+}
+
+fn tls_io(e: std::io::Error) -> JoinError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        JoinError::Tls(e.to_string())
+    } else {
+        JoinError::Io(e)
+    }
+}
+
+fn parse_response(raw: &[u8]) -> Result<JoinResponse, JoinError> {
+    let text = String::from_utf8_lossy(raw);
     let (head, payload) = text.split_once("\r\n\r\n").ok_or(JoinError::Malformed)?;
     let status: u16 = head
         .lines()
@@ -78,75 +212,46 @@ pub fn join(api: &str, req: &JoinRequest) -> Result<JoinResponse, JoinError> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or(JoinError::Malformed)?;
+    let chunked = head
+        .lines()
+        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+    let payload = if chunked { dechunk(payload).ok_or(JoinError::Malformed)? } else { payload.to_string() };
     if status != 200 {
-        let (code, message) = match serde_json::from_str::<ErrorBody>(payload) {
+        let (code, message) = match serde_json::from_str::<ErrorBody>(&payload) {
             Ok(e) => (ErrorCode::parse(&e.error.code), e.error.message),
-            Err(_) => (
-                ErrorCode::Unknown(format!("http_{status}")),
-                payload.trim().to_string(),
-            ),
+            Err(_) => (ErrorCode::Unknown(format!("http_{status}")), payload.trim().to_string()),
         };
         return Err(JoinError::Rejected { status, code, message });
     }
-    Ok(serde_json::from_str(payload)?)
+    Ok(serde_json::from_str(&payload)?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scheme_stripping() {
-        assert_eq!(strip_scheme("https://coord.example:8443/"), "coord.example:8443");
-        assert_eq!(strip_scheme("http://coord.example:8443"), "coord.example:8443");
-        assert_eq!(strip_scheme("coord.example:8443"), "coord.example:8443");
-    }
-
-    #[test]
-    fn terminal_codes_stop_retrying() {
-        let terminal = JoinError::Rejected {
-            status: 403,
-            code: ErrorCode::PinMismatch,
-            message: String::new(),
-        };
-        assert!(terminal.is_terminal());
-        let retryable = JoinError::Rejected {
-            status: 429,
-            code: ErrorCode::RateLimited,
-            message: String::new(),
-        };
-        assert!(!retryable.is_terminal());
-        // An unreachable relay waits for the firewall rather than dying.
-        let unreachable = JoinError::Rejected {
-            status: 409,
-            code: ErrorCode::RelayUnreachable,
-            message: String::new(),
-        };
-        assert!(!unreachable.is_terminal());
+/// Minimal chunked-transfer decoding, in case a proxy re-chunks the body.
+fn dechunk(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let (size_line, tail) = rest.split_once("\r\n")?;
+        let size = usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(out);
+        }
+        out.push_str(tail.get(..size)?);
+        rest = tail.get(size + 2..)?;
     }
 }
 
-/// Retry schedule for a member that is already running and has lost its
-/// coordinator session.
+/// Retry schedule for a member that has lost its coordinator session or
+/// was refused.
 ///
-/// At startup, a terminal rejection should stop the process: the operator
-/// is standing there, and failing loudly beats a daemon that silently
-/// never works. Once running, the opposite is true. Every terminal
-/// condition here — a pin an admin must reset, a disabled member, a
-/// changed secret — is fixed *at the coordinator*, and the member has no
-/// way to know it happened except by asking again. Exiting means a human
-/// must notice and restart something on every affected machine, which is
-/// the failure mode this schedule exists to remove.
-///
-/// Transient failures back off quickly; terminal ones back off to a slow
-/// poll and keep going, so the member heals itself the moment the
-/// operator acts.
-pub fn retry_delay(terminal: bool, consecutive: u32) -> std::time::Duration {
-    use std::time::Duration;
+/// Terminal conditions — a disabled member, a changed secret — are fixed
+/// *at the coordinator*, and the member has no way to know it happened
+/// except by asking again. Exiting means a human must notice and restart
+/// something on every affected machine, which is the failure mode this
+/// schedule exists to remove: terminal failures poll slowly and forever,
+/// transient ones back off quickly.
+pub fn retry_delay(terminal: bool, consecutive: u32) -> Duration {
     if terminal {
-        // Slow, but not so slow that a fixed pin takes an hour to take
-        // effect. Constant rather than exponential: the condition is not
-        // load-related, so backing off further buys nothing.
         return Duration::from_secs(60);
     }
     let secs = 1u64 << consecutive.min(5); // 1,2,4,8,16,32
@@ -154,29 +259,62 @@ pub fn retry_delay(terminal: bool, consecutive: u32) -> std::time::Duration {
 }
 
 #[cfg(test)]
-mod retry_tests {
+mod tests {
     use super::*;
 
     #[test]
+    fn url_parsing() {
+        assert_eq!(parse_url("https://coord.example:8443/").unwrap(), ("coord.example".into(), 8443));
+        assert_eq!(parse_url("https://coord.example").unwrap(), ("coord.example".into(), 443));
+        assert_eq!(parse_url("https://10.0.0.1:18443/api").unwrap(), ("10.0.0.1".into(), 18443));
+        assert_eq!(parse_url("https://[fd00::1]:9/").unwrap(), ("fd00::1".into(), 9));
+        assert!(matches!(parse_url("http://coord.example:8443"), Err(JoinError::BadUrl(_))));
+        assert!(matches!(parse_url("coord.example:8443"), Err(JoinError::BadUrl(_))));
+        assert_eq!(control_addr("https://coord.example:8443", 14433).unwrap(), "coord.example:14433");
+        assert_eq!(control_addr("https://[fd00::1]:8443", 14433).unwrap(), "[fd00::1]:14433");
+    }
+
+    #[test]
+    fn terminal_codes_stop_retrying() {
+        let terminal = JoinError::Rejected { status: 403, code: ErrorCode::ClientDisabled, message: String::new() };
+        assert!(terminal.is_terminal());
+        let retryable = JoinError::Rejected { status: 429, code: ErrorCode::RateLimited, message: String::new() };
+        assert!(!retryable.is_terminal());
+    }
+
+    #[test]
+    fn responses_parse_including_chunked_and_errors() {
+        let body = r#"{"error":{"code":"bad_credentials","message":"nope"}}"#;
+        let raw = format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        match parse_response(raw.as_bytes()) {
+            Err(JoinError::Rejected { status: 401, code: ErrorCode::BadCredentials, .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        let chunked = format!(
+            "HTTP/1.1 401 x\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        assert!(matches!(parse_response(chunked.as_bytes()), Err(JoinError::Rejected { status: 401, .. })));
+        assert!(matches!(parse_response(b"garbage"), Err(JoinError::Malformed)));
+    }
+
+    #[test]
     fn a_terminal_condition_keeps_retrying_slowly() {
-        // The point: never give up. A pin reset or a re-enable happens at
-        // the coordinator, and the member only learns of it by asking.
-        let d = retry_delay(true, 0);
-        assert_eq!(d, std::time::Duration::from_secs(60));
-        // ...and it does not creep upward, because the condition is not
-        // load-related; an hour-long backoff would just delay recovery.
-        assert_eq!(retry_delay(true, 50), d);
+        assert_eq!(retry_delay(true, 0), Duration::from_secs(60));
+        assert_eq!(retry_delay(true, 50), Duration::from_secs(60));
     }
 
     #[test]
     fn transient_failures_back_off_but_are_capped() {
         let d = |n| retry_delay(false, n).as_secs();
         assert_eq!(d(0), 1);
-        assert_eq!(d(1), 2);
         assert_eq!(d(3), 8);
-        // Capped, so a long outage does not turn into a ten-minute wait
-        // after the coordinator comes back.
-        assert_eq!(d(10), 30);
         assert_eq!(d(u32::MAX), 30);
+    }
+
+    #[test]
+    fn strict_mode_builds_a_root_store() {
+        assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None }).is_ok());
+        assert!(tls_config(&JoinTls::default()).is_ok());
     }
 }

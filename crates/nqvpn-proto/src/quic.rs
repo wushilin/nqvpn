@@ -29,14 +29,14 @@ pub enum TlsSetupError {
 pub const ALPN: &[u8] = b"nqvpn/1";
 
 /// Bytes a sealed packet adds on top of the inner IP packet:
-/// routed header (9) + Noise counter (8) + AEAD tag (16).
+/// routed header (15) + Noise counter (8) + AEAD tag (16).
 ///
 /// Deliberately exact rather than padded. The usable tunnel MTU is
 /// derived from this at runtime (`usable_inner_mtu`), so if the wire
 /// format grows the MTU shrinks automatically — and the assertion below
 /// fails the build rather than letting a stale constant silently cost
 /// packets. A safety margin here would buy nothing and hide drift.
-pub const FRAME_OVERHEAD: usize = 33;
+pub const FRAME_OVERHEAD: usize = 39;
 
 // Breaks the build if the wire format and this constant disagree —
 // stronger than a test, since it holds even for `cargo build`.
@@ -121,14 +121,15 @@ impl ClientCertVerifier for AnyClientCert {
     }
 }
 
-/// Verifies the server by pinned fingerprint when one is known
-/// (relay/peer dials, where membership carries `cert_fp`), otherwise
-/// accepts any certificate — used only for the coordinator's QUIC port,
-/// where the credential exchange authenticates in both directions.
+/// Verifies the server by fingerprint when one is known (relay dials,
+/// where the coordinator published what that relay presents), otherwise
+/// accepts any certificate — the coordinator's control port, where the
+/// credential exchange authenticates in both directions, and the join
+/// API when `trust_any_cert` is set.
 #[derive(Debug)]
-struct PinnedServerCert {
-    expected_fp: Option<String>,
-    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+pub struct PinnedServerCert {
+    pub expected_fp: Option<String>,
+    pub supported: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for PinnedServerCert {
@@ -175,7 +176,7 @@ impl ServerCertVerifier for PinnedServerCert {
     }
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
@@ -284,7 +285,7 @@ mod tests {
 
     #[test]
     fn frame_overhead_matches_the_wire_format() {
-        // routed header (type 1 + src 4 + dst 4) + counter 8 + tag 16
+        // routed header (type 1 + src 4 + dst 4 + flags 1 + hop 1 + trace 4) + counter 8 + tag 16
         assert_eq!(FRAME_OVERHEAD, crate::frame::ROUTED_HEADER_LEN + 8 + 16);
     }
 

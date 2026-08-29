@@ -11,11 +11,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
-    /// Unknown member, wrong secret, or unknown network — deliberately
+    /// Unknown node id, wrong secret, or unknown network — deliberately
     /// indistinguishable, so probing cannot enumerate members.
     BadCredentials,
-    /// The presented key differs from the pinned one (§3.3 TOFU).
-    PinMismatch,
     /// Administratively disabled.
     ClientDisabled,
     /// A requested prefix is not permitted, or is already owned.
@@ -37,12 +35,9 @@ pub enum ErrorCode {
     AdminAuthRequired,
     NotFound,
     Internal,
-    /// The peer does not implement this RPC verb. Answered, not fatal:
-    /// the caller learns the feature is absent and carries on.
+    /// The peer does not implement this RPC verb. Answered, not fatal.
     UnsupportedVerb,
     /// The peer implements the verb but not at the requested version.
-    /// The response payload carries the range it does support, so the
-    /// caller can retry lower instead of guessing.
     UnsupportedVersion,
     /// A code this build does not know — forward compatibility, so an
     /// older member meets a newer coordinator without panicking.
@@ -53,7 +48,6 @@ impl ErrorCode {
     pub fn as_str(&self) -> &str {
         match self {
             ErrorCode::BadCredentials => "bad_credentials",
-            ErrorCode::PinMismatch => "pin_mismatch",
             ErrorCode::ClientDisabled => "client_disabled",
             ErrorCode::PrefixConflict => "prefix_conflict",
             ErrorCode::AddressInUse => "address_in_use",
@@ -74,7 +68,6 @@ impl ErrorCode {
     pub fn parse(s: &str) -> ErrorCode {
         match s {
             "bad_credentials" => ErrorCode::BadCredentials,
-            "pin_mismatch" => ErrorCode::PinMismatch,
             "client_disabled" => ErrorCode::ClientDisabled,
             "prefix_conflict" => ErrorCode::PrefixConflict,
             "address_in_use" => ErrorCode::AddressInUse,
@@ -92,15 +85,13 @@ impl ErrorCode {
         }
     }
 
-    /// Retrying will never succeed on its own: stop and surface the
-    /// problem to a human (§9 startup). Everything else is transient,
-    /// including reachability — a firewall can be opened without
-    /// restarting the member.
+    /// Retrying will never succeed on its own: only an operator can fix
+    /// it. Everything else is transient, including reachability — a
+    /// firewall can be opened without restarting the member.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
             ErrorCode::BadCredentials
-                | ErrorCode::PinMismatch
                 | ErrorCode::ClientDisabled
                 | ErrorCode::PrefixConflict
                 | ErrorCode::AddressInUse
@@ -115,8 +106,7 @@ impl ErrorCode {
     /// invent their own wording for the server's failures.
     pub fn hint(&self) -> &'static str {
         match self {
-            ErrorCode::BadCredentials => "check client_id and client_secret against the coordinator config",
-            ErrorCode::PinMismatch => "this machine's keys changed; an admin must reset the pin",
+            ErrorCode::BadCredentials => "check node_id and secret against the coordinator",
             ErrorCode::ClientDisabled => "an admin disabled this member; enable it to rejoin",
             ErrorCode::PrefixConflict => "the requested CIDR is not allowed here, or another member owns it",
             ErrorCode::AddressInUse => "that address is assigned elsewhere; release it or pick another",
@@ -147,7 +137,6 @@ mod tests {
 
     const ALL: &[ErrorCode] = &[
         ErrorCode::BadCredentials,
-        ErrorCode::PinMismatch,
         ErrorCode::ClientDisabled,
         ErrorCode::PrefixConflict,
         ErrorCode::AddressInUse,
@@ -157,6 +146,8 @@ mod tests {
         ErrorCode::BadRequest,
         ErrorCode::RateLimited,
         ErrorCode::AdminAuthRequired,
+        ErrorCode::UnsupportedVerb,
+        ErrorCode::UnsupportedVersion,
         ErrorCode::NotFound,
         ErrorCode::Internal,
     ];
@@ -178,15 +169,10 @@ mod tests {
 
     #[test]
     fn terminal_codes_are_the_ones_a_human_must_fix() {
-        assert!(ErrorCode::PinMismatch.is_terminal());
         assert!(ErrorCode::ClientDisabled.is_terminal());
         assert!(ErrorCode::BadCredentials.is_terminal());
-        // Transient or externally fixable without restarting the member.
         assert!(!ErrorCode::RateLimited.is_terminal());
         assert!(!ErrorCode::Internal.is_terminal());
-        assert!(
-            !ErrorCode::RelayUnreachable.is_terminal(),
-            "opening a firewall should let a waiting relay join without a restart"
-        );
+        assert!(!ErrorCode::RelayUnreachable.is_terminal());
     }
 }

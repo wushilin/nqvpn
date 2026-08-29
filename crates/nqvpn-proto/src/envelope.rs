@@ -18,7 +18,7 @@ pub const PROTO_MAJOR: u8 = 1;
 /// release that changes nothing on the wire must not force a fleet-wide
 /// restart, and a wire change in a patch release must. Tying it to the
 /// build version would get both of those backwards.
-pub const PROTO_MINOR: u8 = 0;
+pub const PROTO_MINOR: u8 = 1;
 pub const HEADER_LEN: usize = 8;
 /// Hard cap for a single control message payload (1 MiB).
 pub const MAX_PAYLOAD: u32 = 1024 * 1024;
@@ -27,24 +27,21 @@ pub const MAX_PAYLOAD: u32 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Kind {
+    /// Member -> coordinator or relay: `Hello { credential, have_gen }`.
     Hello = 1,
+    /// `HelloAck { gen }`, followed by a Snapshot or Deltas.
     HelloAck = 2,
-    MembershipSnapshot = 3,
-    MembershipDelta = 4,
-    Attach = 5,
-    Refresh = 6,
-    KeySet = 7,
-    Ping = 8,
-    Pong = 9,
-    AttachmentSnapshot = 10,
-    AttachmentDelta = 11,
-    RelayList = 12,
-    MtuReport = 13,
-    NetworkMtu = 14,
-    TrafficReport = 15,
-    /// Correlated request/response (see DESIGN-RPC.md). Verbs live in
-    /// their own registry in `rpc`, kept separate from these kinds so the
-    /// two namespaces do not get conflated.
+    /// Coordinator -> member: the whole network view at one generation.
+    Snapshot = 3,
+    /// Coordinator -> member: what changed between two generations.
+    Delta = 4,
+    /// Member -> coordinator: local facts, periodically and on change.
+    Heartbeat = 5,
+    /// Member -> coordinator: my generation is behind, send a snapshot.
+    Resync = 6,
+    /// Member -> any acceptor: a renewed credential for this session.
+    Refresh = 7,
+    /// Correlated request/response (see DESIGN-RPC.md).
     Request = 16,
     Response = 17,
 }
@@ -170,7 +167,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let env = Envelope::new(Kind::Ping, b"hello".to_vec());
+        let env = Envelope::new(Kind::Heartbeat, b"hello".to_vec());
         let bytes = env.encode();
         let (back, used) = Envelope::decode(&bytes).unwrap();
         assert_eq!(used, bytes.len());
@@ -179,7 +176,7 @@ mod tests {
 
     #[test]
     fn truncated_then_complete() {
-        let bytes = Envelope::new(Kind::Ping, vec![0u8; 100]).encode();
+        let bytes = Envelope::new(Kind::Heartbeat, vec![0u8; 100]).encode();
         assert!(matches!(Envelope::decode(&bytes[..4]), Err(EnvelopeError::Truncated(_))));
         assert!(matches!(Envelope::decode(&bytes[..50]), Err(EnvelopeError::Truncated(_))));
         assert!(Envelope::decode(&bytes).is_ok());
@@ -187,7 +184,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_decodable_and_skippable() {
-        let mut env = Envelope::new(Kind::Ping, vec![1, 2, 3]);
+        let mut env = Envelope::new(Kind::Heartbeat, vec![1, 2, 3]);
         env.kind = 0x7777; // future kind
         let bytes = env.encode();
         let (back, used) = Envelope::decode(&bytes).unwrap();
@@ -197,14 +194,14 @@ mod tests {
 
     #[test]
     fn major_mismatch_rejected() {
-        let mut bytes = Envelope::new(Kind::Ping, vec![]).encode();
+        let mut bytes = Envelope::new(Kind::Heartbeat, vec![]).encode();
         bytes[0] = 2;
         assert_eq!(Envelope::decode(&bytes), Err(EnvelopeError::IncompatibleMajor(2)));
     }
 
     #[test]
     fn oversized_rejected() {
-        let mut bytes = Envelope::new(Kind::Ping, vec![]).encode();
+        let mut bytes = Envelope::new(Kind::Heartbeat, vec![]).encode();
         bytes[4..8].copy_from_slice(&(MAX_PAYLOAD + 1).to_be_bytes());
         assert_eq!(Envelope::decode(&bytes), Err(EnvelopeError::TooLarge(MAX_PAYLOAD + 1)));
     }

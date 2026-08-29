@@ -2,17 +2,16 @@
 //!
 //! The control stream had no reply channel: every upstream message was
 //! fire-and-forget, and the only way to report a failure was to tear down
-//! the session — so a member whose `Refresh` was rejected learned nothing
+//! the session — so a member whose request was rejected learned nothing
 //! except that the connection dropped. That is survivable for
-//! notifications and not survivable for identity rotation, where "did my
-//! new key get pinned?" cannot be answered by guessing.
+//! notifications and not for anything that needs an answer.
 //!
 //! Three properties this layer is built around:
 //!
 //!   * **typed at the call site.** The wire carries an opaque payload,
 //!     because that is what lets a peer skip a body it cannot parse — but
-//!     no caller ever sees bytes. `call::<RotateIdentity>()` returns
-//!     `RotateIdentity::Response`, paired by the compiler.
+//!     no caller ever sees bytes: `call::<R>()` returns `R::Response`,
+//!     paired by the compiler.
 //!   * **per-verb versions.** Each verb advertises a supported range and
 //!     each request names the version it speaks. This is what makes
 //!     backward compatibility real, and it is why the payload encoding
@@ -49,39 +48,6 @@ pub mod verb {
     /// it is the one call that cannot rely on negotiation to be
     /// understood, so its shape can never change.
     pub const API_VERSIONS: u16 = 1;
-    /// Member -> coordinator: register a new identity, keeping the old
-    /// one valid for an overlap.
-    pub const ROTATE_IDENTITY: u16 = 2;
-}
-
-/// Register a fresh identity for the member holding this session.
-///
-/// No signature accompanies this: the control session is mutual-TLS with
-/// the currently pinned certificate, verified at `Hello`, so being able
-/// to send it *is* the proof of possession. A signature scheme over the
-/// plaintext HTTP API would be reimplementing, less safely, what the
-/// channel already provides.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RotateIdentity {
-    /// New X25519 public key, base64. Empty leaves the Noise key alone.
-    pub new_pubkey: String,
-    /// New TLS certificate fingerprint ("sha256:..."). Empty leaves it.
-    pub new_cert_fp: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RotateIdentityOk {
-    /// Unix time the previous identity stops being accepted. Until then
-    /// either identity authenticates, so a member that restarts before
-    /// switching is not locked out.
-    pub old_retires_unix: u64,
-}
-
-impl Rpc for RotateIdentity {
-    const VERB: u16 = verb::ROTATE_IDENTITY;
-    const MIN_VERSION: u16 = 1;
-    const MAX_VERSION: u16 = 1;
-    type Response = RotateIdentityOk;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,7 +386,7 @@ mod tests {
                     let msg = if version >= 2 { format!("v2:{}", e.msg) } else { e.msg };
                     Ok(crate::envelope::encode_payload(&EchoOk { msg }).unwrap())
                 }
-                V_FAILING => Err(ErrorCode::PinMismatch),
+                V_FAILING => Err(ErrorCode::ClientDisabled),
                 _ => Err(ErrorCode::UnsupportedVerb),
             }
         }
@@ -523,7 +489,7 @@ mod tests {
     async fn a_handler_error_comes_back_as_its_code() {
         let (a, _b) = pair(Arc::new(NoVerbs), Arc::new(TestHandler));
         match a.call(Failing).await {
-            Err(RpcError::Remote(ErrorCode::PinMismatch)) => {}
+            Err(RpcError::Remote(ErrorCode::ClientDisabled)) => {}
             other => panic!("expected the handler's code, got {other:?}"),
         }
     }
@@ -595,8 +561,8 @@ mod tests {
         // coexists with them rather than replacing them.
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(64);
         let a = RpcPeer::new(tx, Arc::new(NoVerbs));
-        let bytes = encode_msg(Kind::Ping, &()).unwrap();
+        let bytes = encode_msg(Kind::Heartbeat, &()).unwrap();
         let (env, _) = Envelope::decode(&bytes).unwrap();
-        assert!(!a.on_envelope(&env), "Ping is not an RPC message");
+        assert!(!a.on_envelope(&env), "Heartbeat is not an RPC message");
     }
 }

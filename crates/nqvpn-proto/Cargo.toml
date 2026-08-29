@@ -20,6 +20,8 @@ snow.workspace = true
 x25519-dalek.workspace = true
 hex.workspace = true
 rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+rustls-pemfile.workspace = true
 
 quinn.workspace = true
 bytes.workspace = true

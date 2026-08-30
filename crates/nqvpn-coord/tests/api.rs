@@ -7,7 +7,7 @@
 //! cookie), network and member CRUD, tokens, disable/enable, the join
 //! flow, and export/import.
 
-use nqvpn_coord::config::{CoordConfig, NetworkConfig};
+use nqvpn_coord::config::CoordConfig;
 use nqvpn_coord::db::Db;
 use nqvpn_coord::signer::Keyring;
 use nqvpn_coord::state::{now_unix, AppState};

@@ -231,18 +231,39 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
         });
     }
     let _guards = guards;
-    match exit_rx.recv().await {
-        Some((network, exit)) => {
-            let nqvpn_sync::MemberExit::Replaced(reason) = &exit;
-            tracing::error!(
-                %network,
-                %reason,
-                "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
-                exit.exit_code()
-            );
-            Ok(exit.exit_code())
+    tokio::select! {
+        got = exit_rx.recv() => match got {
+            Some((network, exit)) => {
+                let nqvpn_sync::MemberExit::Replaced(reason) = &exit;
+                tracing::error!(
+                    %network,
+                    %reason,
+                    "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
+                    exit.exit_code()
+                );
+                Ok(exit.exit_code())
+            }
+            None => std::future::pending().await,
+        },
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; removing routes and exiting cleanly");
+            Ok(0)
         }
-        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when the process is asked to stop (SIGTERM or SIGINT / Ctrl-C).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! { _ = term.recv() => {}, _ = intr.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

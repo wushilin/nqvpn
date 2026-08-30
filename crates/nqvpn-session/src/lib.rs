@@ -248,20 +248,29 @@ impl Session {
                             Ok(c) if c.node_id == self.claims.node_id && c.role == self.claims.role => {
                                 self.exp.store(c.exp, Ordering::Relaxed);
                                 self.login_gen.store(c.login_gen, Ordering::Relaxed);
+                                tracing::debug!(node = self.claims.node_id, name = %self.claims.sub, new_exp = c.exp, login_gen = c.login_gen, "credential refreshed");
                             }
-                            Ok(c) => return End::Protocol(format!("Refresh for another member ({})", c.node_id)),
-                            Err(e) => return End::Protocol(format!("Refresh rejected: {e}")),
+                            Ok(c) => {
+                                tracing::warn!(node = self.claims.node_id, "session ending: Refresh for another member ({})", c.node_id);
+                                return End::Protocol(format!("Refresh for another member ({})", c.node_id));
+                            }
+                            Err(e) => {
+                                tracing::warn!(node = self.claims.node_id, name = %self.claims.sub, "session ending: Refresh rejected: {e}");
+                                return End::Protocol(format!("Refresh rejected: {e}"));
+                            }
                         }
                     }
                     // Anything else on the control stream is ignored:
                     // unknown kinds are skipped, never fatal.
                 }
                 _ = tokio::time::sleep(exp_in) => {
+                    tracing::info!(node = self.claims.node_id, name = %self.claims.sub, "session ending: credential expired without a Refresh");
                     self.close(CLOSE_EXPIRED, "credential expired");
                     return End::Expired;
                 }
                 _ = probe_tick.tick(), if cfg.probe_secs > 0 => {
                     if outstanding >= cfg.probe_misses {
+                        tracing::warn!(node = self.claims.node_id, name = %self.claims.sub, misses = outstanding, "session ending: peer stopped answering keepalive probes");
                         self.close(CLOSE_PROBE_TIMEOUT, "probe timeout");
                         return End::ProbeTimeout;
                     }
@@ -331,10 +340,12 @@ pub async fn accept(conn: quinn::Connection, acceptor: &dyn Acceptor) -> Result<
     let hello: Hello = parse(&env)?;
     let network = nqvpn_proto::credential::peek_network(&hello.credential).ok_or_else(|| anyhow!("malformed credential"))?;
     let params = acceptor.params_for(&network).ok_or_else(|| anyhow!("not serving network {network:?}"))?;
+    let remote = conn.remote_address();
     let claims = match params.verifier.verify(&hello.credential, &fp) {
         Ok(c) => c,
         Err(e) => {
             let code = if e.downcast_ref::<StaleLogin>().is_some() { CLOSE_STALE_LOGIN } else { CLOSE_EVICTED };
+            tracing::info!(%remote, network = %network, close_code = code, "session rejected: {e}");
             conn.close(code.into(), e.to_string().as_bytes());
             return Err(e);
         }
@@ -342,6 +353,7 @@ pub async fn accept(conn: quinn::Connection, acceptor: &dyn Acceptor) -> Result<
     write_msg(&mut tx, Kind::HelloAck, &HelloAck { gen: params.ack_gen }).await?;
     let chan = PacketChannel::start_lanes(conn.clone(), params.mode, params.lanes);
     let (peer, role) = (claims.node_id, claims.role);
+    tracing::info!(%remote, network = %claims.network_id, node = peer, name = %claims.sub, %role, "session accepted");
     Ok(Session::new(conn, chan, peer, role, claims, fp, tx, rx))
 }
 

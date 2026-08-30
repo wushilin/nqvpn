@@ -152,13 +152,18 @@ impl AppState {
         ns.cfg = cfg;
         ns.save_config()?;
         ns.directory.hold_down_secs = ns.cfg.settings.hold_down_secs;
-        if everyone {
+        let reconnected = if everyone {
             let nodes: Vec<NodeId> = ns.sessions.keys().copied().collect();
-            for n in nodes {
-                ns.reconfigure(n, "network settings changed");
+            let n = nodes.len();
+            for node in nodes {
+                ns.reconfigure(node, "network settings changed");
             }
-        }
+            n
+        } else {
+            0
+        };
         self.publish(&mut ns);
+        tracing::info!(network = %id, reconnected, "network settings updated");
         Ok(())
     }
 
@@ -211,13 +216,16 @@ impl AppState {
         let changed = changed_members(&ns.cfg, &cfg);
         ns.cfg = cfg;
         ns.save_config()?;
-        for n in changed {
-            if let Some(node) = ns.registry.id_of(&n) {
+        let mut reconnected = false;
+        for n in &changed {
+            if let Some(node) = ns.registry.id_of(n) {
                 ns.reconfigure(node, "configuration changed");
+                reconnected = true;
             }
         }
         self.publish(&mut ns);
         ns.notify();
+        tracing::info!(network = %id, member = %name, changed = ?changed, reconnected, "member configuration updated");
         Ok(())
     }
 
@@ -287,6 +295,7 @@ impl AppState {
             }
         }
         self.publish(&mut ns);
+        tracing::info!(network = %id, member = %name, %role, disabled, "member {}", if disabled { "disabled" } else { "enabled" });
         Ok(())
     }
 
@@ -342,6 +351,7 @@ impl AppState {
             }
             applied.push(id);
         }
+        tracing::info!(networks = ?applied, "configuration imported");
         Ok(applied)
     }
 }

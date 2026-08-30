@@ -261,6 +261,26 @@ impl<P: RouteProgrammer> RouteSet<P> {
     }
 }
 
+/// On a graceful shutdown, best-effort remove the routes we installed so
+/// the table is left clean. This is a backstop, not the primary path: a
+/// process killed outright never runs Drop, and there the kernel drops
+/// every route via our TUN when the device's fd closes on death.
+impl<P: RouteProgrammer> Drop for RouteSet<P> {
+    fn drop(&mut self) {
+        let installed: Vec<IpNet> = self.installed.lock().unwrap().iter().copied().collect();
+        if installed.is_empty() {
+            return;
+        }
+        let mut removed = 0u32;
+        for net in &installed {
+            if self.programmer.remove(*net).is_ok() {
+                removed += 1;
+            }
+        }
+        tracing::info!(target: "nqvpn::os_routes", removed, total = installed.len(), "removed our routes on shutdown");
+    }
+}
+
 /// Change a live TUN device's MTU.
 pub fn set_device_mtu(device: &str, mtu: u16) -> Result<()> {
     let mtu_s = mtu.to_string();

@@ -616,6 +616,27 @@ impl RelayNet {
             }
         }
 
+        // Prune per-peer traffic counters for peers we no longer hold —
+        // otherwise they accumulate for every node id ever seen. Keep the
+        // live set (attached clients + mesh peers) only.
+        {
+            let live: std::collections::HashSet<NodeId> = self
+                .clients
+                .read()
+                .unwrap()
+                .keys()
+                .chain(self.mesh.read().unwrap().keys())
+                .copied()
+                .collect();
+            let mut traffic = self.traffic.write().unwrap();
+            let before = traffic.len();
+            traffic.retain(|peer, _| live.contains(peer));
+            let dropped = before - traffic.len();
+            if dropped > 0 {
+                tracing::debug!(network = %self.network_id, dropped, kept = traffic.len(), "pruned stale traffic counters");
+            }
+        }
+
         if let Some(ep) = self.endpoint() {
             ep.sync(view);
         }

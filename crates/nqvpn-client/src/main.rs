@@ -139,9 +139,33 @@ async fn run(cli: Cli) -> Result<i32> {
         });
     }
 
-    let exit = nqvpn_sync::run_member(member, identity, keys, joined, client.view.clone(), client.clone(), client.link.clone(), client.clone()).await;
-    report_exit(&exit);
-    Ok(exit.exit_code())
+    tokio::select! {
+        exit = nqvpn_sync::run_member(member, identity, keys, joined, client.view.clone(), client.clone(), client.link.clone(), client.clone()) => {
+            report_exit(&exit);
+            Ok(exit.exit_code())
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; removing routes and exiting cleanly");
+            Ok(0)
+        }
+    }
+}
+
+/// Resolves when the process is asked to stop (SIGTERM or SIGINT / Ctrl-C).
+/// Returning from `run` then drops the guards — the route set removes its
+/// routes, the endpoint lock is released — for a clean shutdown.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! { _ = term.recv() => {}, _ = intr.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn report_exit(exit: &nqvpn_sync::MemberExit) {

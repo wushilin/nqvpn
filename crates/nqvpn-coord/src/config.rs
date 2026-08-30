@@ -560,6 +560,14 @@ pub fn resolve_admin_password(cfg: &mut AdminCfg) -> Result<()> {
         if pw.trim().is_empty() {
             bail!("[admin] password must not be empty");
         }
+        // A hash pasted into `password` by mistake would be hashed again,
+        // and no real password would ever match it. Detect the argon2 PHC
+        // shape and treat it as the hash it plainly is.
+        if pw.starts_with("$argon2") {
+            tracing::warn!("[admin] password looks like an argon2 hash; treating it as password_hash (put it under password_hash next time)");
+            cfg.password_hash = Some(pw);
+            return Ok(());
+        }
         tracing::warn!("[admin] password is in the clear in the config; prefer password_hash (nqvpn-coord hash-password)");
         cfg.password_hash = Some(crate::auth::hash_password(&pw).map_err(|e| anyhow::anyhow!("hashing admin password: {e}"))?);
     }
@@ -732,6 +740,18 @@ pool = "default"
         assert!(crate::auth::verify_password("hunter2", a.password_hash.as_deref().unwrap()));
         let mut e = AdminCfg { password: Some("  ".into()), ..Default::default() };
         assert!(resolve_admin_password(&mut e).is_err());
+    }
+
+    #[test]
+    fn a_hash_pasted_into_the_password_field_is_used_as_the_hash_not_rehashed() {
+        // The exact footgun: an argon2 hash placed under `password`. It
+        // must verify the original password, not the hash string itself.
+        let hash = crate::auth::hash_password("hunter2").unwrap();
+        let mut a = AdminCfg { user: Some("admin".into()), password: Some(hash.clone()), ..Default::default() };
+        resolve_admin_password(&mut a).unwrap();
+        assert_eq!(a.password_hash.as_deref(), Some(hash.as_str()), "the hash is used verbatim");
+        assert!(crate::auth::verify_password("hunter2", a.password_hash.as_deref().unwrap()));
+        assert!(!crate::auth::verify_password(&hash, a.password_hash.as_deref().unwrap()), "the hash string is not the password");
     }
 
     #[test]

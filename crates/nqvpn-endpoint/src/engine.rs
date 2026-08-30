@@ -321,16 +321,21 @@ impl Engine {
         }
         match PairSession::respond(&self.keys, peer, &self.network_uuid, self.my_node_id, msg, now) {
             Ok((s, reply, ts)) => {
-                // A msg1 is bound to the initiator's clock; one older than
-                // the last we accepted from this peer is a replay (only a
-                // relay could inject one, and relays are untrusted).
-                if !sessions.accept_handshake_ts(peer, ts) {
-                    self.counters.drop_stale_handshake.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
                 let expected = self.peers.lock().unwrap().pubkey_of(peer);
                 match (s.peer_static(), expected) {
                     (Some(got), Some(want)) if got == want => {
+                        // Advance the replay watermark ONLY after the
+                        // static key is verified. Otherwise an untrusted
+                        // relay could inject a wrong-key initiation with a
+                        // far-future timestamp: the key check would reject
+                        // the session, but the poisoned watermark would
+                        // then refuse every real handshake from that peer
+                        // until restart. A msg1 older than the last we
+                        // accepted is a replay.
+                        if !sessions.accept_handshake_ts(peer, ts) {
+                            self.counters.drop_stale_handshake.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                         sessions.insert(peer, s);
                         for p in carried {
                             sessions.queue(peer, p);
@@ -398,5 +403,68 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(" ");
         format!("node={} peers={peers} {c}", self.my_node_id)
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use nqvpn_proto::control::PeerInfo;
+    use nqvpn_proto::seal::decode_pubkey;
+    use nqvpn_proto::types::Role;
+
+    struct NoUplink;
+    impl Uplink for NoUplink {
+        fn send(&self, _d: Vec<u8>, _l: u8) -> bool {
+            true
+        }
+    }
+
+    fn peer_info(id: NodeId, pubkey_b64: &str) -> PeerInfo {
+        PeerInfo {
+            node_id: id,
+            name: format!("n{id}"),
+            role: Role::Client,
+            prefixes: vec![],
+            pubkey: pubkey_b64.to_string(),
+            online: true,
+            login_gen: 0,
+        }
+    }
+
+    /// Regression: a relay-injected handshake made with the *wrong*
+    /// static key and a far-future timestamp must not poison the replay
+    /// watermark. Before the fix it did, and every real handshake from
+    /// that peer was then refused as stale until restart.
+    #[test]
+    fn a_wrong_key_handshake_cannot_poison_the_replay_watermark() {
+        const ME: NodeId = 1;
+        const PEER: NodeId = 2;
+        let uuid = "test-uuid";
+
+        let our_keys = StaticKeys::generate().unwrap();
+        let our_pub = decode_pubkey(&our_keys.public_b64()).unwrap();
+        let peer_keys = StaticKeys::generate().unwrap();
+        let attacker_keys = StaticKeys::generate().unwrap();
+
+        let mut table = PeerTable::new(ME);
+        // The coordinator-published key for PEER is its real one.
+        table.upsert(peer_info(PEER, &peer_keys.public_b64()));
+        let engine = Engine::new(ME, uuid.to_string(), our_keys, table, 1350, 1);
+        let up = NoUplink;
+
+        // Attacker (relay) forges a msg1 as PEER but with its own static
+        // key and timestamp u64::MAX.
+        let (_att, att_msg1) = PairSession::initiate(&attacker_keys, ME, &our_pub, uuid, PEER, u64::MAX).unwrap();
+        engine.on_handshake(PEER, &att_msg1, &up);
+        assert_eq!(engine.counters.drop_key_mismatch.load(Ordering::Relaxed), 1, "wrong static key is rejected");
+        assert_eq!(engine.counters.handshakes_completed.load(Ordering::Relaxed), 0);
+
+        // The real PEER now handshakes with a normal timestamp. It must
+        // succeed — the watermark was not poisoned.
+        let (_p, p_msg1) = PairSession::initiate(&peer_keys, ME, &our_pub, uuid, PEER, 1000).unwrap();
+        engine.on_handshake(PEER, &p_msg1, &up);
+        assert_eq!(engine.counters.drop_stale_handshake.load(Ordering::Relaxed), 0, "real handshake is not refused as stale");
+        assert_eq!(engine.counters.handshakes_completed.load(Ordering::Relaxed), 1, "the real peer establishes a session");
     }
 }

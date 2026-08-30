@@ -96,10 +96,20 @@ impl NetState {
     }
 
     /// Commit the registry, mapping failure to an API error.
-    pub fn commit(&self) -> Result<(), ApiError> {
-        self.db
-            .save_registry(&self.cfg.network_id, &self.registry)
-            .map_err(|e| ApiError::internal(format!("registry commit failed: {e:#}")))
+    pub fn commit(&mut self) -> Result<(), ApiError> {
+        match self.db.save_registry(&self.cfg.network_id, &self.registry) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Durability precedes visibility: if the save failed, drop
+                // the in-memory mutation so no later publish can expose an
+                // unsaved change. Reload the last durable registry.
+                match self.db.load_registry(&self.cfg.network_id) {
+                    Ok(Some(reg)) => self.registry = reg,
+                    _ => tracing::error!(network = %self.cfg.network_id, "registry commit AND its rollback failed; in-memory state may be ahead of disk"),
+                }
+                Err(ApiError::internal(format!("registry commit failed (change discarded): {e:#}")))
+            }
+        }
     }
 
     /// Commit the configuration (an operator's change).
@@ -128,18 +138,33 @@ impl NetState {
 }
 
 /// Fixed-window per-(member, ip) limiter, pruned as it goes.
+/// Fixed-window per-source-IP join limiter, hard-capped so it cannot be
+/// grown without bound. Keyed by IP alone — not by anything the client
+/// chooses (the secret) — so an attacker cannot mint a fresh allowance
+/// per request, and the limit applies before the secret is resolved
+/// (which scans every member).
 #[derive(Default)]
 pub struct RateLimiter {
-    map: HashMap<(String, String), (u64, u32)>,
+    map: HashMap<String, (u64, u32)>,
 }
 
+/// Upper bound on distinct source IPs tracked in one window. Past it,
+/// new IPs are refused for the rest of the window rather than growing
+/// the map — abuse from many spoofed-looking sources cannot exhaust
+/// memory. Real deployments see far fewer than this.
+const RATE_LIMIT_MAX_IPS: usize = 65_536;
+
 impl RateLimiter {
-    pub fn check(&mut self, key: String, ip: String, limit: u32, now: u64) -> bool {
+    pub fn check(&mut self, ip: String, limit: u32, now: u64) -> bool {
         let window = now / 60;
-        if self.map.len() > 4096 {
+        // Drop last window's entries when the window rolls.
+        if self.map.len() > RATE_LIMIT_MAX_IPS {
             self.map.retain(|_, (w, _)| *w == window);
         }
-        let entry = self.map.entry((key, ip)).or_insert((window, 0));
+        if self.map.len() > RATE_LIMIT_MAX_IPS && !self.map.contains_key(&ip) {
+            return false; // at capacity this window: refuse new sources
+        }
+        let entry = self.map.entry(ip).or_insert((window, 0));
         if entry.0 != window {
             *entry = (window, 0);
         }
@@ -243,9 +268,9 @@ impl AppState {
         v
     }
 
-    fn check_rate(&self, key: String, ip: String) -> Result<(), ApiError> {
+    fn check_rate(&self, ip: &str) -> Result<(), ApiError> {
         let limit = self.coord.limits.join_rate_per_min;
-        if self.join_rate.lock().unwrap().check(key, ip, limit, now_unix()) {
+        if self.join_rate.lock().unwrap().check(ip.to_string(), limit, now_unix()) {
             Ok(())
         } else {
             Err(ApiError::rate_limited())
@@ -281,10 +306,10 @@ impl AppState {
 
     /// The whole join transaction.
     pub fn join(&self, req: &JoinRequest, peer_ip: &str) -> Result<JoinResponse, ApiError> {
-        // Rate limited by the secret's prefix, so a guessing client is
-        // throttled before any comparison work is spent on it.
-        let key: String = req.secret.chars().take(8).collect();
-        self.check_rate(key, peer_ip.to_string())?;
+        // Rate limited per source IP, before any secret comparison, so a
+        // client cannot mint a fresh allowance by varying the secret and
+        // cannot make us scan every member for free.
+        self.check_rate(peer_ip)?;
 
         // ---- phase 1: the secret names the member ----
         let Resolved { net, network_id, name, role, member: member_cfg } =
@@ -485,4 +510,25 @@ pub fn relay_entries(ns: &NetState) -> Vec<RelayEntry> {
         .into_iter()
         .map(|r| RelayEntry { relay_id: r.relay_id, name: r.name, addr: r.addr, cert_fp: r.cert_fp })
         .collect()
+}
+
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn join_limit_is_per_ip_and_cannot_be_bypassed_or_grown_unbounded() {
+        let mut rl = RateLimiter::default();
+        // One IP is capped at the limit within a window, regardless of
+        // what the client varies (the key is the IP alone).
+        for i in 0..5 {
+            assert!(rl.check("1.1.1.1".into(), 5, 100), "attempt {i} within limit");
+        }
+        assert!(!rl.check("1.1.1.1".into(), 5, 100), "over the limit for this IP");
+        // A different IP has its own allowance.
+        assert!(rl.check("2.2.2.2".into(), 5, 100));
+        // The window rolls: the allowance resets.
+        assert!(rl.check("1.1.1.1".into(), 5, 160));
+    }
 }

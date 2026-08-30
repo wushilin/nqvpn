@@ -1,3 +1,9 @@
 target/
 state/
 dist/
+
+# Never commit generated identity keys.
+*.key
+static.key
+tls.key
+tls.crt

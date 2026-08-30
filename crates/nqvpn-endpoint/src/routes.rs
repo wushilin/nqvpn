@@ -142,18 +142,44 @@ impl<P: RouteProgrammer> RouteSet<P> {
         let ours: BTreeSet<IpNet> =
             present.into_iter().map(|n| n.trunc()).filter(|n| !mine.contains(n)).collect();
 
+        let (mut added, mut removed, mut failed) = (0u32, 0u32, 0u32);
         for net in ours.difference(&wanted) {
-            let _ = self.programmer.remove(*net);
+            match self.programmer.remove(*net) {
+                Ok(()) => {
+                    removed += 1;
+                    tracing::info!(target: "nqvpn::os_routes", prefix = %net, "os route removed");
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route remove failed: {e:#}");
+                }
+            }
         }
         let mut first_err = None;
         for net in wanted.difference(&ours) {
             // Idempotent add, so a route that reappeared between the read
             // and now is not an error.
-            if let Err(e) = self.programmer.add_via_tun(*net) {
-                if first_err.is_none() {
-                    first_err = Some(e);
+            match self.programmer.add_via_tun(*net) {
+                Ok(()) => {
+                    added += 1;
+                    tracing::info!(target: "nqvpn::os_routes", prefix = %net, "os route added");
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route add failed: {e:#}");
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
             }
+        }
+        if added + removed + failed > 0 {
+            tracing::info!(
+                target: "nqvpn::os_routes",
+                added, removed, failed,
+                total = wanted.len(),
+                "os routing table reconciled (against the kernel)"
+            );
         }
         *self.installed.lock().unwrap() = wanted;
         match first_err {
@@ -177,8 +203,13 @@ impl<P: RouteProgrammer> RouteSet<P> {
         let wanted: BTreeSet<IpNet> = wanted.iter().map(|n| n.trunc()).collect();
         let mut installed = self.installed.lock().unwrap();
         let extra: Vec<IpNet> = installed.difference(&wanted).copied().collect();
+        let (mut added, mut removed, mut failed) = (0u32, 0u32, 0u32);
         for net in extra {
-            let _ = self.programmer.remove(net);
+            match self.programmer.remove(net) {
+                Ok(()) => tracing::info!(target: "nqvpn::os_routes", prefix = %net, "os route removed"),
+                Err(e) => tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route remove failed: {e:#}"),
+            }
+            removed += 1;
             installed.remove(&net);
         }
         let missing: Vec<IpNet> = wanted.difference(&installed).copied().collect();
@@ -186,14 +217,26 @@ impl<P: RouteProgrammer> RouteSet<P> {
         for net in missing {
             match self.programmer.add_via_tun(net) {
                 Ok(()) => {
+                    added += 1;
+                    tracing::info!(target: "nqvpn::os_routes", prefix = %net, "os route added");
                     installed.insert(net);
                 }
                 Err(e) => {
+                    failed += 1;
+                    tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route add failed: {e:#}");
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
                 }
             }
+        }
+        if added + removed + failed > 0 {
+            tracing::info!(
+                target: "nqvpn::os_routes",
+                added, removed, failed,
+                total = wanted.len(),
+                "os routing table reconciled (cache)"
+            );
         }
         match first_err {
             Some(e) => Err(e),

@@ -16,7 +16,7 @@ use nqvpn_proto::control::PeerInfo;
 use nqvpn_proto::lpm::LpmTable;
 use nqvpn_proto::seal::{decode_pubkey, PairSession, SealError, StaticKeys};
 use nqvpn_proto::types::NodeId;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,10 +84,58 @@ impl PeerTable {
     }
 
     pub fn replace_all(&mut self, peers: Vec<PeerInfo>) {
+        // Snapshot the prefix -> owner map before and after so the
+        // in-VPN routing table's changes are logged with detail: what
+        // prefix, which member gained/lost/took it over. No change,
+        // no log.
+        let before: BTreeMap<IpNet, NodeId> = self.lpm.iter().collect();
+        let name_before: HashMap<NodeId, String> =
+            self.peers.iter().map(|(id, p)| (*id, p.name.clone())).collect();
+        let members_before = self.peers.len();
+
         self.peers.clear();
         self.lpm = LpmTable::new();
         for p in peers {
             self.upsert(p);
+        }
+
+        let after: BTreeMap<IpNet, NodeId> = self.lpm.iter().collect();
+        let name = |id: NodeId| -> String {
+            self.peers
+                .get(&id)
+                .map(|p| p.name.clone())
+                .or_else(|| name_before.get(&id).cloned())
+                .unwrap_or_default()
+        };
+        let (mut added, mut removed, mut moved) = (0u32, 0u32, 0u32);
+        for (net, owner) in &after {
+            match before.get(net) {
+                None => {
+                    added += 1;
+                    tracing::info!(target: "nqvpn::vpn_routes", prefix = %net, owner = %name(*owner), node = owner, "vpn route added");
+                }
+                Some(prev) if prev != owner => {
+                    moved += 1;
+                    tracing::info!(target: "nqvpn::vpn_routes", prefix = %net, from = %name(*prev), to = %name(*owner), "vpn route owner changed");
+                }
+                _ => {}
+            }
+        }
+        for (net, prev) in &before {
+            if !after.contains_key(net) {
+                removed += 1;
+                tracing::info!(target: "nqvpn::vpn_routes", prefix = %net, was = %name(*prev), "vpn route withdrawn");
+            }
+        }
+        if added + removed + moved > 0 {
+            tracing::info!(
+                target: "nqvpn::vpn_routes",
+                added, removed, moved,
+                members = self.peers.len(),
+                prev_members = members_before,
+                total_prefixes = after.len(),
+                "in-vpn routing table updated"
+            );
         }
     }
 

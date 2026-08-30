@@ -638,3 +638,132 @@ async fn a_wrong_protocol_version_is_refused_at_hello() -> Result<()> {
     assert!(outcome.is_err(), "a version-mismatched peer must be refused");
     Ok(())
 }
+
+// ---- restart storm: what a fleet reconnecting actually costs ----
+
+/// A coordinator serving `n` client members, with a chosen restart grace.
+/// `fresh_restart` = true keeps the collect-before-publish window active
+/// (started_at = now); false skips it (started_at = 0) to show the storm.
+async fn setup_fleet(n: usize, grace_secs: u64, fresh_restart: bool) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let coord: CoordConfig = toml::from_str("[listen]\napi = \"127.0.0.1:0\"\n[state]\ndir = \"x\"\n").unwrap();
+    let mut toml = format!(
+        "network_id = \"n1\"\ncidrs = [\"10.99.0.0/16\"]\n[pools.default]\ncidr = \"10.99.1.0/24\"\n\
+         [settings]\nheartbeat_secs = 1\noffline_after = 30\nhold_down_secs = 0\nrestart_grace_secs = {grace_secs}\n"
+    );
+    for i in 0..n {
+        toml.push_str(&format!("[clients.c{i}]\nsecret = \"s-c{i}\"\n"));
+    }
+    let cfg: NetworkConfig = toml::from_str(&toml).unwrap();
+    let db = Arc::new(nqvpn_coord::db::Db::open_memory().unwrap());
+    let keyring = Keyring::load_or_create(&dir.path().join("signing.json"), now_unix()).unwrap();
+    let state = Arc::new(AppState::new(coord, Some("tok".into()), keyring, db.clone(), 0));
+    let reg = Registry::new();
+    db.save_network_and_registry(&cfg, &reg).unwrap();
+    let ns = state.add_network(cfg, reg);
+    ns.lock().unwrap().started_at = if fresh_restart { now_unix() } else { 0 };
+    let id = TlsIdentity::generate("coord").unwrap();
+    let endpoint = control::bind("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _ = control::serve(s, endpoint).await;
+    });
+    Env { state, addr, _dir: dir }
+}
+
+/// A member joining the fleet as client `i` (node id 100 + i).
+fn join_fleet(env: &Env, i: usize, id: &TlsIdentity) -> String {
+    let node_id = 100 + i as u32;
+    let req = JoinRequest {
+        secret: format!("s-c{i}"),
+        pubkey: B64.encode([node_id as u8; 32]),
+        cert_fingerprint: id.fingerprint(),
+    };
+    env.state.join(&req, "1.1.1.1").unwrap().credential
+}
+
+/// Count the Snapshot and Delta pushes waiting on a member's stream,
+/// draining until quiet for `quiet`.
+async fn drain_pushes(m: &mut Member, quiet: Duration) -> (u32, u32) {
+    let (mut snaps, mut deltas) = (0u32, 0u32);
+    // Drain until a quiet period elapses or the stream ends.
+    while let Ok(Ok(env)) = tokio::time::timeout(quiet, read_envelope(&mut m.rx)).await {
+        if env.kind == Kind::Snapshot as u16 {
+            snaps += 1;
+        } else if env.kind == Kind::Delta as u16 {
+            deltas += 1;
+        }
+    }
+    (snaps, deltas)
+}
+
+/// Without the grace, every reconnection broadcasts a delta to everyone
+/// already synced: the fleet pays O(N^2) pushes. This is the storm the
+/// grace exists to prevent — measured, so the fix is not just asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fleet_reconnecting_without_the_grace_storms() -> Result<()> {
+    const N: usize = 12;
+    let env = setup_fleet(N, 0, false).await; // grace off, not a fresh restart
+    let ids: Vec<TlsIdentity> = (0..N).map(|i| TlsIdentity::generate(&format!("c{i}")).unwrap()).collect();
+    let mut members = Vec::new();
+    // Sequential connects, as a reconnect wave arrives.
+    for (i, id) in ids.iter().enumerate() {
+        let cred = join_fleet(&env, i, id);
+        members.push(Member::connect(&env, &cred, id, 0).await?);
+    }
+    let mut total_snaps = 0u32;
+    let mut total_deltas = 0u32;
+    for m in &mut members {
+        let (s, d) = drain_pushes(m, Duration::from_millis(300)).await;
+        total_snaps += s;
+        total_deltas += d;
+    }
+    // Each member is caught up once (a snapshot), and then receives a
+    // delta for every member that connected after it: ~N*(N-1)/2 total.
+    assert_eq!(total_snaps, N as u32, "each member is caught up once");
+    assert!(
+        total_deltas >= (N * (N - 1) / 2) as u32 / 2,
+        "without the grace the fleet pays O(N^2) deltas — got {total_deltas} for N={N}"
+    );
+    Ok(())
+}
+
+/// With the grace, a reconnecting fleet gets zero broadcasts during the
+/// window, then one snapshot each of the settled view: O(N), not O(N^2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grace_turns_a_reconnect_storm_into_one_snapshot_each() -> Result<()> {
+    const N: usize = 12;
+    // A long-enough grace that the whole wave lands inside it.
+    let env = setup_fleet(N, 3, true).await;
+    let ids: Vec<TlsIdentity> = (0..N).map(|i| TlsIdentity::generate(&format!("c{i}")).unwrap()).collect();
+    let mut members = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        let cred = join_fleet(&env, i, id);
+        members.push(Member::connect(&env, &cred, id, 0).await?);
+    }
+    // During the grace: nothing is pushed to anyone (all sessions are
+    // unsynced, so broadcasts are held and catch-up is deferred).
+    let mut during_snaps = 0u32;
+    let mut during_deltas = 0u32;
+    for m in &mut members {
+        let (s, d) = drain_pushes(m, Duration::from_millis(150)).await;
+        during_snaps += s;
+        during_deltas += d;
+    }
+    assert_eq!((during_snaps, during_deltas), (0, 0), "no pushes at all while the fleet reconnects");
+
+    // Let the grace end, then each member heartbeats once. It gets exactly
+    // one snapshot of the settled view — never a per-reconnection delta.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (mut after_snaps, mut after_deltas) = (0u32, 0u32);
+    for m in &mut members {
+        m.heartbeat(&Heartbeat { gen: 0, ..Default::default() }).await?;
+        let (s, d) = drain_pushes(m, Duration::from_millis(400)).await;
+        after_snaps += s;
+        after_deltas += d;
+    }
+    assert_eq!(after_snaps, N as u32, "exactly one snapshot per member after the grace");
+    assert_eq!(after_deltas, 0, "and no per-reconnection deltas");
+    Ok(())
+}

@@ -537,6 +537,29 @@ mod tests {
     }
 
     #[test]
+    fn an_identical_resnapshot_programs_nothing_the_no_op_after_a_coordinator_restart() {
+        // The routes a member holds after a coordinator restart: some
+        // peers and a couple of gateway LANs.
+        let set = RouteSet::new(RecordingProgrammer::with_kernel(&[]));
+        let wanted = [net("10.99.1.5/32"), net("10.99.1.6/32"), net("192.168.9.0/24")];
+        let mine = [net("10.99.1.1/32")];
+        assert!(set.reconcile_via_kernel(&wanted, &mine).unwrap());
+        assert_eq!(set.programmer_calls().len(), 3, "the first apply installs three routes");
+
+        // The coordinator comes back and pushes a snapshot with the SAME
+        // content (only the generation changed). Re-applying it must
+        // touch the routing table zero times — no churn, no flap.
+        set.reconcile_via_kernel(&wanted, &mine).unwrap();
+        assert_eq!(set.programmer_calls().len(), 3, "an identical resnapshot programs nothing new");
+        // And the kernel still holds exactly the same set.
+        let mut k = set.programmer_kernel().into_iter().collect::<Vec<_>>();
+        k.sort();
+        let mut w: Vec<IpNet> = wanted.to_vec();
+        w.sort();
+        assert_eq!(k, w);
+    }
+
+    #[test]
     fn kernel_reconcile_reports_unsupported_so_the_caller_can_fall_back() {
         // The default recorder has no simulated kernel.
         let set = RouteSet::new(RecordingProgrammer::default());

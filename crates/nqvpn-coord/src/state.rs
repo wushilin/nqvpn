@@ -159,6 +159,10 @@ pub struct AppState {
     pub db: Arc<Db>,
     /// Published in join responses: the QUIC control port.
     pub control_port: u16,
+    /// The coordinator's own certificate (PEM) and whether it is the
+    /// auto-generated self-signed one, so the UI can hand members a
+    /// config that verifies it. Set once at startup.
+    pub coord_cert: Mutex<Option<(String, bool)>>,
     /// Network ids whose published state changed; the UI's live feed.
     pub events: tokio::sync::broadcast::Sender<String>,
     /// UI login sessions.
@@ -202,9 +206,14 @@ impl AppState {
             join_rate: Mutex::new(RateLimiter::default()),
             db,
             control_port,
+            coord_cert: Mutex::new(None),
             events: tokio::sync::broadcast::channel(256).0,
             auth: crate::auth::Sessions::default(),
         }
+    }
+
+    pub fn set_coord_cert(&self, pem: String, self_signed: bool) {
+        *self.coord_cert.lock().unwrap() = Some((pem, self_signed));
     }
 
     /// Serve a network (loaded from the database, or just created).

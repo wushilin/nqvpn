@@ -99,7 +99,9 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let quic_addr: SocketAddr = coord.listen.quic.parse().context("parsing listen.quic")?;
 
     let control_port = coord.listen.public_quic_port.unwrap_or(quic_addr.port());
+    let coord_tls_is_self_signed = coord.tls.is_none();
     let state = Arc::new(AppState::new(coord, admin_token, keyring, db.clone(), control_port));
+    state.set_coord_cert(identity.cert_pem(), coord_tls_is_self_signed);
     let loaded = db.load_all().context("loading networks from the database")?;
     if loaded.is_empty() {
         tracing::info!(db = %db_path.display(), "no networks yet — create one in the UI at /ui");

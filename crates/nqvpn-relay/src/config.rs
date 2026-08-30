@@ -19,6 +19,10 @@ pub struct RelayConfig {
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
+    /// The coordinator's certificate inline (PEM), as the UI hands it
+    /// out. Verified when `trust_any_cert = false`.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
     /// One QUIC socket serves attached clients and the relay mesh. Its
     /// port must be the one in the coordinator's relay address.
     #[serde(default = "d_listen")]
@@ -80,7 +84,7 @@ impl RelayConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone() }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone() }
     }
 }
 

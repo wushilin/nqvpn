@@ -34,6 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
         .route("/api/v1/ws", get(ws_upgrade))
+        .route("/api/v1/ca", get(coordinator_ca))
         .route("/api/v1/status", get(global_status))
         .route("/api/v1/networks", get(list_networks).post(create_network))
         .route("/api/v1/networks/{id}", put(update_network).delete(delete_network))
@@ -142,6 +143,16 @@ async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Js
         .map(|s| s.user)
         .unwrap_or_else(|| "token".into());
     Ok(Json(serde_json::json!({ "user": user, "login_configured": state.coord.admin.password_hash.is_some() })))
+}
+
+/// The coordinator's own certificate (public), so the UI can hand
+/// members a config that verifies it. No auth: a certificate is public.
+async fn coordinator_ca(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let cert = state.coord_cert.lock().unwrap().clone();
+    match cert {
+        Some((pem, self_signed)) => Ok(Json(serde_json::json!({ "pem": pem, "self_signed": self_signed }))),
+        None => Err(ApiError::not_found("coordinator certificate is not available")),
+    }
 }
 
 async fn ws_upgrade(State(state): State<Arc<AppState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Result<Response, ApiError> {

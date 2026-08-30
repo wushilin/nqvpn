@@ -7,7 +7,7 @@ use nqvpn_proto::api::JoinResponse;
 use nqvpn_proto::control::{Delta, GenerationGap, Heartbeat, Hello, HelloAck, Refresh, Resync, Snapshot};
 use nqvpn_proto::envelope::{decode_payload, Kind};
 use nqvpn_proto::identity::TlsIdentity;
-use nqvpn_proto::quic::client_config;
+
 use nqvpn_proto::seal::StaticKeys;
 use nqvpn_proto::stream::{read_envelope, write_msg};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -221,6 +221,9 @@ pub struct SessionParams {
     pub credential: String,
     pub keepalive_secs: u64,
     pub heartbeat_secs: u64,
+    /// How to trust the coordinator's certificate — the same settings
+    /// the HTTPS join used, so both channels trust it identically.
+    pub tls: nqvpn_proto::joinapi::JoinTls,
 }
 
 fn app_close(conn: &quinn::Connection) -> Option<(u32, String)> {
@@ -266,7 +269,11 @@ pub async fn run_session(
         let mut ep = quinn::Endpoint::client(bind)?;
         // The credential exchange authenticates both directions; the
         // coordinator's certificate is not pinned.
-        ep.set_default_client_config(client_config(identity, None, params.keepalive_secs).map_err(|e| anyhow!("tls: {e}"))?);
+        let extra_ca = params.tls.extra_ca().map_err(|e| anyhow!("ca: {e}"))?;
+        ep.set_default_client_config(
+            nqvpn_proto::quic::coordinator_client_config(identity, params.tls.trust_any_cert, &extra_ca, params.keepalive_secs)
+                .map_err(|e| anyhow!("tls: {e}"))?,
+        );
         match tokio::time::timeout(Duration::from_secs(10), ep.connect(sock, &host)?).await {
             Ok(Ok(c)) => {
                 connected = Some((ep, c));
@@ -447,6 +454,7 @@ pub async fn run_member(
             credential: credential.lock().unwrap().clone(),
             keepalive_secs,
             heartbeat_secs,
+            tls: cfg.tls.clone(),
         };
         match run_session(&identity, params, view.clone(), facts.clone(), handle.clone()).await {
             Ok(()) => tracing::warn!("coordinator session ended; reconnecting"),

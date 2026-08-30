@@ -65,13 +65,34 @@ pub struct JoinTls {
     /// with the coordinator's auto-generated certificate.
     pub trust_any_cert: bool,
     /// Extra PEM roots to trust when verifying (self-signed coordinator
-    /// certificate, private CA). Only used when `trust_any_cert` is off.
+    /// certificate, private CA), as a file path. Only used when
+    /// `trust_any_cert` is off.
     pub ca_pem: Option<PathBuf>,
+    /// Extra PEM roots inline (the coordinator's own certificate, as the
+    /// UI hands it out so a copied config just works). Only used when
+    /// `trust_any_cert` is off.
+    pub ca_cert: Option<String>,
+}
+
+impl JoinTls {
+    /// The extra CA / self-signed certificates to trust, from the inline
+    /// PEM and the file, as DER.
+    pub fn extra_ca(&self) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+        let mut out = Vec::new();
+        if let Some(pem) = &self.ca_cert {
+            out.extend(crate::quic::certs_from_pem(pem.as_bytes()));
+        }
+        if let Some(path) = &self.ca_pem {
+            let pem = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            out.extend(crate::quic::certs_from_pem(&pem));
+        }
+        Ok(out)
+    }
 }
 
 impl Default for JoinTls {
     fn default() -> Self {
-        JoinTls { trust_any_cert: true, ca_pem: None }
+        JoinTls { trust_any_cert: true, ca_pem: None, ca_cert: None }
     }
 }
 
@@ -111,26 +132,11 @@ fn tls_config(tls: &JoinTls) -> Result<Arc<rustls::ClientConfig>, JoinError> {
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| JoinError::Tls(e.to_string()))?;
-    let cfg = if tls.trust_any_cert {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::quic::PinnedServerCert {
-                expected_fp: None,
-                supported: provider.signature_verification_algorithms,
-            }))
-            .with_no_client_auth()
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Some(path) = &tls.ca_pem {
-            let pem = std::fs::read(path)?;
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-                let cert = cert.map_err(|e| JoinError::Tls(format!("reading {}: {e}", path.display())))?;
-                roots.add(cert).map_err(|e| JoinError::Tls(e.to_string()))?;
-            }
-        }
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
+    // The same trust decision the QUIC control plane uses, so both
+    // channels trust the coordinator identically.
+    let extra = tls.extra_ca().map_err(JoinError::Tls)?;
+    let verifier = crate::quic::coordinator_verifier(tls.trust_any_cert, &extra).map_err(|e| JoinError::Tls(e.to_string()))?;
+    let cfg = builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
     Ok(Arc::new(cfg))
 }
 
@@ -323,7 +329,7 @@ mod tests {
 
     #[test]
     fn strict_mode_builds_a_root_store() {
-        assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None }).is_ok());
+        assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None, ca_cert: None }).is_ok());
         assert!(tls_config(&JoinTls::default()).is_ok());
     }
 }

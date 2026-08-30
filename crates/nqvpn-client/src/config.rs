@@ -22,6 +22,10 @@ pub struct ClientConfig {
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
+    /// The coordinator's certificate inline (PEM), as the UI hands it
+    /// out. Verified when `trust_any_cert = false`.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
     /// Where the auto-generated TLS certificate and X25519 key live.
     /// Safe to delete: the next join records the new ones.
     #[serde(default = "d_state")]
@@ -44,7 +48,7 @@ fn d_state() -> PathBuf {
 /// with the key omitted would).
 impl Default for ClientConfig {
     fn default() -> Self {
-        ClientConfig { token: None, token_file: None, trust_any_cert: true, ca: None, state_dir: d_state(), tun_name: None }
+        ClientConfig { token: None, token_file: None, trust_any_cert: true, ca: None, ca_cert: None, state_dir: d_state(), tun_name: None }
     }
 }
 
@@ -70,7 +74,7 @@ impl ClientConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone() }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone() }
     }
 
     pub fn member(&self, override_token: Option<&str>) -> Result<nqvpn_sync::MemberConfig> {

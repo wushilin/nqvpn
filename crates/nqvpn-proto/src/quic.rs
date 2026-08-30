@@ -128,7 +128,8 @@ impl ClientCertVerifier for AnyClientCert {
 /// API when `trust_any_cert` is set.
 #[derive(Debug)]
 pub struct PinnedServerCert {
-    pub expected_fp: Option<String>,
+    /// Fingerprints to accept; empty means accept any certificate.
+    pub expected_fps: Vec<String>,
     pub supported: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
@@ -141,18 +142,17 @@ impl ServerCertVerifier for PinnedServerCert {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match &self.expected_fp {
-            None => Ok(ServerCertVerified::assertion()),
-            Some(want) => {
-                let got = fingerprint_der(end_entity);
-                if &got == want {
-                    Ok(ServerCertVerified::assertion())
-                } else {
-                    Err(rustls::Error::General(format!(
-                        "server certificate fingerprint mismatch: expected {want}, got {got}"
-                    )))
-                }
-            }
+        if self.expected_fps.is_empty() {
+            return Ok(ServerCertVerified::assertion());
+        }
+        let got = fingerprint_der(end_entity);
+        if self.expected_fps.contains(&got) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "server certificate fingerprint mismatch: got {got}, expected one of {:?}",
+                self.expected_fps
+            )))
         }
     }
     fn verify_tls12_signature(
@@ -228,8 +228,106 @@ pub fn client_config(
 ) -> Result<quinn::ClientConfig, TlsSetupError> {
     let p = provider();
     let verifier =
-        Arc::new(PinnedServerCert { expected_fp: expected_server_fp, supported: p.signature_verification_algorithms });
+        Arc::new(PinnedServerCert { expected_fps: expected_server_fp.into_iter().collect(), supported: p.signature_verification_algorithms });
     let mut tls = rustls::ClientConfig::builder_with_provider(p)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(id.cert_chain(), id.private_key())?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).map_err(|e| TlsSetupError::Quic(e.to_string()))?));
+    cfg.transport_config(transport(keepalive_secs));
+    Ok(cfg)
+}
+
+/// The certificates in a PEM blob, as DER.
+pub fn certs_from_pem(pem: &[u8]) -> Vec<CertificateDer<'static>> {
+    rustls_pemfile::certs(&mut &pem[..]).filter_map(|c| c.ok()).collect()
+}
+
+/// SHA-256 fingerprints ("sha256:<hex>") of the certificates in a PEM blob.
+pub fn cert_fingerprints_from_pem(pem: &[u8]) -> Vec<String> {
+    certs_from_pem(pem).iter().map(|c| fingerprint_der(c)).collect()
+}
+
+/// Verifies the coordinator: accept a certificate whose fingerprint is
+/// pinned (the self-signed coordinator cert, delivered to the member),
+/// otherwise fall back to standard chain + hostname validation against
+/// the platform roots plus any provided CA (a real certificate). This is
+/// the one trust path both the HTTPS join and the QUIC control plane use.
+#[derive(Debug)]
+pub struct CoordServerVerifier {
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
+    pinned: Vec<String>,
+}
+
+impl CoordServerVerifier {
+    /// Build from the platform roots plus `extra` CA/self-signed certs;
+    /// those same certs are also pinned by fingerprint so a self-signed
+    /// leaf is accepted regardless of its SAN.
+    pub fn new(extra: &[CertificateDer<'static>]) -> Result<Arc<Self>, TlsSetupError> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for c in extra {
+            let _ = roots.add(c.clone());
+        }
+        let pinned = extra.iter().map(|c| fingerprint_der(c)).collect();
+        let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
+            .build()
+            .map_err(|e| TlsSetupError::Quic(e.to_string()))?;
+        Ok(Arc::new(CoordServerVerifier { webpki, pinned }))
+    }
+}
+
+impl ServerCertVerifier for CoordServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if !self.pinned.is_empty() && self.pinned.contains(&fingerprint_der(end_entity)) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.webpki.verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls12_signature(m, c, d)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls13_signature(m, c, d)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.webpki.supported_verify_schemes()
+    }
+}
+
+/// The server-cert verifier for talking to the coordinator, honoring the
+/// member's trust settings. Shared by the HTTPS join and QUIC control
+/// plane so both channels trust the coordinator identically.
+pub fn coordinator_verifier(
+    trust_any: bool,
+    extra_ca: &[CertificateDer<'static>],
+) -> Result<Arc<dyn ServerCertVerifier>, TlsSetupError> {
+    if trust_any {
+        Ok(Arc::new(PinnedServerCert { expected_fps: Vec::new(), supported: provider().signature_verification_algorithms }))
+    } else {
+        Ok(CoordServerVerifier::new(extra_ca)?)
+    }
+}
+
+/// A quinn client config for the coordinator control plane, honoring the
+/// member's trust settings (mirrors the HTTPS join).
+pub fn coordinator_client_config(
+    id: &TlsIdentity,
+    trust_any: bool,
+    extra_ca: &[CertificateDer<'static>],
+    keepalive_secs: u64,
+) -> Result<quinn::ClientConfig, TlsSetupError> {
+    let verifier = coordinator_verifier(trust_any, extra_ca)?;
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -251,6 +349,49 @@ pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::identity::TlsIdentity;
+
+    async fn handshakes(server_id: &TlsIdentity, client_cfg: quinn::ClientConfig) -> Result<(), String> {
+        let srv = quinn::Endpoint::server(server_config(server_id, 1).unwrap(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = srv.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            if let Some(inc) = srv.accept().await {
+                let _ = inc.await; // drive the server handshake
+            }
+        });
+        let mut cep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        cep.set_default_client_config(client_cfg);
+        let r = cep.connect(addr, "coord.example.com").unwrap().await.map(|_| ()).map_err(|e| e.to_string());
+        accept.abort();
+        r
+    }
+
+    #[tokio::test]
+    async fn strict_mode_accepts_the_pinned_cert_and_rejects_a_wrong_one() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let coord = TlsIdentity::generate("coord").unwrap();
+        let member = TlsIdentity::generate("member").unwrap();
+        let coord_cert = CertificateDer::from(coord.cert_der.clone());
+        let other = TlsIdentity::generate("someone-else").unwrap();
+        let other_cert = CertificateDer::from(other.cert_der.clone());
+
+        // trust-any: connects regardless.
+        let cfg = coordinator_client_config(&member, true, &[], 5).unwrap();
+        assert!(handshakes(&coord, cfg).await.is_ok(), "trust_any accepts any cert");
+
+        // strict + the coordinator's own cert pinned: connects.
+        let cfg = coordinator_client_config(&member, false, std::slice::from_ref(&coord_cert), 5).unwrap();
+        assert!(handshakes(&coord, cfg).await.is_ok(), "strict + correct cert connects");
+
+        // strict + a different cert: rejected (a MITM presenting its own
+        // certificate fails).
+        let cfg = coordinator_client_config(&member, false, &[other_cert], 5).unwrap();
+        assert!(handshakes(&coord, cfg).await.is_err(), "strict rejects a cert that is not the coordinator's");
+
+        // strict + no CA at all: a self-signed coordinator is not in the
+        // platform roots, so it is rejected too.
+        let cfg = coordinator_client_config(&member, false, &[], 5).unwrap();
+        assert!(handshakes(&coord, cfg).await.is_err(), "strict with no CA rejects the self-signed coordinator");
+    }
 
     /// The bug this constant exists to prevent: quinn's default
     /// `initial_mtu` of 1200 is smaller than a sealed 1350-byte packet,

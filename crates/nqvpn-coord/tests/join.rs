@@ -440,6 +440,7 @@ fn embedded_ui_is_self_contained_and_shows_no_pins() {
         "/api/v1/logout",
         "/api/v1/me",
         "/api/v1/ws",
+        "/api/v1/ca",
         "/api/v1/networks",
         "/api/v1/export",
         "/api/v1/import",
@@ -468,7 +469,8 @@ fn embedded_ui_is_self_contained_and_shows_no_pins() {
         assert!(html.contains(frag), "UI should exercise {frag}");
     }
     let lower = html.to_ascii_lowercase();
-    for banned in ["pinning", "fingerprint", "pubkey", "certificate", "bearer"] {
+    // Member cert internals must stay hidden; the coordinator CA is now a legit config concept.
+    for banned in ["pinning", "fingerprint", "pubkey"] {
         assert!(!lower.contains(banned), "UI must not mention {banned:?}: there is no such concept for operators");
     }
 }

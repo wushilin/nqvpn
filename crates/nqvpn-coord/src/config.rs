@@ -324,7 +324,17 @@ pub fn load_coord_config(path: &Path) -> Result<CoordConfig> {
     Ok(cfg)
 }
 
-pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
+/// Canonicalize and check a network. Validation and normalization are one
+/// step so a network can never be stored un-normalized: a routed LAN given
+/// as a host address (`172.26.6.59/20`) is accepted and its host bits are
+/// masked off to the network address (`172.26.0.0/20`) here, before any
+/// overlap check runs against it.
+pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
+    for m in cfg.relays.values_mut() {
+        for c in m.local_cidrs.iter_mut() {
+            *c = c.trunc();
+        }
+    }
     let s = &cfg.settings;
     if !matches!(s.relay_reachability.as_str(), "off" | "warn" | "deny") {
         bail!(
@@ -417,9 +427,7 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("relay {name}: relay_addr is required"))?;
             validate_relay_addr(name, addr, cfg)?;
             for c in &m.local_cidrs {
-                if c.addr() != c.network() {
-                    bail!("relay {name}: local cidr {c} is not a network address (did you mean {}?)", c.trunc());
-                }
+                // Host bits were masked off above; every c is a network address now.
                 for t in &cfg.cidrs {
                     if overlaps(c, t) {
                         bail!("relay {name}: local cidr {c} overlaps tunnel space {t}");
@@ -613,8 +621,8 @@ pool = "default"
 
     #[test]
     fn valid_config_passes_and_indexes_by_name() {
-        let cfg = parse(&base());
-        validate_network(&cfg).unwrap();
+        let mut cfg = parse(&base());
+        validate_network(&mut cfg).unwrap();
         assert_eq!(cfg.member_by_name("c1").unwrap().1, Role::Client);
         assert_eq!(cfg.member_by_name("r1").unwrap().1, Role::Relay);
         assert!(cfg.member_by_name("nope").is_none());
@@ -623,46 +631,46 @@ pool = "default"
 
     #[test]
     fn pool_must_be_entirely_inside_a_cidr() {
-        assert!(validate_network(&parse(&base().replace("10.99.1.0/24", "10.200.0.0/24"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("10.99.1.0/24", "10.200.0.0/24"))).is_err());
         // Larger than its network: the old check only looked at the
         // first address and let the allocator hand out tunnel-space
         // addresses that were outside every route.
-        assert!(validate_network(&parse(&base().replace("10.99.1.0/24", "10.0.0.0/8"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("10.99.1.0/24", "10.0.0.0/8"))).is_err());
     }
 
     #[test]
     fn overlapping_pools_fail() {
         let mut s = base();
         s.push_str("[pools.other]\ncidr = \"10.99.1.128/25\"\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
     }
 
     #[test]
     fn client_with_relay_fields_fails() {
         let mut s = base();
         s.push_str("[clients.c2]\nrelay_addr = \"1.1.1.1:1\"\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
     }
 
     #[test]
     fn relay_without_addr_fails() {
         let mut s = base();
         s.push_str("[relays.r2]\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
     }
 
     #[test]
     fn relay_addr_in_tunnel_space_or_loopback_fails() {
-        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "10.99.0.7:4444"))).is_err());
-        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "127.0.0.1:4444"))).is_err());
-        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "localhost:4444"))).is_err(), "names resolve too");
+        assert!(validate_network(&mut parse(&base().replace("1.2.3.4:4444", "10.99.0.7:4444"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("1.2.3.4:4444", "127.0.0.1:4444"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("1.2.3.4:4444", "localhost:4444"))).is_err(), "names resolve too");
     }
 
     #[test]
     fn duplicate_preferred_ip_fails_and_node_ids_are_not_configurable() {
         let mut s = base();
         s.push_str("[clients.c9]\npreferred_ip4 = \"10.99.0.1\"\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
         let mut d = base();
         d.push_str("[clients.c9]\nnode_id = 7\n");
         assert!(toml::from_str::<NetworkConfig>(&d).is_err(), "ids are assigned by the coordinator, never written in config");
@@ -670,53 +678,57 @@ pool = "default"
 
     #[test]
     fn local_cidr_overlapping_tunnel_fails() {
-        assert!(validate_network(&parse(&base().replace("192.168.1.0/24", "10.99.5.0/24"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("192.168.1.0/24", "10.99.5.0/24"))).is_err());
     }
 
     #[test]
     fn identical_local_cidrs_across_relays_ok_for_failover_but_partial_overlap_fails() {
         let mut s = base();
         s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.1.0/24\"]\n");
-        validate_network(&parse(&s)).unwrap();
+        validate_network(&mut parse(&s)).unwrap();
         let mut s = base();
         s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.1.128/25\"]\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
+        // A routed LAN given as a host address is accepted and masked to
+        // its network address, not rejected.
         let mut s = base();
         s.push_str("[relays.r2]\nrelay_addr = \"5.6.7.8:4444\"\nlocal_cidrs = [\"192.168.2.1/24\"]\n");
-        assert!(validate_network(&parse(&s)).is_err(), "not a network address");
+        let mut cfg = parse(&s);
+        validate_network(&mut cfg).unwrap();
+        assert_eq!(cfg.relays["r2"].local_cidrs[0], "192.168.2.0/24".parse().unwrap(), "host bits masked off");
     }
 
     #[test]
     fn addresses_may_lie_outside_the_tunnel_cidrs_but_must_be_usable_and_unique() {
-        validate_network(&parse(&base().replace("10.99.0.1", "172.20.0.7"))).unwrap();
-        assert!(validate_network(&parse(&base().replace("10.99.0.1", "127.0.0.1"))).is_err());
-        assert!(validate_network(&parse(&base().replace("10.99.0.1", "192.168.1.7"))).is_ok(), "inside its own LAN is fine");
+        validate_network(&mut parse(&base().replace("10.99.0.1", "172.20.0.7"))).unwrap();
+        assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "127.0.0.1"))).is_err());
+        assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "192.168.1.7"))).is_ok(), "inside its own LAN is fine");
         let mut s = base();
         s.push_str("[clients.c2]\npreferred_ip4 = \"192.168.1.9\"\n");
-        assert!(validate_network(&parse(&s)).is_err(), "inside another member's routed LAN is not");
+        assert!(validate_network(&mut parse(&s)).is_err(), "inside another member's routed LAN is not");
     }
 
     #[test]
     fn relay_addr_may_be_auto_with_a_port() {
-        validate_network(&parse(&base().replace("1.2.3.4:4444", "auto:4444"))).unwrap();
-        assert!(validate_network(&parse(&base().replace("1.2.3.4:4444", "auto:x"))).is_err());
+        validate_network(&mut parse(&base().replace("1.2.3.4:4444", "auto:4444"))).unwrap();
+        assert!(validate_network(&mut parse(&base().replace("1.2.3.4:4444", "auto:x"))).is_err());
     }
 
     #[test]
     fn a_secret_is_optional_but_not_empty() {
         let s = base().replace("secret = \"s\"\npool", "pool");
-        validate_network(&parse(&s)).expect("an imported member may have none yet");
-        assert!(validate_network(&parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
+        validate_network(&mut parse(&s)).expect("an imported member may have none yet");
+        assert!(validate_network(&mut parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
     }
 
     #[test]
     fn preferred_relay_must_name_a_relay() {
         let mut s = base();
         s.push_str("[clients.c2]\npreferred_relay = \"r1\"\n[clients.c3]\npreferred_relay = \"nope\"\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
         let mut s = base();
         s.push_str("[clients.c2]\npreferred_relay = \"r1\"\n");
-        validate_network(&parse(&s)).unwrap();
+        validate_network(&mut parse(&s)).unwrap();
     }
 
     #[test]
@@ -758,9 +770,9 @@ pool = "default"
     fn settings_are_bounds_checked() {
         let mut s = base();
         s.push_str("[settings]\ncredential_ttl_mins = 0\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
         let mut s = base();
         s.push_str("[settings]\nmtu = 100\n");
-        assert!(validate_network(&parse(&s)).is_err());
+        assert!(validate_network(&mut parse(&s)).is_err());
     }
 }

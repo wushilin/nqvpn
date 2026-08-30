@@ -110,7 +110,7 @@ impl AppState {
         if self.net(&spec.network_id).is_some() {
             return Err(ApiError::bad_request(format!("network {:?} already exists", spec.network_id)));
         }
-        let cfg = NetworkConfig {
+        let mut cfg = NetworkConfig {
             network_id: spec.network_id.clone(),
             cidrs: spec.cidrs,
             pools: spec.pools,
@@ -118,7 +118,7 @@ impl AppState {
             relays: BTreeMap::new(),
             clients: BTreeMap::new(),
         };
-        validate_network(&cfg).map_err(invalid)?;
+        validate_network(&mut cfg).map_err(invalid)?;
         let registry = Registry::new();
         self.db
             .save_network_and_registry(&cfg, &registry)
@@ -140,7 +140,7 @@ impl AppState {
         cfg.cidrs = spec.cidrs;
         cfg.pools = spec.pools;
         cfg.settings = spec.settings;
-        validate_network(&cfg).map_err(invalid)?;
+        validate_network(&mut cfg).map_err(invalid)?;
         let s_old = &ns.cfg.settings;
         let s_new = &cfg.settings;
         let everyone = s_old.mtu != s_new.mtu
@@ -196,7 +196,7 @@ impl AppState {
         m.secret = Some(secret.clone());
         let mut cfg = ns.cfg.clone();
         cfg.insert_member(name, role, m);
-        validate_network(&cfg).map_err(invalid)?;
+        validate_network(&mut cfg).map_err(invalid)?;
         ns.cfg = cfg;
         ns.save_config()?;
         ns.notify();
@@ -212,7 +212,7 @@ impl AppState {
         let mut cfg = ns.cfg.clone();
         let (m, _) = cfg.member_by_name_mut(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         spec.apply(m);
-        validate_network(&cfg).map_err(invalid)?;
+        validate_network(&mut cfg).map_err(invalid)?;
         let changed = changed_members(&ns.cfg, &cfg);
         ns.cfg = cfg;
         ns.save_config()?;
@@ -324,8 +324,8 @@ impl AppState {
 
     /// Restore configuration: networks that exist are replaced whole
     /// (members included), others are created. Registries are kept.
-    pub fn import(&self, cfgs: Vec<NetworkConfig>) -> Result<Vec<String>, ApiError> {
-        for cfg in &cfgs {
+    pub fn import(&self, mut cfgs: Vec<NetworkConfig>) -> Result<Vec<String>, ApiError> {
+        for cfg in &mut cfgs {
             validate_network(cfg).map_err(invalid)?;
         }
         let mut applied = Vec::new();

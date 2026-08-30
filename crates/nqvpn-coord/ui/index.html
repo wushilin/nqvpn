@@ -351,6 +351,46 @@ function inp(value, attrs = {}) { const i = el('input'); i.value = value ?? ''; 
 const lines = s => s.split(/[\n,]/).map(x => x.trim()).filter(Boolean);
 const optNum = s => (s === '' || s === null || s === undefined) ? null : Number(s);
 const optStr = s => (s === '' || s === null || s === undefined) ? null : s;
+// CIDR helpers. The coordinator masks host bits off before saving; these
+// mirror that so the form can show the operator the exact result first.
+function ipToBig(ip) {
+  if (ip.includes(':')) {
+    const parts = ip.split('::');
+    if (parts.length > 2) return null;
+    const head = parts[0] ? parts[0].split(':') : [];
+    const tail = parts.length === 2 ? (parts[1] ? parts[1].split(':') : []) : null;
+    let groups;
+    if (tail === null) { groups = head; }
+    else { const miss = 8 - head.length - tail.length; if (miss < 0) return null; groups = head.concat(Array(miss).fill('0'), tail); }
+    if (groups.length !== 8) return null;
+    let v = 0n;
+    for (const g of groups) { if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null; v = (v << 16n) | BigInt(parseInt(g, 16)); }
+    return { v, bits: 128, v6: true };
+  }
+  const o = ip.split('.');
+  if (o.length !== 4) return null;
+  let v = 0n;
+  for (const x of o) { if (!/^\d{1,3}$/.test(x)) return null; const n = parseInt(x, 10); if (n > 255) return null; v = (v << 8n) | BigInt(n); }
+  return { v, bits: 32, v6: false };
+}
+function bigToIp(v, v6) {
+  if (!v6) return [24n, 16n, 8n, 0n].map(sh => ((v >> sh) & 255n).toString()).join('.');
+  const g = []; for (let i = 7; i >= 0; i--) g.push(Number((v >> BigInt(i * 16)) & 0xffffn));
+  let bs = -1, bl = 0, cs = -1, cl = 0;
+  for (let i = 0; i < 8; i++) { if (g[i] === 0) { if (cs < 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs; } } else { cs = -1; cl = 0; } }
+  if (bl > 1) return g.slice(0, bs).map(x => x.toString(16)).join(':') + '::' + g.slice(bs + bl).map(x => x.toString(16)).join(':');
+  return g.map(x => x.toString(16)).join(':');
+}
+// The network address of a CIDR, or null if it doesn't parse. When the
+// input carried host bits, the result differs from the input.
+function cidrNetwork(s) {
+  const m = s.trim().match(/^(.+)\/(\d+)$/); if (!m) return null;
+  const p = ipToBig(m[1]); if (!p) return null;
+  const pfx = parseInt(m[2], 10); if (pfx < 0 || pfx > p.bits) return null;
+  const ones = (1n << BigInt(p.bits)) - 1n;
+  const mask = pfx === 0 ? 0n : ones ^ ((1n << BigInt(p.bits - pfx)) - 1n);
+  return bigToIp(p.v & mask, p.v6) + '/' + pfx;
+}
 
 /* ---------- login ---------- */
 function showLogin() { $('#app').hidden = true; $('#login').hidden = false; if (ws) { ws.onclose = null; ws.close(); ws = null; } $('#lu').focus(); }
@@ -626,22 +666,44 @@ async function memberForm(st, existing) {
   const err = el('span', 'msg err'); bar.append(save, cancel, err); f.append(bar);
   if (existing) f.append(el('p', 'note', 'Saving tells the member to re-join immediately; it applies the new facts without a restart.'));
   cancel.onclick = closeModal;
-  f.onsubmit = async e => {
-    e.preventDefault(); save.disabled = true; err.textContent = '';
+  // Send the member. Throws on failure so each caller can place the error
+  // where the operator can see it (inline in the form, or via a toast when
+  // the form has been replaced by the confirm dialog).
+  const submit = async (localCidrs) => {
     const isRelay = roleSel.value === 'relay';
     const spec = {
       relay_addr: isRelay ? optStr(relayAddr.value.trim()) : null,
-      local_cidrs: isRelay ? lines(cidrs.value) : [],
+      local_cidrs: isRelay ? localCidrs : [],
       preferred_ip4: optStr(ip4.value.trim()), preferred_ip6: optStr(ip6.value.trim()),
       pool: optStr(poolInput.value.trim()),
       want_vpn_ip: wantIp.value === '' ? null : wantIp.value === 'true',
       max_session_mbps: isRelay ? optNum(cap.value.trim()) : null,
       preferred_relay: isRelay ? null : optStr(pref.value),
     };
-    try {
-      if (existing) { await api(memberPath(net, existing.name), { method: 'PUT', body: spec }); msg('Saved ' + existing.name + '; it is re-joining'); closeModal(); }
-      else { const r = await api(netPath(net) + '/members', { method: 'POST', body: { name: name.value.trim(), role: roleSel.value, ...spec } }); paintToken(openModal(r.name, net + ' · new ' + r.role), r, true); }
-    } catch (ex) { err.textContent = ex.message; save.disabled = false; }
+    if (existing) { await api(memberPath(net, existing.name), { method: 'PUT', body: spec }); msg('Saved ' + existing.name + '; it is re-joining'); closeModal(); }
+    else { const r = await api(netPath(net) + '/members', { method: 'POST', body: { name: name.value.trim(), role: roleSel.value, ...spec } }); paintToken(openModal(r.name, net + ' · new ' + r.role), r, true); }
+  };
+  f.onsubmit = async e => {
+    e.preventDefault(); save.disabled = true; err.textContent = '';
+    const isRelay = roleSel.value === 'relay';
+    const raw = isRelay ? lines(cidrs.value) : [];
+    // A routed LAN entered with host bits (172.26.6.59/20) is a network
+    // (172.26.0.0/20) with a typo'd address. Show what will be saved and
+    // let the operator confirm, rather than silently rewriting it.
+    const fixes = raw.map(c => ({ orig: c, norm: cidrNetwork(c) })).filter(x => x.norm && x.norm !== x.orig);
+    if (fixes.length) {
+      const normalized = raw.map(c => { const f = fixes.find(x => x.orig === c); return f ? f.norm : c; });
+      confirmModal({
+        title: 'Normalize routed ' + (fixes.length > 1 ? 'CIDRs?' : 'CIDR?'),
+        sub: existing ? existing.name : 'new member',
+        lead: 'These have host bits set. They are saved as their network address — confirm, or cancel to fix the input yourself.',
+        details: fixes.map(x => x.orig + '  →  ' + x.norm),
+        danger: 'Normalize & save',
+        onConfirm: async () => { await submit(normalized); return true; }, // confirmModal toasts on throw
+      });
+      return; // the confirm dialog owns the flow now
+    }
+    try { await submit(raw); } catch (ex) { err.textContent = ex.message; save.disabled = false; }
   };
   body.append(f);
   (existing ? relayAddr : name).focus();

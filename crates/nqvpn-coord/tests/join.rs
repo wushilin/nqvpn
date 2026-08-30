@@ -61,8 +61,8 @@ fn harness_with(toml: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let coord: CoordConfig =
         toml::from_str("[listen]\napi = \"127.0.0.1:0\"\n[state]\ndir = \"unused\"\n").unwrap();
-    let net_cfg: NetworkConfig = toml::from_str(toml).unwrap();
-    nqvpn_coord::config::validate_network(&net_cfg).unwrap();
+    let mut net_cfg: NetworkConfig = toml::from_str(toml).unwrap();
+    nqvpn_coord::config::validate_network(&mut net_cfg).unwrap();
     let keyring = Keyring::load_or_create(&dir.path().join("signing.json"), now_unix()).unwrap();
     let db = Arc::new(Db::open_memory().unwrap());
     let state = AppState::new(coord, Some("tok".into()), keyring, db.clone(), 14433);

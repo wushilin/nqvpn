@@ -7,5 +7,8 @@ token_file = "/etc/nqvpn/client.token"
 # token = "nqv1.…"
 state_dir = "/var/lib/nqvpn-client"
 # tun_name = "nqvpn0"             # Linux: any name; macOS: utunN
-# trust_any_cert = true           # default; set false to verify the coordinator's cert
-# ca = "/etc/nqvpn/coord-ca.pem"
+# The coordinator is verified by default: the token carries its
+# certificate fingerprint (self-signed), or it is checked against the
+# system roots (CA-signed). Nothing to configure.
+# trust_any_cert = true           # set only to deliberately skip verification
+# ca = "/etc/nqvpn/coord-ca.pem"  # extra CA file, if you verify a private CA

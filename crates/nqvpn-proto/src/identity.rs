@@ -34,15 +34,23 @@ impl TlsIdentity {
     /// Generate a fresh self-signed identity. `name` is cosmetic (the
     /// fingerprint is what's verified), but useful in packet captures.
     pub fn generate(name: &str) -> Result<Self, IdentityError> {
-        let mut params = rcgen::CertificateParams::new(vec![name.to_string()])
-            .map_err(|e| IdentityError::Gen(e.to_string()))?;
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, name.to_string());
-        let key = rcgen::KeyPair::generate().map_err(|e| IdentityError::Gen(e.to_string()))?;
-        let cert = params
-            .self_signed(&key)
-            .map_err(|e| IdentityError::Gen(e.to_string()))?;
+        use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P384_SHA384};
+        let mut params =
+            CertificateParams::new(vec![name.to_string()]).map_err(|e| IdentityError::Gen(e.to_string()))?;
+        params.distinguished_name.push(DnType::CommonName, name.to_string());
+        // Secure defaults for an identity that is verified by fingerprint
+        // (self-signed) and lives for the life of the node: ECDSA P-384,
+        // a 20-year validity so it never silently expires, backdated a
+        // day for clock skew. One identity is used for both TLS roles, so
+        // it carries both server- and client-auth EKUs.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(365 * 20);
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages =
+            vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).map_err(|e| IdentityError::Gen(e.to_string()))?;
+        let cert = params.self_signed(&key).map_err(|e| IdentityError::Gen(e.to_string()))?;
         TlsIdentity::from_der(cert.der().to_vec(), key.serialize_der())
     }
 

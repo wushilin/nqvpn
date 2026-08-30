@@ -6,7 +6,9 @@
 listen    = "0.0.0.0:4444"        # the port in this relay's address at the coordinator
 state_dir = "/var/lib/nqvpn-relay"
 # tun_name = "nqvpn0"             # only used when the relay has an endpoint role
-# trust_any_cert = true           # default; set false to verify the coordinator's cert
+# The coordinator is verified by default (the token carries its
+# fingerprint, or the system roots verify a CA-signed cert).
+# trust_any_cert = true           # set only to deliberately skip verification
 # ca = "/etc/nqvpn/coord-ca.pem"
 
 [limits]

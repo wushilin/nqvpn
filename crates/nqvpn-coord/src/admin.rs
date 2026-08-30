@@ -305,7 +305,16 @@ impl AppState {
         let ns = net.lock().unwrap();
         let (m, role) = ns.cfg.member_by_name(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         let secret = m.secret.clone().ok_or_else(|| ApiError::not_found(format!("member {name:?} has no secret; rotate to mint one")))?;
-        Ok((Token { coordinator: endpoint.to_string(), secret }, role))
+        // A self-signed coordinator ships its fingerprint in the token so
+        // the member verifies it with no CA file; a CA-signed one relies
+        // on the platform roots (renewal-safe).
+        let fp = self
+            .coord_cert
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(pem, self_signed)| self_signed.then(|| nqvpn_proto::quic::cert_fingerprints_from_pem(pem.as_bytes()).into_iter().next()).flatten());
+        Ok((Token { coordinator: endpoint.to_string(), secret, fp }, role))
     }
 
     /// All configuration, for backup or for keeping in version control.

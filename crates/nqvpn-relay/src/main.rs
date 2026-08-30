@@ -113,7 +113,10 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
     let mut nets: HashMap<String, Arc<RelayNet>> = HashMap::new();
     let mut guards = Vec::new();
     for (i, ncfg) in cfg.networks.iter().enumerate() {
-        let member = Arc::new(MemberConfig::from_token(&ncfg.token()?, cfg.tls()));
+        let token = ncfg.token()?;
+        let mut member_tls = cfg.tls();
+        member_tls.pinned_fp = token.fp.clone();
+        let member = Arc::new(MemberConfig::from_token(&token, member_tls));
         let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
         anyhow::ensure!(
             joined.role == Role::Relay,

@@ -19,6 +19,12 @@ pub struct Token {
     /// `https://host[:port]` of the coordinator.
     pub coordinator: String,
     pub secret: String,
+    /// The coordinator's certificate fingerprint ("sha256:<hex>"), when
+    /// it uses a self-signed certificate. The member pins both the HTTPS
+    /// join and the QUIC control plane to it, so verification is the
+    /// default with no CA file. Absent for a CA-signed coordinator (the
+    /// member verifies against the platform roots instead).
+    pub fp: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -35,7 +41,11 @@ pub enum TokenError {
 
 impl Token {
     pub fn encode(&self) -> String {
-        let body = format!("endpoint={};secret={}", self.coordinator, self.secret);
+        let mut body = format!("endpoint={};secret={}", self.coordinator, self.secret);
+        if let Some(fp) = &self.fp {
+            body.push_str(";fp=");
+            body.push_str(fp);
+        }
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(body.as_bytes()))
     }
 
@@ -46,16 +56,18 @@ impl Token {
         let text = String::from_utf8(raw).map_err(|_| TokenError::Malformed)?;
         let mut coordinator = None;
         let mut secret = None;
+        let mut fp = None;
         for part in text.split(';') {
             match part.split_once('=') {
                 Some(("endpoint", v)) => coordinator = Some(v.trim().to_string()),
                 Some(("secret", v)) => secret = Some(v.trim().to_string()),
+                Some(("fp", v)) => fp = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
                 _ => {} // forward compatible: unknown fields are ignored
             }
         }
         let coordinator = coordinator.filter(|c| !c.is_empty()).ok_or(TokenError::NoEndpoint)?;
         let secret = secret.filter(|c| !c.is_empty()).ok_or(TokenError::NoSecret)?;
-        Ok(Token { coordinator, secret })
+        Ok(Token { coordinator, secret, fp })
     }
 }
 
@@ -65,7 +77,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let t = Token { coordinator: "https://coord.example:8443".into(), secret: "abc_-123".into() };
+        let t = Token { coordinator: "https://coord.example:8443".into(), secret: "abc_-123".into(), fp: None };
         let s = t.encode();
         assert!(s.starts_with("nqv1."));
         assert_eq!(Token::parse(&s).unwrap(), t);
@@ -83,8 +95,15 @@ mod tests {
     }
 
     #[test]
+    fn a_fingerprint_round_trips() {
+        let t = Token { coordinator: "https://c:8443".into(), secret: "s".into(), fp: Some("sha256:abcd".into()) };
+        assert_eq!(Token::parse(&t.encode()).unwrap(), t);
+        assert!(t.encode().contains("nqv1."));
+    }
+
+    #[test]
     fn unknown_fields_are_ignored() {
         let s = format!("nqv1.{}", URL_SAFE_NO_PAD.encode(b"endpoint=https://x;future=1;secret=y"));
-        assert_eq!(Token::parse(&s).unwrap(), Token { coordinator: "https://x".into(), secret: "y".into() });
+        assert_eq!(Token::parse(&s).unwrap(), Token { coordinator: "https://x".into(), secret: "y".into(), fp: None });
     }
 }

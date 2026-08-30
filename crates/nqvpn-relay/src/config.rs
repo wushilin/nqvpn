@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
-    /// Accept any coordinator certificate (default). Set false to
-    /// verify against system roots plus `ca`.
-    #[serde(default = "d_true")]
+    /// Skip coordinator certificate verification. Default false: the
+    /// token pins the coordinator's certificate (self-signed) or it is
+    /// verified against the system roots (CA-signed). Set true only to
+    /// deliberately trust any certificate.
+    #[serde(default = "d_false")]
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
@@ -60,8 +62,8 @@ pub struct LimitsCfg {
     pub workers: usize,
 }
 
-fn d_true() -> bool {
-    true
+fn d_false() -> bool {
+    false
 }
 
 fn d_listen() -> String {
@@ -84,7 +86,7 @@ impl RelayConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone() }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fp: None }
     }
 }
 
@@ -106,7 +108,7 @@ mod tests {
     use super::*;
 
     fn tok(secret: &str) -> String {
-        Token { coordinator: "https://coord.example:8443".into(), secret: secret.into() }.encode()
+        Token { coordinator: "https://coord.example:8443".into(), secret: secret.into(), fp: None }.encode()
     }
 
     #[test]

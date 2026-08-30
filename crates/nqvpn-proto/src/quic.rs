@@ -308,10 +308,15 @@ impl ServerCertVerifier for CoordServerVerifier {
 /// member's trust settings. Shared by the HTTPS join and QUIC control
 /// plane so both channels trust the coordinator identically.
 pub fn coordinator_verifier(
+    pinned_fp: Option<&str>,
     trust_any: bool,
     extra_ca: &[CertificateDer<'static>],
 ) -> Result<Arc<dyn ServerCertVerifier>, TlsSetupError> {
-    if trust_any {
+    if let Some(fp) = pinned_fp {
+        // The token carried the coordinator's fingerprint: pin to it,
+        // regardless of the other settings. Verification with no CA file.
+        Ok(Arc::new(PinnedServerCert { expected_fps: vec![fp.to_string()], supported: provider().signature_verification_algorithms }))
+    } else if trust_any {
         Ok(Arc::new(PinnedServerCert { expected_fps: Vec::new(), supported: provider().signature_verification_algorithms }))
     } else {
         Ok(CoordServerVerifier::new(extra_ca)?)
@@ -322,11 +327,12 @@ pub fn coordinator_verifier(
 /// member's trust settings (mirrors the HTTPS join).
 pub fn coordinator_client_config(
     id: &TlsIdentity,
+    pinned_fp: Option<&str>,
     trust_any: bool,
     extra_ca: &[CertificateDer<'static>],
     keepalive_secs: u64,
 ) -> Result<quinn::ClientConfig, TlsSetupError> {
-    let verifier = coordinator_verifier(trust_any, extra_ca)?;
+    let verifier = coordinator_verifier(pinned_fp, trust_any, extra_ca)?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
@@ -375,21 +381,21 @@ mod tests {
         let other_cert = CertificateDer::from(other.cert_der.clone());
 
         // trust-any: connects regardless.
-        let cfg = coordinator_client_config(&member, true, &[], 5).unwrap();
+        let cfg = coordinator_client_config(&member, None, true, &[], 5).unwrap();
         assert!(handshakes(&coord, cfg).await.is_ok(), "trust_any accepts any cert");
 
         // strict + the coordinator's own cert pinned: connects.
-        let cfg = coordinator_client_config(&member, false, std::slice::from_ref(&coord_cert), 5).unwrap();
+        let cfg = coordinator_client_config(&member, None, false, std::slice::from_ref(&coord_cert), 5).unwrap();
         assert!(handshakes(&coord, cfg).await.is_ok(), "strict + correct cert connects");
 
         // strict + a different cert: rejected (a MITM presenting its own
         // certificate fails).
-        let cfg = coordinator_client_config(&member, false, &[other_cert], 5).unwrap();
+        let cfg = coordinator_client_config(&member, None, false, &[other_cert], 5).unwrap();
         assert!(handshakes(&coord, cfg).await.is_err(), "strict rejects a cert that is not the coordinator's");
 
         // strict + no CA at all: a self-signed coordinator is not in the
         // platform roots, so it is rejected too.
-        let cfg = coordinator_client_config(&member, false, &[], 5).unwrap();
+        let cfg = coordinator_client_config(&member, None, false, &[], 5).unwrap();
         assert!(handshakes(&coord, cfg).await.is_err(), "strict with no CA rejects the self-signed coordinator");
     }
 

@@ -659,33 +659,11 @@ function paintToken(body, r, fresh) {
   bar.append(copy, regen); body.append(bar);
 
   body.append(el('h2', null, 'On the machine'));
-  const pre = el('pre', 'cfg', 'building config…');
-  body.append(pre);
-  const note = el('p', 'note', ''); body.append(note);
-  // Fetch the coordinator's own certificate so the config verifies it
-  // (a copied config just works, and is not exposed to a man-in-the-middle).
-  (async () => {
-    let ca = null;
-    try { ca = await api('/api/v1/ca'); } catch {}
-    const indent = pem => pem.trim().split('\n').join('\n');
-    let trust;
-    if (ca && ca.self_signed) {
-      trust = `trust_any_cert = false\nca_cert = """\n${indent(ca.pem)}\n"""`;
-      note.textContent = 'The coordinator uses a self-signed certificate; it is embedded above so the member verifies it. If you rotate the coordinator certificate, re-issue this config.';
-    } else if (ca) {
-      trust = 'trust_any_cert = false';
-      note.textContent = 'The coordinator uses a CA-signed certificate; members verify it against the system roots.';
-    } else {
-      trust = 'trust_any_cert = true   # coordinator certificate not available; not verified';
-      note.textContent = 'Could not fetch the coordinator certificate; falling back to trust_any_cert = true (works, but not verified).';
-    }
-    const snip = r.role === 'relay'
-      ? `# /etc/nqvpn/relay.toml\nlisten = "0.0.0.0:4444"        # the port in this relay's address\n${trust}\n\n[[networks]]\ntoken = "${r.token}"\n\n# then:  nqvpn-relay --config /etc/nqvpn/relay.toml`
-      : `# /etc/nqvpn/client.toml\ntoken = "${r.token}"\n${trust}`;
-    pre.textContent = snip;
-    const endpoint = el('p', 'note', `Coordinator endpoint in this token: ${r.coordinator}. If members reach the coordinator at a different address, set listen.public_url in coordinator.toml.`);
-    note.after(endpoint);
-  })();
+  const snip = r.role === 'relay'
+    ? `# /etc/nqvpn/relay.toml\nlisten = "0.0.0.0:4444"        # the port in this relay's address\n\n[[networks]]\ntoken = "${r.token}"\n\n# then:  nqvpn-relay --config /etc/nqvpn/relay.toml`
+    : `# one-liner\nnqvpn-client --token "${r.token}"\n\n# or /etc/nqvpn/client.toml\ntoken = "${r.token}"`;
+  body.append(el('pre', 'cfg', snip));
+  body.append(el('p', 'note', `The token carries the coordinator endpoint (${r.coordinator}) and, for a self-signed coordinator, its certificate fingerprint — so the member verifies the coordinator with nothing else to configure (a CA-signed coordinator is verified against the system roots). Add trust_any_cert = true only to deliberately skip verification. If members reach the coordinator at a different address, set listen.public_url in coordinator.toml.`));
 }
 
 /* ---------- settings ---------- */

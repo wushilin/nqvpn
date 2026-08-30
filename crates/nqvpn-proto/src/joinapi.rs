@@ -68,10 +68,13 @@ pub struct JoinTls {
     /// certificate, private CA), as a file path. Only used when
     /// `trust_any_cert` is off.
     pub ca_pem: Option<PathBuf>,
-    /// Extra PEM roots inline (the coordinator's own certificate, as the
-    /// UI hands it out so a copied config just works). Only used when
-    /// `trust_any_cert` is off.
+    /// Extra PEM roots inline (the coordinator's own certificate). Only
+    /// used when `trust_any_cert` is off and there is no `pinned_fp`.
     pub ca_cert: Option<String>,
+    /// The coordinator's certificate fingerprint from the member token.
+    /// When set, both channels pin to it (verification, no CA file),
+    /// taking precedence over everything else.
+    pub pinned_fp: Option<String>,
 }
 
 impl JoinTls {
@@ -92,7 +95,7 @@ impl JoinTls {
 
 impl Default for JoinTls {
     fn default() -> Self {
-        JoinTls { trust_any_cert: true, ca_pem: None, ca_cert: None }
+        JoinTls { trust_any_cert: true, ca_pem: None, ca_cert: None, pinned_fp: None }
     }
 }
 
@@ -135,7 +138,7 @@ fn tls_config(tls: &JoinTls) -> Result<Arc<rustls::ClientConfig>, JoinError> {
     // The same trust decision the QUIC control plane uses, so both
     // channels trust the coordinator identically.
     let extra = tls.extra_ca().map_err(JoinError::Tls)?;
-    let verifier = crate::quic::coordinator_verifier(tls.trust_any_cert, &extra).map_err(|e| JoinError::Tls(e.to_string()))?;
+    let verifier = crate::quic::coordinator_verifier(tls.pinned_fp.as_deref(), tls.trust_any_cert, &extra).map_err(|e| JoinError::Tls(e.to_string()))?;
     let cfg = builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth();
     Ok(Arc::new(cfg))
 }
@@ -329,7 +332,7 @@ mod tests {
 
     #[test]
     fn strict_mode_builds_a_root_store() {
-        assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None, ca_cert: None }).is_ok());
+        assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None, ca_cert: None, pinned_fp: None }).is_ok());
         assert!(tls_config(&JoinTls::default()).is_ok());
     }
 }

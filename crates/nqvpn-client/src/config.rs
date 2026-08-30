@@ -16,9 +16,11 @@ pub struct ClientConfig {
     pub token: Option<String>,
     #[serde(default)]
     pub token_file: Option<PathBuf>,
-    /// Accept any coordinator certificate (default). Set false to
-    /// verify against system roots plus `ca`.
-    #[serde(default = "d_true")]
+    /// Skip coordinator certificate verification. Default false: the
+    /// token pins the coordinator's certificate (self-signed) or it is
+    /// verified against the system roots (CA-signed). Set true only to
+    /// deliberately trust any certificate.
+    #[serde(default = "d_false")]
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
@@ -35,8 +37,8 @@ pub struct ClientConfig {
     pub tun_name: Option<String>,
 }
 
-fn d_true() -> bool {
-    true
+fn d_false() -> bool {
+    false
 }
 
 fn d_state() -> PathBuf {
@@ -48,7 +50,7 @@ fn d_state() -> PathBuf {
 /// with the key omitted would).
 impl Default for ClientConfig {
     fn default() -> Self {
-        ClientConfig { token: None, token_file: None, trust_any_cert: true, ca: None, ca_cert: None, state_dir: d_state(), tun_name: None }
+        ClientConfig { token: None, token_file: None, trust_any_cert: false, ca: None, ca_cert: None, state_dir: d_state(), tun_name: None }
     }
 }
 
@@ -74,11 +76,15 @@ impl ClientConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone() }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fp: None }
     }
 
     pub fn member(&self, override_token: Option<&str>) -> Result<nqvpn_sync::MemberConfig> {
-        Ok(nqvpn_sync::MemberConfig::from_token(&self.token(override_token)?, self.tls()))
+        let token = self.token(override_token)?;
+        let mut tls = self.tls();
+        // The token's fingerprint is the trust anchor when present.
+        tls.pinned_fp = token.fp.clone();
+        Ok(nqvpn_sync::MemberConfig::from_token(&token, tls))
     }
 }
 
@@ -87,13 +93,13 @@ mod tests {
     use super::*;
 
     fn tok() -> String {
-        Token { coordinator: "https://coord.example:8443".into(), secret: "s".into() }.encode()
+        Token { coordinator: "https://coord.example:8443".into(), secret: "s".into(), fp: None }.encode()
     }
 
     #[test]
     fn a_token_is_all_it_takes() {
         let c: ClientConfig = toml::from_str(&format!("token = \"{}\"\n", tok())).unwrap();
-        assert!(c.trust_any_cert);
+        assert!(!c.trust_any_cert, "verification is the default now");
         let m = c.member(None).unwrap();
         assert_eq!(m.coordinator, "https://coord.example:8443");
         assert_eq!(m.secret, "s");
@@ -105,7 +111,10 @@ mod tests {
         assert!(c.member(None).is_err());
         let m = c.member(Some(&tok())).unwrap();
         assert_eq!(m.secret, "s");
-        assert!(m.tls.trust_any_cert, "--token without a config file must still trust any coordinator certificate");
+        // Verification is the default; a real token from the UI carries
+        // the coordinator's fingerprint (this bare test token has none).
+        assert!(!m.tls.trust_any_cert);
+        assert_eq!(m.tls.pinned_fp, None);
         assert_eq!(c.state_dir, d_state());
     }
 

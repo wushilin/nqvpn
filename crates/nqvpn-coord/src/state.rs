@@ -70,8 +70,11 @@ impl NetState {
     /// Collecting before publishing: members that reconnect after a
     /// coordinator restart keep their last view until the fleet has had
     /// two heartbeats to re-declare what it holds.
+    /// Within the post-restart collect window: hold view pushes while the
+    /// fleet reconnects, then send each member one snapshot of the
+    /// settled view (see `restart_grace_secs`).
     pub fn in_grace(&self, now: u64) -> bool {
-        now < self.started_at + 2 * self.cfg.settings.heartbeat_secs.max(1) as u64
+        now < self.started_at + self.cfg.settings.restart_grace_secs
     }
 
     /// Recompute the view and, if it changed, push the delta to every

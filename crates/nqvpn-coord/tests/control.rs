@@ -32,6 +32,7 @@ cidr = "10.99.1.0/24"
 heartbeat_secs = 1
 offline_after = 3
 hold_down_secs = 0
+restart_grace_secs = 2
 [relays.r1]
 secret = "s-r1"
 relay_addr = "1.2.3.4:4444"
@@ -584,7 +585,7 @@ async fn refresh_extends_the_session_but_never_rebinds_it() -> Result<()> {
 #[tokio::test]
 async fn a_restarted_coordinator_collects_before_publishing() -> Result<()> {
     let env = setup().await;
-    env.state.net("n1").unwrap().lock().unwrap().started_at = now_unix(); // grace = 2 × 1 s
+    env.state.net("n1").unwrap().lock().unwrap().started_at = now_unix(); // grace = restart_grace_secs = 2 s
     let cid = TlsIdentity::generate("c1")?;
     let (cred, _) = join_as(&env, 10, Role::Client, &cid, vec![]);
     let mut c = Member::connect(&env, &cred, &cid, 0).await?;

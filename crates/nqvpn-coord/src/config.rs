@@ -170,6 +170,16 @@ pub struct SettingsCfg {
     /// Default per-client bandwidth cap applied by relays; 0 = none.
     #[serde(default)]
     pub max_session_mbps: u32,
+    /// After a coordinator restart, hold view pushes for this long while
+    /// members reconnect, then send each one snapshot of the settled
+    /// view — instead of a delta per reconnection, which for a large
+    /// fleet is a broadcast storm. Must exceed the reconnect window
+    /// (members are back within ~5 s of the coordinator returning); the
+    /// data plane keeps forwarding throughout, so a generous value is
+    /// safe. It only delays visibility of *changes* made during the
+    /// window.
+    #[serde(default = "d_restart_grace")]
+    pub restart_grace_secs: u64,
     /// Let relays advertise loopback addresses. Only for running a whole
     /// network on one machine (tests, demos); never in production.
     #[serde(default)]
@@ -188,6 +198,7 @@ impl Default for SettingsCfg {
             transport: d_transport(),
             lanes: d_lanes(),
             max_session_mbps: 0,
+            restart_grace_secs: d_restart_grace(),
             allow_loopback_relays: false,
         }
     }
@@ -211,6 +222,10 @@ fn d_offline_after() -> u32 {
 }
 fn d_hold_down() -> u64 {
     60
+}
+
+fn d_restart_grace() -> u64 {
+    30
 }
 fn d_mtu() -> u16 {
     1350
@@ -334,6 +349,13 @@ pub fn validate_network(cfg: &NetworkConfig) -> Result<()> {
     }
     if s.mtu < 1280 || s.mtu > 9000 {
         bail!("network {}: mtu {} is outside 1280..=9000", cfg.network_id, s.mtu);
+    }
+    if s.restart_grace_secs > 600 {
+        bail!(
+            "network {}: restart_grace_secs {} is unreasonably large (max 600); it only holds view pushes after a coordinator restart while the fleet reconnects",
+            cfg.network_id,
+            s.restart_grace_secs
+        );
     }
     if cfg.cidrs.is_empty() {
         bail!("network {}: cidrs must not be empty", cfg.network_id);

@@ -41,7 +41,7 @@ fn port() -> u16 {
 fn net_toml(relays: &[(NodeId, u16)], clients: &[NodeId]) -> String {
     let mut s = format!(
         "network_id = \"{NET}\"\ncidrs = [\"10.99.0.0/16\"]\n[pools.default]\ncidr = \"10.99.1.0/24\"\n\
-         [settings]\nheartbeat_secs = 1\noffline_after = 3\nhold_down_secs = 0\nallow_loopback_relays = true\ntransport = \"datagram\"\n"
+         [settings]\nheartbeat_secs = 1\noffline_after = 3\nhold_down_secs = 0\nrestart_grace_secs = 2\nallow_loopback_relays = true\ntransport = \"datagram\"\n"
     );
     for (id, p) in relays {
         s.push_str(&format!("[relays.r{id}]\nsecret = \"{}\"\nrelay_addr = \"127.0.0.1:{p}\"\nwant_vpn_ip = false\n", secret_of(&format!("r{id}"))));

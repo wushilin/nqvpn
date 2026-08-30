@@ -32,6 +32,12 @@ struct Cli {
     /// The member token (overrides the config's token / token_file).
     #[arg(long)]
     token: Option<String>,
+    /// Send ALL traffic through the tunnel (like OpenVPN's redirect-gateway):
+    /// installs the 0.0.0.0/1 + 128.0.0.0/1 (and ::/1 + 8000::/1) default
+    /// override and pins the coordinator/relay transport to the real
+    /// gateway so it is not captured. DNS is not changed.
+    #[arg(long)]
+    route_all: bool,
 }
 
 fn main() -> Result<()> {
@@ -110,7 +116,7 @@ async fn run(cli: Cli) -> Result<i32> {
         ))
     };
 
-    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None);
+    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, cli.route_all);
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
         use std::net::ToSocketAddrs;
         if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {

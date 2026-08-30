@@ -74,8 +74,8 @@ impl Coord {
         });
         // The database is the coordinator's memory across restarts: the
         // network is seeded into it once, and a restart reloads it.
-        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
-        nqvpn_coord::config::validate_network(&cfg).unwrap();
+        let mut cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        nqvpn_coord::config::validate_network(&mut cfg).unwrap();
         let coord: CoordConfig = toml::from_str(&format!(
             "[listen]\napi = \"127.0.0.1:{api_port}\"\nquic = \"127.0.0.1:{quic_port}\"\n[state]\ndir = \"{}\"\n",
             dir.display()
@@ -299,7 +299,7 @@ impl ClientHandle {
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false);
         *client.prefer_recheck.lock().unwrap() = Duration::from_secs(2);
         client.spawn_pumps();
         let tasks = vec![
@@ -735,7 +735,7 @@ impl ClientHandle {
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),

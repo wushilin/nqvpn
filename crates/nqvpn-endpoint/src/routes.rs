@@ -49,6 +49,62 @@ pub trait RouteProgrammer: Send + Sync {
     fn list_via_dev(&self) -> Option<Vec<IpNet>> {
         None
     }
+
+    /// For `--route-all`: pin each underlay host (the coordinator and the
+    /// relays this node dials) to the real default gateway with a host
+    /// route, so the catch-all halves below do not swallow the tunnel's
+    /// own transport. Reconciles to exactly `ips` (adds new, drops gone)
+    /// and returns those actually pinned. The default pretends success so
+    /// the recording/dry-run programmer still reports the catch-all routes;
+    /// the real programmer overrides it.
+    fn pin_underlay(&self, ips: &[IpAddr]) -> Result<Vec<IpAddr>> {
+        Ok(ips.to_vec())
+    }
+}
+
+/// The two halves that together cover a whole address family. Each is one
+/// bit longer than the default route, so the kernel prefers them over
+/// `0.0.0.0/0` without deleting it — OpenVPN's `redirect-gateway def1`.
+pub fn catch_all_halves(v6: bool) -> [IpNet; 2] {
+    if v6 {
+        ["::/1".parse().unwrap(), "8000::/1".parse().unwrap()]
+    } else {
+        ["0.0.0.0/1".parse().unwrap(), "128.0.0.0/1".parse().unwrap()]
+    }
+}
+
+/// Which underlay hosts need pinning under route-all: those NOT already
+/// carried by a connected local route (a relay on the same LAN is reached
+/// by its own more-specific connected route, which already outranks the
+/// catch-all — pinning it via the gateway would be wrong).
+pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
+    let s: BTreeSet<IpAddr> = underlay
+        .iter()
+        .copied()
+        .filter(|ip| !local.iter().any(|l| l.contains(ip)))
+        .collect();
+    s.into_iter().collect()
+}
+
+/// The catch-all halves that are safe to install: a family's halves go in
+/// only if every underlay host of that family that needed pinning was
+/// pinned. If a family's transport could not be protected (no gateway),
+/// its halves are withheld so route-all never severs the tunnel.
+pub fn route_all_nets(to_pin: &[IpAddr], pinned: &[IpAddr]) -> Vec<IpNet> {
+    let mut out = Vec::new();
+    let family_ok = |v6: bool| {
+        to_pin
+            .iter()
+            .filter(|ip| ip.is_ipv6() == v6)
+            .all(|ip| pinned.contains(ip))
+    };
+    if family_ok(false) {
+        out.extend(catch_all_halves(false));
+    }
+    if family_ok(true) {
+        out.extend(catch_all_halves(true));
+    }
+    out
 }
 
 /// Routes the view says this node should have, before local exclusion.
@@ -115,6 +171,12 @@ pub struct RouteSet<P: RouteProgrammer> {
 impl<P: RouteProgrammer> RouteSet<P> {
     pub fn new(programmer: P) -> Self {
         RouteSet { programmer, installed: Mutex::new(BTreeSet::new()), last: Mutex::new((Vec::new(), Vec::new())) }
+    }
+
+    /// Pin the underlay transport hosts to the real gateway (route-all).
+    /// Delegates to the programmer; returns those actually pinned.
+    pub fn pin_underlay(&self, ips: &[IpAddr]) -> Result<Vec<IpAddr>> {
+        self.programmer.pin_underlay(ips)
     }
 
     /// Reconcile against the **kernel's** own view of our device — the
@@ -352,13 +414,27 @@ impl RouteProgrammer for RecordingProgrammer {
 pub struct NetRouteProgrammer {
     device: String,
     mgr: Mutex<route_manager::RouteManager>,
+    /// Underlay host routes we added via the real gateway (route-all), so
+    /// we can reconcile and tear them down. ip -> the gateway used.
+    pinned: Mutex<std::collections::BTreeMap<IpAddr, IpAddr>>,
 }
 
 impl NetRouteProgrammer {
     pub fn new(device: String) -> Result<Self> {
         let mgr = route_manager::RouteManager::new()
             .map_err(|e| anyhow::anyhow!("opening the OS routing table: {e}"))?;
-        Ok(NetRouteProgrammer { device, mgr: Mutex::new(mgr) })
+        Ok(NetRouteProgrammer { device, mgr: Mutex::new(mgr), pinned: Mutex::new(std::collections::BTreeMap::new()) })
+    }
+
+    /// The current default route's gateway for a family, ignoring any
+    /// default that points at our own TUN. `None` if there is none.
+    fn default_gateway(&self, v6: bool) -> Option<IpAddr> {
+        let mytun = self.ifindex();
+        let routes = self.mgr.lock().unwrap().list().ok()?;
+        routes
+            .into_iter()
+            .find(|r| r.prefix() == 0 && r.destination().is_ipv6() == v6 && r.gateway().is_some() && !self.ours(r, mytun))
+            .and_then(|r| r.gateway())
     }
 
     /// Our TUN's kernel interface index, resolved fresh each call so a
@@ -384,6 +460,12 @@ impl NetRouteProgrammer {
     fn ours(&self, r: &route_manager::Route, idx: Option<u32>) -> bool {
         r.if_name().map(|n| n == &self.device).unwrap_or(false) || (idx.is_some() && r.if_index() == idx)
     }
+}
+
+/// A `/32` or `/128` host route for `ip` (no interface/gateway set yet).
+fn host_route(ip: IpAddr) -> route_manager::Route {
+    let bits = if ip.is_ipv6() { 128 } else { 32 };
+    route_manager::Route::new(ip, bits)
 }
 
 impl RouteProgrammer for NetRouteProgrammer {
@@ -413,6 +495,51 @@ impl RouteProgrammer for NetRouteProgrammer {
                 .collect(),
         )
     }
+
+    fn pin_underlay(&self, ips: &[IpAddr]) -> Result<Vec<IpAddr>> {
+        let want: BTreeSet<IpAddr> = ips.iter().copied().collect();
+        let mut pinned = self.pinned.lock().unwrap();
+        // Drop pins no longer wanted (a relay left the fleet).
+        let stale: Vec<IpAddr> = pinned.keys().copied().filter(|ip| !want.contains(ip)).collect();
+        for ip in stale {
+            if let Some(gw) = pinned.remove(&ip) {
+                let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
+            }
+        }
+        // Add pins we don't have yet, via the family's real gateway.
+        let mut ok = Vec::new();
+        for ip in want {
+            if pinned.contains_key(&ip) {
+                ok.push(ip);
+                continue;
+            }
+            let Some(gw) = self.default_gateway(ip.is_ipv6()) else {
+                tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host; withholding its family's catch-all so the tunnel is not cut off");
+                continue;
+            };
+            match self.mgr.lock().unwrap().add(&host_route(ip).with_gateway(gw)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    tracing::warn!(%ip, %gw, "route-all: pinning underlay host failed: {e}");
+                    continue;
+                }
+            }
+            tracing::info!(target: "nqvpn::os_routes", %ip, %gw, "route-all: pinned underlay host to gateway");
+            pinned.insert(ip, gw);
+            ok.push(ip);
+        }
+        Ok(ok)
+    }
+}
+
+impl Drop for NetRouteProgrammer {
+    fn drop(&mut self) {
+        let pinned = std::mem::take(&mut *self.pinned.lock().unwrap());
+        for (ip, gw) in pinned {
+            let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +565,35 @@ mod tests {
 
     fn net(s: &str) -> IpNet {
         s.parse().unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn route_all_pins_only_underlay_not_carried_by_a_local_route() {
+        // The coordinator/relay on the public internet need pinning; a
+        // relay that sits on our own LAN is already carried by the
+        // connected route and must NOT be pinned via the gateway.
+        let underlay = [ip("203.0.113.7"), ip("192.168.1.9"), ip("2001:db8::5")];
+        let local = [net("192.168.1.0/24"), net("10.0.0.5/32")];
+        let to_pin = underlay_to_pin(&underlay, &local);
+        assert_eq!(to_pin, vec![ip("203.0.113.7"), ip("2001:db8::5")], "LAN-local underlay is left to its connected route");
+    }
+
+    #[test]
+    fn route_all_installs_a_familys_halves_only_when_its_transport_is_pinned() {
+        let to_pin = [ip("203.0.113.7"), ip("2001:db8::5")];
+        // Both families pinned -> both v4 and v6 halves.
+        let all = route_all_nets(&to_pin, &to_pin);
+        assert_eq!(all, vec![net("0.0.0.0/1"), net("128.0.0.0/1"), net("::/1"), net("8000::/1")]);
+        // v6 transport could not be pinned (no v6 gateway): withhold ::/1
+        // so route-all never severs the tunnel, but keep the v4 halves.
+        let v4_only = route_all_nets(&to_pin, &[ip("203.0.113.7")]);
+        assert_eq!(v4_only, vec![net("0.0.0.0/1"), net("128.0.0.0/1")]);
+        // Nothing pinned -> no override at all.
+        assert!(route_all_nets(&to_pin, &[]).is_empty());
     }
 
     fn view() -> Snapshot {

@@ -26,9 +26,18 @@ use std::time::Duration;
 pub trait RouteSink: Send + Sync {
     fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> Result<()>;
     fn reassert(&self) -> Result<()>;
+    /// Pin the underlay transport hosts to the real gateway (route-all);
+    /// returns those actually pinned. Default pretends success so a
+    /// recording sink still surfaces the catch-all routes.
+    fn pin_underlay(&self, ips: &[std::net::IpAddr]) -> Result<Vec<std::net::IpAddr>> {
+        Ok(ips.to_vec())
+    }
 }
 
 impl<P: nqvpn_endpoint::routes::RouteProgrammer + 'static> RouteSink for nqvpn_endpoint::routes::RouteSet<P> {
+    fn pin_underlay(&self, ips: &[std::net::IpAddr]) -> Result<Vec<std::net::IpAddr>> {
+        nqvpn_endpoint::routes::RouteSet::pin_underlay(self, ips)
+    }
     fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> Result<()> {
         // Prefer diffing against the kernel's own table; fall back to the
         // cache path when it can't be read (the recording programmer).
@@ -121,6 +130,10 @@ pub struct Client {
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
     pub counters: ClientCounters,
+    /// `--route-all`: send all traffic through the tunnel (the two-/1
+    /// default override), pinning the underlay transport to the real
+    /// gateway so it is not swallowed.
+    route_all: bool,
 }
 
 #[derive(Default)]
@@ -139,6 +152,7 @@ impl Client {
         tun: Arc<dyn TunDevice>,
         routes: Arc<dyn RouteSink>,
         preferred_relay: Option<String>,
+        route_all: bool,
     ) -> Arc<Client> {
         let mut hosts = Vec::new();
         if let Some(ip) = joined.ip4 {
@@ -170,6 +184,7 @@ impl Client {
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
             counters: ClientCounters::default(),
+            route_all,
         })
     }
 
@@ -442,9 +457,25 @@ impl Client {
                 underlay.extend(it.map(|s| s.ip()));
             }
         }
-        let (keep, excluded) = exclude_local(wanted, &local, &underlay);
+        let (mut keep, excluded) = exclude_local(wanted, &local, &underlay);
         for (net, why) in excluded {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
+        }
+        // --route-all: pin the underlay transport to the real gateway, then
+        // add the catch-all halves for whichever families we could protect,
+        // so all other traffic goes through the tunnel without cutting off
+        // the tunnel's own path to the coordinator and relays.
+        if c.route_all {
+            let to_pin = nqvpn_endpoint::routes::underlay_to_pin(&underlay, &local);
+            let pinned = c.routes.pin_underlay(&to_pin).unwrap_or_else(|e| {
+                tracing::warn!("route-all: pinning underlay failed: {e:#}");
+                Vec::new()
+            });
+            let nets = nqvpn_endpoint::routes::route_all_nets(&to_pin, &pinned);
+            if nets.is_empty() {
+                tracing::warn!("route-all: no family could be protected; not overriding the default route");
+            }
+            keep.extend(nets);
         }
         if let Err(e) = c.routes.reconcile(&keep, &mine) {
             tracing::warn!("route reconcile: {e:#}");

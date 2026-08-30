@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-coord"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-endpoint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "getifaddrs",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "nqvpn-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",

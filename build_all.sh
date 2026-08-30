@@ -182,7 +182,11 @@ collect() {
     esac
   done
   tar="dist/nqvpn-$VERSION-linux-$arch.tar.gz"
-  tar -czf "$tar" -C "$out" $BINS
+  # --no-xattrs keeps macOS's bsdtar from embedding extended attributes
+  # (e.g. com.apple.provenance) as LIBARCHIVE.xattr.* PAX headers, which
+  # make GNU tar on Linux warn "Ignoring unknown extended header keyword"
+  # on extraction. The flag is understood by both bsdtar and GNU tar.
+  tar --no-xattrs -czf "$tar" -C "$out" $BINS
   ( cd dist && shasum -a 256 "$(basename "$tar")" > "$(basename "$tar").sha256" )
   echo "  -> $tar"
 }

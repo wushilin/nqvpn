@@ -55,5 +55,6 @@ webpki-roots = "1"
 rustls-pemfile = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 getifaddrs = "0.6"
+route_manager = "0.2"
 futures-util = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }

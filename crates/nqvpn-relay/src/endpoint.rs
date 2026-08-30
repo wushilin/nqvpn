@@ -30,16 +30,24 @@ pub struct LocalEndpoint {
 
 /// Route programming behind one method, so tests can record.
 pub trait RouteSink: Send + Sync {
-    fn reconcile(&self, wanted: &[ipnet::IpNet]) -> anyhow::Result<()>;
+    fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> anyhow::Result<()>;
     fn reassert(&self) -> anyhow::Result<()>;
 }
 
 impl<P: RouteProgrammer + 'static> RouteSink for RouteSet<P> {
-    fn reconcile(&self, wanted: &[ipnet::IpNet]) -> anyhow::Result<()> {
-        RouteSet::reconcile(self, wanted)
+    fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> anyhow::Result<()> {
+        if RouteSet::reconcile_via_kernel(self, wanted, mine)? {
+            Ok(())
+        } else {
+            RouteSet::reconcile(self, wanted)
+        }
     }
     fn reassert(&self) -> anyhow::Result<()> {
-        RouteSet::reassert(self)
+        if RouteSet::reassert_via_kernel(self)? {
+            Ok(())
+        } else {
+            RouteSet::reassert(self)
+        }
     }
 }
 
@@ -130,7 +138,7 @@ impl LocalEndpoint {
         for (net, why) in excluded {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
         }
-        if let Err(e) = self.routes.reconcile(&keep) {
+        if let Err(e) = self.routes.reconcile(&keep, &mine) {
             tracing::warn!("route reconcile: {e:#}");
         }
     }

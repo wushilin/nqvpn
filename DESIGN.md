@@ -486,12 +486,22 @@ Applies to clients and gateway relays.
   would steal the LAN), or one containing an underlay address (the
   coordinator, a relay) with no more-specific local route protecting it.
   A prefix *wider* than a local LAN is fine — the kernel's longest match
-  keeps the LAN local. `RouteSet::reconcile` diffs wanted against
-  installed and issues only the difference; a 20 s re-assert heals
-  routes another writer removed. One endpoint per network per host,
-  enforced with an `flock`.
-- Backends: Linux `/dev/net/tun` + `ip route`; macOS `utun` + `route`
-  (IPv6 with explicit `-prefixlen`). Gateway return path: LAN hosts must
+  keeps the LAN local. One endpoint per network per host, enforced with
+  an `flock`.
+- **OS route reconcile is against the kernel, not a cache.** Every route
+  we install goes out our TUN (`dev <tun>`), and nothing else routes
+  through that device, so "a route on our TUN" ≡ "a route we own" — the
+  one exception being the kernel's own connected routes for the addresses
+  we assigned, which are exactly `mine` and excluded. `reconcile_via_kernel`
+  reads the table back (via the `route_manager` crate — Linux netlink,
+  macOS/BSD PF_ROUTE, Windows IP Helper; no CLI parsing), computes
+  `ours = on-our-dev − mine`, then `remove = ours − wanted` and
+  `add = wanted − present`. Because the diff is against reality, a route
+  another writer deleted reappears and a stale one is removed; the 20 s
+  re-assert re-runs the same reconcile. A recording programmer (dry-run,
+  tests) reports no readback and the caller falls back to a cache diff.
+- Backends: Linux `/dev/net/tun`, macOS `utun`; route table via
+  `route_manager` on all three OSes. Gateway return path: LAN hosts must
   route VPN prefixes back via the gateway; no NAT is programmed.
 
 ## 9. Runtime shape

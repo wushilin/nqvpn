@@ -105,7 +105,9 @@ async fn run(cli: Cli) -> Result<i32> {
     let routes: Arc<dyn nqvpn_client::client::RouteSink> = if cli.dry_run {
         Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::RecordingProgrammer::default()))
     } else {
-        Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::SystemProgrammer { device: tun.name() }))
+        Arc::new(nqvpn_endpoint::routes::RouteSet::new(
+            nqvpn_endpoint::routes::NetRouteProgrammer::new(tun.name()).context("opening the routing table")?,
+        ))
     };
 
     let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None);

@@ -1457,6 +1457,7 @@ dependencies = [
  "ipnet",
  "libc",
  "nqvpn-proto",
+ "route_manager",
  "tempfile",
  "tokio",
  "tracing",

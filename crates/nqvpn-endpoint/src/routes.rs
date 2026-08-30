@@ -3,6 +3,16 @@
 //!
 //! The routing table is a pure function of the network view:
 //!
+//! Ownership is structural: every route we install goes out our TUN
+//! device (`dev <tun>`), and nothing else routes through that device, so
+//! "a route whose output interface is our TUN" == "a route we own". The
+//! kernel is the source of truth — we read it back (via the `net-route`
+//! crate, not by parsing CLI output) and reconcile against it, so a
+//! route another writer deleted reappears and a stale one is removed.
+//! The only routes on our device we must not touch are the kernel's own
+//! connected routes for the addresses we assigned; those are exactly
+//! `mine`, and we exclude them.
+//!
 //!  * **wanted** = every reserved prefix of the network (tunnel CIDRs and
 //!    every registered gateway CIDR, owned or not) plus every member's
 //!    prefixes — minus anything this node owns itself;
@@ -31,6 +41,14 @@ use std::sync::Mutex;
 pub trait RouteProgrammer: Send + Sync {
     fn add_via_tun(&self, net: IpNet) -> Result<()>;
     fn remove(&self, net: IpNet) -> Result<()>;
+
+    /// Every prefix the kernel currently routes out our device, as
+    /// ground truth for `reconcile_via_kernel`. `None` means the table
+    /// cannot be read here (the recording/dry-run programmer), and the
+    /// caller falls back to the cache-based `reconcile`.
+    fn list_via_dev(&self) -> Option<Vec<IpNet>> {
+        None
+    }
 }
 
 /// Routes the view says this node should have, before local exclusion.
@@ -89,11 +107,66 @@ pub fn exclude_local(
 pub struct RouteSet<P: RouteProgrammer> {
     programmer: P,
     installed: Mutex<BTreeSet<IpNet>>,
+    /// The last (wanted, mine) applied, so `reassert` can re-run the
+    /// kernel reconcile without the caller repeating them.
+    last: Mutex<(Vec<IpNet>, Vec<IpNet>)>,
 }
 
 impl<P: RouteProgrammer> RouteSet<P> {
     pub fn new(programmer: P) -> Self {
-        RouteSet { programmer, installed: Mutex::new(BTreeSet::new()) }
+        RouteSet { programmer, installed: Mutex::new(BTreeSet::new()), last: Mutex::new((Vec::new(), Vec::new())) }
+    }
+
+    /// Reconcile against the **kernel's** own view of our device — the
+    /// path used in production.
+    ///
+    /// Ownership is structural (a route on our TUN is ours), with the
+    /// single exception of the kernel's connected routes for our own
+    /// addresses (`mine`), which we exclude:
+    ///
+    ///   ours   = routes on our dev  −  mine
+    ///   remove = ours    − wanted
+    ///   add    = wanted  − present
+    ///
+    /// Self-healing: the diff is against reality, not a cache, so a
+    /// route another writer deleted reappears and a stale one is
+    /// removed. Returns `Ok(false)` when the table cannot be read (the
+    /// recording programmer), so the caller can fall back to `reconcile`.
+    pub fn reconcile_via_kernel(&self, wanted: &[IpNet], mine: &[IpNet]) -> Result<bool> {
+        *self.last.lock().unwrap() = (wanted.to_vec(), mine.to_vec());
+        let Some(present) = self.programmer.list_via_dev() else {
+            return Ok(false);
+        };
+        let wanted: BTreeSet<IpNet> = wanted.iter().map(|n| n.trunc()).collect();
+        let mine: BTreeSet<IpNet> = mine.iter().map(|n| n.trunc()).collect();
+        let ours: BTreeSet<IpNet> =
+            present.into_iter().map(|n| n.trunc()).filter(|n| !mine.contains(n)).collect();
+
+        for net in ours.difference(&wanted) {
+            let _ = self.programmer.remove(*net);
+        }
+        let mut first_err = None;
+        for net in wanted.difference(&ours) {
+            // Idempotent add, so a route that reappeared between the read
+            // and now is not an error.
+            if let Err(e) = self.programmer.add_via_tun(*net) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        *self.installed.lock().unwrap() = wanted;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(true),
+        }
+    }
+
+    /// Re-run the kernel reconcile with the last desired set. Returns
+    /// `Ok(false)` when the table cannot be read.
+    pub fn reassert_via_kernel(&self) -> Result<bool> {
+        let (wanted, mine) = self.last.lock().unwrap().clone();
+        self.reconcile_via_kernel(&wanted, &mine)
     }
 
     /// Make the kernel hold exactly `wanted`: add what is missing, remove
@@ -145,27 +218,6 @@ impl<P: RouteProgrammer> RouteSet<P> {
     }
 }
 
-/// Build a macOS `route` invocation. IPv6 needs an explicit -prefixlen:
-/// `-net fd00::/64` silently installs a *default* route.
-#[cfg(any(target_os = "macos", test))]
-pub fn macos_route_args(verb: &str, net: IpNet, device: &str) -> Vec<String> {
-    let own = |s: &str| s.to_string();
-    if net.addr().is_ipv6() {
-        vec![
-            own("route"), own("-n"), own(verb), own("-inet6"),
-            net.addr().to_string(),
-            own("-prefixlen"), net.prefix_len().to_string(),
-            own("-interface"), own(device),
-        ]
-    } else {
-        vec![
-            own("route"), own("-n"), own(verb), own("-inet"),
-            own("-net"), net.to_string(),
-            own("-interface"), own(device),
-        ]
-    }
-}
-
 /// Change a live TUN device's MTU.
 pub fn set_device_mtu(device: &str, mtu: u16) -> Result<()> {
     let mtu_s = mtu.to_string();
@@ -189,74 +241,129 @@ pub fn set_device_mtu(device: &str, mtu: u16) -> Result<()> {
 #[derive(Debug, Default)]
 pub struct RecordingProgrammer {
     pub calls: Mutex<Vec<String>>,
+    /// A simulated kernel table for exercising `reconcile_via_kernel`;
+    /// `None` (the default) means "readback unsupported".
+    pub kernel: Mutex<Option<BTreeSet<IpNet>>>,
+}
+
+impl RecordingProgrammer {
+    /// A recorder whose simulated kernel starts holding `initial` and
+    /// tracks every add/remove, so `list_via_dev` reflects reality.
+    pub fn with_kernel(initial: &[IpNet]) -> Self {
+        RecordingProgrammer {
+            calls: Mutex::new(Vec::new()),
+            kernel: Mutex::new(Some(initial.iter().map(|n| n.trunc()).collect())),
+        }
+    }
+
+    pub fn kernel_now(&self) -> Option<Vec<IpNet>> {
+        self.kernel.lock().unwrap().as_ref().map(|s| s.iter().copied().collect())
+    }
 }
 
 impl RouteProgrammer for RecordingProgrammer {
     fn add_via_tun(&self, net: IpNet) -> Result<()> {
         self.calls.lock().unwrap().push(format!("add {net}"));
+        if let Some(k) = self.kernel.lock().unwrap().as_mut() {
+            k.insert(net.trunc());
+        }
         Ok(())
     }
     fn remove(&self, net: IpNet) -> Result<()> {
         self.calls.lock().unwrap().push(format!("remove {net}"));
-        Ok(())
-    }
-}
-
-/// Programs routes with the platform's command-line tools: `ip` on
-/// Linux, `route` on macOS.
-pub struct SystemProgrammer {
-    pub device: String,
-}
-
-impl SystemProgrammer {
-    fn run(&self, args: &[&str]) -> Result<()> {
-        let out = std::process::Command::new(args[0]).args(&args[1..]).output()?;
-        if !out.status.success() {
-            anyhow::bail!("{} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        if let Some(k) = self.kernel.lock().unwrap().as_mut() {
+            k.remove(&net.trunc());
         }
         Ok(())
     }
+    fn list_via_dev(&self) -> Option<Vec<IpNet>> {
+        self.kernel_now()
+    }
 }
 
-impl RouteProgrammer for SystemProgrammer {
-    #[cfg(target_os = "linux")]
-    fn add_via_tun(&self, net: IpNet) -> Result<()> {
-        let n = net.to_string();
-        let fam = if net.addr().is_ipv6() { "-6" } else { "-4" };
-        self.run(&["ip", fam, "route", "replace", &n, "dev", &self.device])
-    }
-    #[cfg(target_os = "macos")]
-    fn add_via_tun(&self, net: IpNet) -> Result<()> {
-        let args = macos_route_args("add", net, &self.device);
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        // `add` fails when the route exists; `change` makes this behave
-        // like Linux's `replace` so re-asserting is a no-op.
-        self.run(&refs).or_else(|_| {
-            let chg = macos_route_args("change", net, &self.device);
-            let refs: Vec<&str> = chg.iter().map(|s| s.as_str()).collect();
-            self.run(&refs)
-        })
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn add_via_tun(&self, _net: IpNet) -> Result<()> {
-        anyhow::bail!("route programming is not implemented on this platform yet")
+/// Programs and reads the OS routing table through the `route_manager`
+/// crate (Linux netlink, macOS/BSD PF_ROUTE, Windows IP Helper) — no
+/// shelling out and no CLI parsing. The crate is synchronous, so this is
+/// just a `RouteManager` behind a lock. Every route is bound to our TUN
+/// by interface, which is also how `list_via_dev` selects what is ours.
+pub struct NetRouteProgrammer {
+    device: String,
+    mgr: Mutex<route_manager::RouteManager>,
+}
+
+impl NetRouteProgrammer {
+    pub fn new(device: String) -> Result<Self> {
+        let mgr = route_manager::RouteManager::new()
+            .map_err(|e| anyhow::anyhow!("opening the OS routing table: {e}"))?;
+        Ok(NetRouteProgrammer { device, mgr: Mutex::new(mgr) })
     }
 
-    #[cfg(target_os = "linux")]
-    fn remove(&self, net: IpNet) -> Result<()> {
-        let n = net.to_string();
-        let fam = if net.addr().is_ipv6() { "-6" } else { "-4" };
-        self.run(&["ip", fam, "route", "del", &n, "dev", &self.device])
+    /// Our TUN's kernel interface index, resolved fresh each call so a
+    /// device that did not exist at construction, or was renamed, is
+    /// still matched as long as the name is stable. `None` means the
+    /// device is gone (its routes went with it).
+    fn ifindex(&self) -> Option<u32> {
+        let c = std::ffi::CString::new(self.device.as_str()).ok()?;
+        let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+        (idx != 0).then_some(idx)
     }
-    #[cfg(target_os = "macos")]
-    fn remove(&self, net: IpNet) -> Result<()> {
-        let args = macos_route_args("delete", net, &self.device);
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.run(&refs)
+
+    fn route(&self, net: IpNet) -> route_manager::Route {
+        let mut r = route_manager::Route::new(net.addr(), net.prefix_len());
+        match self.ifindex() {
+            Some(i) => r = r.with_if_index(i),
+            None => r = r.with_if_name(self.device.clone()),
+        }
+        r
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn remove(&self, _net: IpNet) -> Result<()> {
-        anyhow::bail!("route programming is not implemented on this platform yet")
+
+    /// Is this kernel route one on our device?
+    fn ours(&self, r: &route_manager::Route, idx: Option<u32>) -> bool {
+        r.if_name().map(|n| n == &self.device).unwrap_or(false) || (idx.is_some() && r.if_index() == idx)
+    }
+}
+
+impl RouteProgrammer for NetRouteProgrammer {
+    fn add_via_tun(&self, net: IpNet) -> Result<()> {
+        let r = self.route(net.trunc());
+        match self.mgr.lock().unwrap().add(&r) {
+            Ok(()) => Ok(()),
+            // Idempotent: a route that already exists is fine.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("adding route {net}: {e}")),
+        }
+    }
+    fn remove(&self, net: IpNet) -> Result<()> {
+        let r = self.route(net.trunc());
+        // Deleting an already-absent route is not an error.
+        let _ = self.mgr.lock().unwrap().delete(&r);
+        Ok(())
+    }
+    fn list_via_dev(&self) -> Option<Vec<IpNet>> {
+        let idx = self.ifindex();
+        let routes = self.mgr.lock().unwrap().list().ok()?;
+        Some(
+            routes
+                .into_iter()
+                .filter(|r| self.ours(r, idx) && r.gateway().is_none())
+                .filter_map(|r| IpNet::new(r.destination(), r.prefix()).ok().map(|n| n.trunc()))
+                .collect(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl RouteSet<RecordingProgrammer> {
+    fn programmer_kernel(&self) -> BTreeSet<IpNet> {
+        self.programmer.kernel.lock().unwrap().clone().unwrap_or_default()
+    }
+    fn programmer_kernel_remove(&self, net: IpNet) {
+        if let Some(k) = self.programmer.kernel.lock().unwrap().as_mut() {
+            k.remove(&net.trunc());
+        }
+    }
+    fn programmer_calls(&self) -> Vec<String> {
+        self.programmer.calls.lock().unwrap().clone()
     }
 }
 
@@ -336,6 +443,45 @@ mod tests {
     }
 
     #[test]
+    fn kernel_reconcile_deletes_stale_adds_missing_and_leaves_our_addresses() {
+        // Kernel starts with a stale route, a wanted route already
+        // present, and our own host address (a connected route).
+        let mine = net("10.99.1.1/32");
+        let p = RecordingProgrammer::with_kernel(&[net("10.0.9.0/24"), net("10.0.2.0/24"), mine]);
+        let set = RouteSet::new(p);
+        let ok = set
+            .reconcile_via_kernel(&[net("10.0.2.0/24"), net("10.0.3.0/24")], &[mine])
+            .unwrap();
+        assert!(ok, "readback was available");
+        let kernel = set.programmer_kernel();
+        // stale removed, missing added, present untouched, ours kept.
+        assert!(!kernel.contains(&net("10.0.9.0/24")), "stale removed");
+        assert!(kernel.contains(&net("10.0.3.0/24")), "missing added");
+        assert!(kernel.contains(&net("10.0.2.0/24")), "present kept");
+        assert!(kernel.contains(&mine), "our own address is never touched");
+    }
+
+    #[test]
+    fn kernel_reconcile_self_heals_an_externally_deleted_route() {
+        let p = RecordingProgrammer::with_kernel(&[net("10.0.1.0/24")]);
+        let set = RouteSet::new(p);
+        set.reconcile_via_kernel(&[net("10.0.1.0/24")], &[]).unwrap();
+        // Someone else deletes it out from under us.
+        set.programmer_kernel_remove(net("10.0.1.0/24"));
+        // A cache-only reconcile would not notice; the kernel one does.
+        set.reassert_via_kernel().unwrap();
+        assert!(set.programmer_kernel().contains(&net("10.0.1.0/24")), "re-added from truth");
+    }
+
+    #[test]
+    fn kernel_reconcile_reports_unsupported_so_the_caller_can_fall_back() {
+        // The default recorder has no simulated kernel.
+        let set = RouteSet::new(RecordingProgrammer::default());
+        assert!(!set.reconcile_via_kernel(&[net("10.0.1.0/24")], &[]).unwrap(), "readback unavailable");
+        assert!(set.programmer_calls().is_empty(), "did nothing; caller uses the cache path");
+    }
+
+    #[test]
     fn reconcile_issues_only_the_difference() {
         let set = RouteSet::new(RecordingProgrammer::default());
         set.reconcile(&[net("10.0.1.0/24"), net("10.0.2.0/24")]).unwrap();
@@ -376,15 +522,4 @@ mod tests {
         assert_eq!(set.programmer.calls.lock().unwrap().clone(), vec!["add 10.99.1.1/32", "add 10.99.1.2/32"]);
     }
 
-    #[test]
-    fn macos_ipv6_routes_carry_an_explicit_prefix_length() {
-        let a = macos_route_args("add", net("fd99::1:1/128"), "utun10");
-        assert!(a.contains(&"-prefixlen".to_string()));
-        assert!(a.contains(&"128".to_string()));
-        assert!(!a.contains(&"-net".to_string()));
-        let v4 = macos_route_args("add", net("10.99.1.0/24"), "utun10");
-        assert!(v4.contains(&"-net".to_string()));
-        let del = macos_route_args("delete", net("fd99::/64"), "utun10");
-        assert_eq!(del[2], "delete");
-    }
 }

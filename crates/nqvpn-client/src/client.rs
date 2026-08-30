@@ -24,16 +24,26 @@ use std::time::Duration;
 
 /// Route programming behind one method, so the harness can record.
 pub trait RouteSink: Send + Sync {
-    fn reconcile(&self, wanted: &[ipnet::IpNet]) -> Result<()>;
+    fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> Result<()>;
     fn reassert(&self) -> Result<()>;
 }
 
 impl<P: nqvpn_endpoint::routes::RouteProgrammer + 'static> RouteSink for nqvpn_endpoint::routes::RouteSet<P> {
-    fn reconcile(&self, wanted: &[ipnet::IpNet]) -> Result<()> {
-        nqvpn_endpoint::routes::RouteSet::reconcile(self, wanted)
+    fn reconcile(&self, wanted: &[ipnet::IpNet], mine: &[ipnet::IpNet]) -> Result<()> {
+        // Prefer diffing against the kernel's own table; fall back to the
+        // cache path when it can't be read (the recording programmer).
+        if nqvpn_endpoint::routes::RouteSet::reconcile_via_kernel(self, wanted, mine)? {
+            Ok(())
+        } else {
+            nqvpn_endpoint::routes::RouteSet::reconcile(self, wanted)
+        }
     }
     fn reassert(&self) -> Result<()> {
-        nqvpn_endpoint::routes::RouteSet::reassert(self)
+        if nqvpn_endpoint::routes::RouteSet::reassert_via_kernel(self)? {
+            Ok(())
+        } else {
+            nqvpn_endpoint::routes::RouteSet::reassert(self)
+        }
     }
 }
 
@@ -436,7 +446,7 @@ impl Client {
         for (net, why) in excluded {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
         }
-        if let Err(e) = c.routes.reconcile(&keep) {
+        if let Err(e) = c.routes.reconcile(&keep, &mine) {
             tracing::warn!("route reconcile: {e:#}");
         }
         // The relay I am attached to re-registered from somewhere else

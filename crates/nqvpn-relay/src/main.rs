@@ -164,7 +164,9 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 }
             };
             let device = tun.name();
-            let routes = Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::SystemProgrammer { device }));
+            let routes = Arc::new(nqvpn_endpoint::routes::RouteSet::new(
+                nqvpn_endpoint::routes::NetRouteProgrammer::new(device).context("opening the routing table")?,
+            ));
             // The endpoint's own frames loop through the relay's tables;
             // a local channel carries trace notes back to it.
             let loopback = nqvpn_proto::transport::PacketChannel::start_lanes(

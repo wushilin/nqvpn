@@ -178,10 +178,10 @@ impl Engine {
                 return;
             }
         }
-        let (owner, pubkey) = {
+        let owner = {
             let p = self.peers.lock().unwrap();
             match p.owner_of(dst) {
-                Some(o) => (o, p.pubkey_of(o)),
+                Some(o) => o,
                 None => {
                     self.counters.drop_no_route.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -213,7 +213,13 @@ impl Engine {
             self.counters.drop_queue_full.fetch_add(1, Ordering::Relaxed);
         }
         if !sessions.has(owner) {
-            let Some(pk) = pubkey else {
+            // The peer's static key is needed only to start a handshake —
+            // once per session, not per packet. Fetch (and decode) it
+            // lazily here, holding the sessions lock, in the sessions→peers
+            // order on_handshake already uses. The steady-state path above
+            // never touches it, so no per-packet decode/allocation.
+            let pk = self.peers.lock().unwrap().pubkey_of(owner);
+            let Some(pk) = pk else {
                 self.counters.drop_no_session.fetch_add(1, Ordering::Relaxed);
                 return;
             };
@@ -466,5 +472,65 @@ mod handshake_tests {
         engine.on_handshake(PEER, &p_msg1, &up);
         assert_eq!(engine.counters.drop_stale_handshake.load(Ordering::Relaxed), 0, "real handshake is not refused as stale");
         assert_eq!(engine.counters.handshakes_completed.load(Ordering::Relaxed), 1, "the real peer establishes a session");
+    }
+
+    struct NullTun;
+    impl TunDevice for NullTun {
+        fn reader(&self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+            tokio::sync::mpsc::channel(1).1
+        }
+        fn write(&self, _p: Vec<u8>) -> bool {
+            true
+        }
+        fn mtu(&self) -> u16 {
+            1350
+        }
+        fn name(&self) -> String {
+            "null".into()
+        }
+    }
+
+    fn v4_to(dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    /// The first packet to a peer with no session starts a handshake. The
+    /// peer's static key is needed only here — fetched lazily off the
+    /// steady-state path — so this exercises that the lazy fetch works and
+    /// that a peer whose key does not decode cannot start one.
+    #[test]
+    fn outbound_to_a_new_peer_starts_a_handshake_and_a_bad_key_cannot() {
+        const ME: NodeId = 1;
+        let peer_keys = StaticKeys::generate().unwrap();
+
+        let mut table = PeerTable::new(ME);
+        // #2 is routable and has a real key; #3 is routable but its key is
+        // not decodable (as if the coordinator sent a malformed pubkey).
+        let mut good = peer_info(2, &peer_keys.public_b64());
+        good.prefixes = vec!["10.9.0.2/32".parse().unwrap()];
+        table.upsert(good);
+        let mut bad = peer_info(3, "not-base64!!");
+        bad.prefixes = vec!["10.9.0.3/32".parse().unwrap()];
+        table.upsert(bad);
+
+        let engine = Engine::new(ME, "uuid".to_string(), StaticKeys::generate().unwrap(), table, 1350, 1);
+        let (up, tun) = (NoUplink, NullTun);
+
+        engine.outbound(v4_to([10, 9, 0, 2]), &up, &tun);
+        assert_eq!(engine.counters.handshakes_started.load(Ordering::Relaxed), 1, "a routable peer's first packet starts a handshake");
+        assert_eq!(engine.counters.drop_no_route.load(Ordering::Relaxed), 0);
+
+        engine.outbound(v4_to([10, 9, 0, 3]), &up, &tun);
+        assert_eq!(engine.counters.handshakes_started.load(Ordering::Relaxed), 1, "an undecodable key cannot start a handshake");
+        assert_eq!(engine.counters.drop_no_session.load(Ordering::Relaxed), 1, "it is dropped for want of a session");
+
+        // A packet to nowhere is a no-route drop, not a handshake.
+        engine.outbound(v4_to([10, 9, 0, 9]), &up, &tun);
+        assert_eq!(engine.counters.drop_no_route.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.counters.handshakes_started.load(Ordering::Relaxed), 1);
     }
 }

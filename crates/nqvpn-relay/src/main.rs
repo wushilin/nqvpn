@@ -17,7 +17,7 @@ use nqvpn_relay::endpoint::LocalEndpoint;
 use nqvpn_relay::net::{Fleet, RelayNet};
 
 #[derive(Parser)]
-#[command(name = "nqvpn-relay", about = "nqvpn relay: forwarding service + optional site gateway")]
+#[command(name = "nqvpn-relay", version, about = "nqvpn relay: forwarding service + optional site gateway")]
 struct Cli {
     #[arg(long, default_value = "/etc/nqvpn/relay.toml")]
     config: PathBuf,

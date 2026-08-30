@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "nqvpn-coord", about = "NetQ VPN coordinator")]
+#[command(name = "nqvpn-coord", version, about = "NetQ VPN coordinator")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

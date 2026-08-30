@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "nqvpn-client", about = "nqvpn client (leaf node)")]
+#[command(name = "nqvpn-client", version, about = "nqvpn client (leaf node)")]
 struct Cli {
     #[arg(long, default_value = "/etc/nqvpn/client.toml")]
     config: PathBuf,

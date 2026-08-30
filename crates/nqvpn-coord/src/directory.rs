@@ -91,6 +91,10 @@ impl Directory {
 
     /// Recompute the view. Returns the delta if anything changed, in
     /// which case `gen` has advanced and the delta is in the ring.
+    /// `now` is seconds (hold-down, liveness); `now_ms` is epoch
+    /// milliseconds, which the generation number tracks so that a
+    /// generation *is* the time the snapshot took effect. Monotonic: it
+    /// never goes backward even if the wall clock does.
     pub fn recompute(
         &mut self,
         cfg: &NetworkConfig,
@@ -98,6 +102,7 @@ impl Directory {
         leases: &Leases,
         keys: &[KeyInfo],
         now: u64,
+        now_ms: u64,
     ) -> Option<Delta> {
         self.resolve_owners(reg, leases, now);
 
@@ -160,7 +165,7 @@ impl Directory {
         if next == self.published {
             return None;
         }
-        next.gen = self.gen + 1;
+        next.gen = (self.gen + 1).max(now_ms);
         let delta = self.published.diff(&next);
         self.gen = next.gen;
         self.published = next;
@@ -334,16 +339,16 @@ local_cidrs = ["192.168.1.0/24"]
         let (c, reg) = (cfg(), registry());
         let mut l = Leases::default();
         let mut d = Directory::new(1000, 0);
-        let d1 = d.recompute(&c, &reg, &l, &[], 1).expect("first view");
+        let d1 = d.recompute(&c, &reg, &l, &[], 1, 1).expect("first view");
         assert_eq!(d1.base_gen, 1000);
         assert_eq!(d.gen, 1001);
-        assert!(d.recompute(&c, &reg, &l, &[], 2).is_none(), "no change, no generation");
+        assert!(d.recompute(&c, &reg, &l, &[], 2, 2).is_none(), "no change, no generation");
 
         online(&mut l, &[1], 10);
-        let d2 = d.recompute(&c, &reg, &l, &[], 10).expect("relay 1 came online");
+        let d2 = d.recompute(&c, &reg, &l, &[], 10, 10).expect("relay 1 came online");
         assert_eq!((d2.base_gen, d2.gen), (1001, 1002));
         online(&mut l, &[10], 11);
-        d.recompute(&c, &reg, &l, &[], 11).expect("client online");
+        d.recompute(&c, &reg, &l, &[], 11, 11).expect("client online");
         assert_eq!(d.gen, 1003);
 
         // A member at 1001 catches up with two deltas; at 1000 with three.
@@ -367,10 +372,10 @@ local_cidrs = ["192.168.1.0/24"]
         let mut l = Leases::default();
         let mut d = Directory::new(1, 60);
         online(&mut l, &[1, 2], 1000);
-        d.recompute(&c, &reg, &l, &[], 1000);
+        d.recompute(&c, &reg, &l, &[], 1000, 1000);
         assert_eq!(d.owners["192.168.1.0/24"], 1);
         l.offline(1);
-        let delta = d.recompute(&c, &reg, &l, &[], 1100).expect("ownership moved");
+        let delta = d.recompute(&c, &reg, &l, &[], 1100, 1100).expect("ownership moved");
         assert_eq!(d.owners["192.168.1.0/24"], 2);
         let new_peer = delta.members_changed.iter().find(|p| p.node_id == 2).unwrap();
         assert!(new_peer.prefixes.iter().any(|p| p.to_string() == "192.168.1.0/24"));
@@ -387,12 +392,12 @@ local_cidrs = ["192.168.1.0/24"]
         let mut l = Leases::default();
         let mut d = Directory::new(1, 60);
         online(&mut l, &[2], 1000);
-        d.recompute(&c, &reg, &l, &[], 1000);
+        d.recompute(&c, &reg, &l, &[], 1000, 1000);
         assert_eq!(d.owners["192.168.1.0/24"], 2);
         online(&mut l, &[1], 1_100_000);
-        d.recompute(&c, &reg, &l, &[], 1110);
+        d.recompute(&c, &reg, &l, &[], 1110, 1110);
         assert_eq!(d.owners["192.168.1.0/24"], 2, "hold-down still active");
-        d.recompute(&c, &reg, &l, &[], 1160);
+        d.recompute(&c, &reg, &l, &[], 1160, 1160);
         assert_eq!(d.owners["192.168.1.0/24"], 1, "reclaimed after hold-down");
     }
 
@@ -403,11 +408,11 @@ local_cidrs = ["192.168.1.0/24"]
         online(&mut l, &[1, 10], 5);
         l.heartbeat(1, Role::Relay, &Heartbeat { attached: vec![AttachedClient { node_id: 10, session_id: 1 }], ..Default::default() }, 5);
         let mut d = Directory::new(1, 0);
-        d.recompute(&c, &reg, &l, &[], 5);
+        d.recompute(&c, &reg, &l, &[], 5, 5);
         assert!(d.published.member(10).is_some());
         assert_eq!(d.published.attachment_of(10), Some(1));
         reg.members.get_mut(&10).unwrap().disabled = true;
-        let delta = d.recompute(&c, &reg, &l, &[], 6).unwrap();
+        let delta = d.recompute(&c, &reg, &l, &[], 6, 6).unwrap();
         assert_eq!(delta.members_removed, vec![10]);
         assert_eq!(delta.attachments_removed, vec![10]);
         assert!(d.published.member(10).is_none());

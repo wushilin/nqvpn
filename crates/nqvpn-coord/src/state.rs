@@ -77,8 +77,9 @@ impl NetState {
     /// Recompute the view and, if it changed, push the delta to every
     /// synced session. The one place generations are minted.
     pub fn publish(&mut self, keys: &[KeyInfo], now: u64) {
+        let now_ms = now_ms();
         let NetState { cfg, registry, directory, leases, .. } = self;
-        let Some(delta) = directory.recompute(cfg, registry, leases, keys, now) else {
+        let Some(delta) = directory.recompute(cfg, registry, leases, keys, now, now_ms) else {
             return;
         };
         if registry.note_gen(directory.gen) {

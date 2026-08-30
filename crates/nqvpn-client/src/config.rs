@@ -24,10 +24,17 @@ pub struct ClientConfig {
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
-    /// The coordinator's certificate inline (PEM), as the UI hands it
-    /// out. Verified when `trust_any_cert = false`.
+    /// The coordinator's certificate inline (PEM). Verified when
+    /// `trust_any_cert = false`.
     #[serde(default)]
     pub ca_cert: Option<String>,
+    /// Extra coordinator certificate fingerprints to trust ("sha256:..."),
+    /// on top of the one in the token. Pre-stage the next certificate's
+    /// fingerprint here to rotate the coordinator without changing every
+    /// member at once: add it everywhere, switch the server, then drop
+    /// the old one.
+    #[serde(default)]
+    pub coordinator_fp: Vec<String>,
     /// Where the auto-generated TLS certificate and X25519 key live.
     /// Safe to delete: the next join records the new ones.
     #[serde(default = "d_state")]
@@ -50,7 +57,7 @@ fn d_state() -> PathBuf {
 /// with the key omitted would).
 impl Default for ClientConfig {
     fn default() -> Self {
-        ClientConfig { token: None, token_file: None, trust_any_cert: false, ca: None, ca_cert: None, state_dir: d_state(), tun_name: None }
+        ClientConfig { token: None, token_file: None, trust_any_cert: false, ca: None, ca_cert: None, coordinator_fp: Vec::new(), state_dir: d_state(), tun_name: None }
     }
 }
 
@@ -76,14 +83,14 @@ impl ClientConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fp: None }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fps: Vec::new() }
     }
 
     pub fn member(&self, override_token: Option<&str>) -> Result<nqvpn_sync::MemberConfig> {
         let token = self.token(override_token)?;
         let mut tls = self.tls();
-        // The token's fingerprint is the trust anchor when present.
-        tls.pinned_fp = token.fp.clone();
+        // Trust the token's fingerprint plus any pre-staged for rotation.
+        tls.pinned_fps = token.fp.iter().cloned().chain(self.coordinator_fp.iter().cloned()).collect();
         Ok(nqvpn_sync::MemberConfig::from_token(&token, tls))
     }
 }
@@ -114,7 +121,7 @@ mod tests {
         // Verification is the default; a real token from the UI carries
         // the coordinator's fingerprint (this bare test token has none).
         assert!(!m.tls.trust_any_cert);
-        assert_eq!(m.tls.pinned_fp, None);
+        assert!(m.tls.pinned_fps.is_empty());
         assert_eq!(c.state_dir, d_state());
     }
 

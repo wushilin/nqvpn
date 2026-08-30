@@ -271,7 +271,7 @@ pub async fn run_session(
         // coordinator's certificate is not pinned.
         let extra_ca = params.tls.extra_ca().map_err(|e| anyhow!("ca: {e}"))?;
         ep.set_default_client_config(
-            nqvpn_proto::quic::coordinator_client_config(identity, params.tls.pinned_fp.as_deref(), params.tls.trust_any_cert, &extra_ca, params.keepalive_secs)
+            nqvpn_proto::quic::coordinator_client_config(identity, &params.tls.pinned_fps, params.tls.trust_any_cert, &extra_ca, params.keepalive_secs)
                 .map_err(|e| anyhow!("tls: {e}"))?,
         );
         match tokio::time::timeout(Duration::from_secs(10), ep.connect(sock, &host)?).await {

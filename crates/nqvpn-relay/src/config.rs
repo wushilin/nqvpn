@@ -21,10 +21,15 @@ pub struct RelayConfig {
     pub trust_any_cert: bool,
     #[serde(default)]
     pub ca: Option<PathBuf>,
-    /// The coordinator's certificate inline (PEM), as the UI hands it
-    /// out. Verified when `trust_any_cert = false`.
+    /// The coordinator's certificate inline (PEM). Verified when
+    /// `trust_any_cert = false`.
     #[serde(default)]
     pub ca_cert: Option<String>,
+    /// Extra coordinator certificate fingerprints to trust, on top of the
+    /// token's — pre-stage the next certificate to rotate without
+    /// changing every member at once.
+    #[serde(default)]
+    pub coordinator_fp: Vec<String>,
     /// One QUIC socket serves attached clients and the relay mesh. Its
     /// port must be the one in the coordinator's relay address.
     #[serde(default = "d_listen")]
@@ -86,7 +91,7 @@ impl RelayConfig {
     }
 
     pub fn tls(&self) -> JoinTls {
-        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fp: None }
+        JoinTls { trust_any_cert: self.trust_any_cert, ca_pem: self.ca.clone(), ca_cert: self.ca_cert.clone(), pinned_fps: Vec::new() }
     }
 }
 
@@ -119,7 +124,7 @@ mod tests {
             tok("b")
         ))
         .unwrap();
-        assert!(cfg.trust_any_cert, "the simple default");
+        assert!(!cfg.trust_any_cert, "verification is the default now");
         assert_eq!(cfg.networks.len(), 2);
         assert_eq!(cfg.networks[0].token().unwrap().secret, "a");
         assert_eq!(cfg.networks[1].token().unwrap().coordinator, "https://coord.example:8443");

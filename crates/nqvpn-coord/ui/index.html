@@ -304,6 +304,14 @@ function fmtAge(unix) { if (!unix) return '—'; const s = Math.max(0, nowUnix()
   if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
   return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h'; }
 const fmtTime = unix => unix ? new Date(unix * 1000).toLocaleString() : '—';
+// A generation number is epoch milliseconds — the time the snapshot took
+// effect. Show it as a time (with the raw number on hover).
+function fmtGen(gen) {
+  if (!gen || gen < 1e12) return 'gen ' + gen; // pre-clock / test value
+  const s = el('span', null, 'as of ' + new Date(gen).toLocaleTimeString());
+  s.title = 'generation ' + gen;
+  return s;
+}
 const addrOf = m => [m.ip4, m.ip6].filter(Boolean).join('  ');
 
 /* ---------- shared bits ---------- */
@@ -328,7 +336,7 @@ function table(headers, rows) {
 }
 function heading(st, label) {
   const h = el('h2'); h.append(el('span', null, label));
-  h.append(el('span', 'gen', 'gen ' + st.gen));
+  const g = el('span', 'gen'); g.append(fmtGen(st.gen)); h.append(g);
   return h;
 }
 function field(labelText, input, help) {
@@ -449,7 +457,7 @@ function homePage() {
     const st = frame.status[n.network_id] || {};
     const c = el('div', 'card netcard');
     c.onclick = () => go('#/n/' + enc(n.network_id));
-    const nm = el('div', 'nm'); nm.append(el('span', null, n.network_id), el('span', 'gen tiny', 'gen ' + n.gen)); c.append(nm);
+    const nm = el('div', 'nm'); const gt = el('span', 'gen tiny'); gt.append(fmtGen(n.gen)); nm.append(el('span', null, n.network_id), gt); c.append(nm);
     const f = el('div', 'facts');
     const fact = (l, v) => { const s = el('span'); s.append(el('b', null, v), document.createTextNode(' ' + l)); return s; };
     f.append(fact('online', n.members_online), fact('members', n.members_total), fact('relays', n.relays_total));
@@ -467,7 +475,7 @@ function networkPage(st, tab) {
   const page = el('div');
   const crumbs = el('div', 'crumbs'); const a = el('a', null, 'Overview'); a.href = '#/'; crumbs.append(a, el('span', null, '›'), el('span', null, st.network_id)); page.append(crumbs);
   const t = el('div', 'title'); t.append(el('h1', null, st.network_id));
-  t.append(el('span', 'gen tiny', 'gen ' + st.gen)); const u = el('code', 'tiny muted', st.network_uuid); u.title = 'network uuid'; t.append(u);
+  const gt2 = el('span', 'gen tiny'); gt2.append(fmtGen(st.gen)); t.append(gt2); const u = el('code', 'tiny muted', st.network_uuid); u.title = 'network uuid'; t.append(u);
   const tr = el('span', 'pill rolepill', st.transport + (st.transport === 'stream' && st.lanes > 1 ? ` ×${st.lanes}` : '')); t.append(tr);
   page.append(t);
 

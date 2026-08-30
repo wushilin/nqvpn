@@ -308,8 +308,12 @@ const fmtTime = unix => unix ? new Date(unix * 1000).toLocaleString() : '—';
 // effect. Show it as a time (with the raw number on hover).
 function fmtGen(gen) {
   if (!gen || gen < 1e12) return 'gen ' + gen; // pre-clock / test value
-  const s = el('span', null, 'as of ' + new Date(gen).toLocaleTimeString());
-  s.title = 'generation ' + gen;
+  const d = new Date(gen);
+  // Time alone for a snapshot from today; the date too when it's older,
+  // so an old snapshot never reads as a bare, ambiguous time-of-day.
+  const label = d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
+  const s = el('span', null, 'as of ' + label);
+  s.title = d.toLocaleString() + '  ·  generation ' + gen;
   return s;
 }
 const addrOf = m => [m.ip4, m.ip6].filter(Boolean).join('  ');

@@ -38,6 +38,13 @@ struct Cli {
     /// gateway so it is not captured. DNS is not changed.
     #[arg(long)]
     route_all: bool,
+    /// With route-all, seal internet-bound traffic to this exit gateway by
+    /// member name (a node that fronts 0.0.0.0/0 / ::/0 and masquerades).
+    /// Implies --route-all. Without it, route-all uses whichever online
+    /// node advertises a default (lowest id). Only affects the exit choice;
+    /// which relay carries the traffic is still picked normally.
+    #[arg(long)]
+    via: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -116,7 +123,10 @@ async fn run(cli: Cli) -> Result<i32> {
         ))
     };
 
-    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, cli.route_all);
+    // --via names an exit; it is meaningless without the catch-all, so it
+    // turns route-all on.
+    let route_all = cli.route_all || cli.via.is_some();
+    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, route_all, cli.via.clone());
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
         use std::net::ToSocketAddrs;
         if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {

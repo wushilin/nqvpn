@@ -125,6 +125,18 @@ impl Directory {
                     }
                 }
             }
+            // A default route is an internet-exit designation, not a LAN, so
+            // it is published for EVERY gateway granted one — not just the
+            // single age-resolved owner. That makes several exits coexist so
+            // a route-all client can pick among them (`--via`); a client's
+            // longest-prefix match keeps every specific route local, so the
+            // extra default entries never shadow real routes. Specific LANs
+            // stay single-owner (active/standby failover) above.
+            for r in &rec.routes {
+                if r.cidr.prefix_len() == 0 && !prefixes.contains(&r.cidr) {
+                    prefixes.push(r.cidr);
+                }
+            }
             prefixes.sort_by_key(|p| p.to_string());
             members.push(PeerInfo {
                 node_id: *id,

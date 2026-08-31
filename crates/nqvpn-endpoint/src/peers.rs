@@ -143,6 +143,19 @@ impl PeerTable {
         self.lpm.lookup(addr)
     }
 
+    /// Point a family's default (`0.0.0.0/0` / `::/0`) at `node` in the
+    /// outbound table, overriding whatever the published prefixes resolved
+    /// it to. This is how a route-all client selects its internet exit
+    /// gateway — and picks deterministically when several nodes advertise a
+    /// default. A no-op for our own id (we never route the default back at
+    /// ourselves). `replace_all` wipes it, so the caller re-asserts it
+    /// every reconcile.
+    pub fn set_default_exit(&mut self, net: IpNet, node: NodeId) {
+        if node != self.my_node_id {
+            self.lpm.insert(net, node);
+        }
+    }
+
     /// Is this one of our own host addresses? macOS routes a host's own
     /// tunnel address *into* the utun rather than looping it back in the
     /// kernel, so without this a node cannot ping itself.
@@ -355,6 +368,24 @@ mod tests {
         assert_eq!(t.owner_of("10.99.1.2".parse().unwrap()), Some(2));
         assert_eq!(t.owner_of("192.168.7.20".parse().unwrap()), Some(3));
         assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn a_default_exit_routes_the_unrouted_but_a_specific_peer_still_wins() {
+        let mut t = table();
+        // Without an exit, internet-bound traffic has no owner (drops).
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), None);
+        // Selecting node 3 as the exit routes the otherwise-unrouted there.
+        t.set_default_exit("0.0.0.0/0".parse().unwrap(), 3);
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), Some(3), "internet goes to the exit");
+        assert_eq!(t.owner_of("10.99.1.2".parse().unwrap()), Some(2), "a member is unaffected by the default");
+        assert_eq!(t.owner_of("192.168.7.20".parse().unwrap()), Some(3), "a gateway LAN still wins by longest match");
+        // Re-selecting a different exit overrides deterministically.
+        t.set_default_exit("0.0.0.0/0".parse().unwrap(), 2);
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), Some(2));
+        // Never at ourselves (node 1): the default is left as it was.
+        t.set_default_exit("0.0.0.0/0".parse().unwrap(), 1);
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), Some(2), "a self-exit is ignored");
     }
 
     #[test]

@@ -428,9 +428,19 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
             validate_relay_addr(name, addr, cfg)?;
             for c in &m.local_cidrs {
                 // Host bits were masked off above; every c is a network address now.
-                for t in &cfg.cidrs {
-                    if overlaps(c, t) {
-                        bail!("relay {name}: local cidr {c} overlaps tunnel space {t}");
+                // A default route (0.0.0.0/0 or ::/0) marks this gateway an
+                // internet exit: it legitimately contains the tunnel space,
+                // every member address, and every more-specific gateway LAN.
+                // Longest-prefix match keeps each of those routed to its own
+                // owner, so a default coexists unambiguously — it is exempt
+                // from the overlap checks below, which exist to catch genuine
+                // routing ambiguity, not a deliberate catch-all.
+                let is_default = c.prefix_len() == 0;
+                if !is_default {
+                    for t in &cfg.cidrs {
+                        if overlaps(c, t) {
+                            bail!("relay {name}: local cidr {c} overlaps tunnel space {t}");
+                        }
                     }
                 }
                 // Other members' prefixes: identical is a failover pair;
@@ -440,13 +450,20 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
                         continue;
                     }
                     for oc in &om.local_cidrs {
+                        // A default vs a more-specific prefix is not ambiguous
+                        // (longest match wins); two defaults are a failover pair.
+                        if is_default || oc.prefix_len() == 0 {
+                            continue;
+                        }
                         if overlaps(c, oc) && c.trunc() != oc.trunc() {
                             bail!("relay {name}: local cidr {c} partially overlaps {oc} routed by {other}");
                         }
                     }
-                    for ip in [om.preferred_ip4.map(IpAddr::V4), om.preferred_ip6.map(IpAddr::V6)].into_iter().flatten() {
-                        if c.contains(&ip) {
-                            bail!("relay {name}: local cidr {c} contains {other}'s address {ip}");
+                    if !is_default {
+                        for ip in [om.preferred_ip4.map(IpAddr::V4), om.preferred_ip6.map(IpAddr::V6)].into_iter().flatten() {
+                            if c.contains(&ip) {
+                                bail!("relay {name}: local cidr {c} contains {other}'s address {ip}");
+                            }
                         }
                     }
                 }
@@ -542,12 +559,16 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
         if cfg.cidrs.iter().any(|c| c.contains(&ip)) {
             bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside tunnel space");
         }
+        // A default route (an internet exit) contains every relay address by
+        // definition; that is expected and handled by underlay pinning, so it
+        // does not disqualify a relay's dial address. A *specific* routed LAN
+        // that swallows the address still would.
         let in_lan = cfg
             .relays
             .values()
             .chain(cfg.clients.values())
             .flat_map(|m| m.local_cidrs.iter())
-            .any(|c| c.contains(&ip));
+            .any(|c| c.prefix_len() != 0 && c.contains(&ip));
         if in_lan {
             bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside a routed LAN prefix");
         }
@@ -719,6 +740,24 @@ pool = "default"
         let s = base().replace("secret = \"s\"\npool", "pool");
         validate_network(&mut parse(&s)).expect("an imported member may have none yet");
         assert!(validate_network(&mut parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
+    }
+
+    #[test]
+    fn a_gateway_may_front_the_default_route_as_an_internet_exit() {
+        // 0.0.0.0/0 and ::/0 overlap tunnel space and every member address,
+        // but a default is unambiguous under longest-prefix match, so it is
+        // allowed as an internet-exit designation.
+        let s = base().replace(r#"local_cidrs = ["192.168.1.0/24"]"#, r#"local_cidrs = ["0.0.0.0/0", "::/0"]"#);
+        validate_network(&mut parse(&s)).expect("a gateway may front the default route");
+
+        // A second exit fronting the same default is a failover pair, allowed.
+        let mut s = base().replace(r#"local_cidrs = ["192.168.1.0/24"]"#, r#"local_cidrs = ["0.0.0.0/0"]"#);
+        s.push_str("[relays.r2]\nsecret = \"s\"\nrelay_addr = \"1.2.3.5:4444\"\nlocal_cidrs = [\"0.0.0.0/0\"]\n");
+        validate_network(&mut parse(&s)).expect("two internet exits are a failover pair");
+
+        // A non-default LAN that overlaps tunnel space is still rejected.
+        let s = base().replace(r#"local_cidrs = ["192.168.1.0/24"]"#, r#"local_cidrs = ["10.99.0.0/24"]"#);
+        assert!(validate_network(&mut parse(&s)).is_err(), "a specific overlap is still ambiguous");
     }
 
     #[test]

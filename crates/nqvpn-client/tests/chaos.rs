@@ -299,7 +299,7 @@ impl ClientHandle {
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false, None);
         *client.prefer_recheck.lock().unwrap() = Duration::from_secs(2);
         client.spawn_pumps();
         let tasks = vec![
@@ -367,6 +367,40 @@ impl ClientHandle {
 
     fn uplink_ends(&self) -> u64 {
         self.client.counters.uplink_ends.load(Ordering::Relaxed)
+    }
+}
+
+impl ClientHandle {
+    /// A route-all client, optionally pinned to a named exit gateway.
+    async fn start_route_all(coord_url: &str, node_id: NodeId, via: Option<&str>) -> ClientHandle {
+        let identity = TlsIdentity::generate(&format!("client{node_id}")).unwrap();
+        let keys = StaticKeys::generate().unwrap();
+        let mut m = (*member(coord_url, node_id, Role::Client)).clone();
+        m.secret = secret_of(&format!("c{node_id}"));
+        let cfg = Arc::new(m);
+        let joined = join(&cfg, &identity, &keys).await;
+        let tun = FakeTun::new(joined.mtu);
+        let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, true, via.map(str::to_string));
+        client.spawn_pumps();
+        let tasks = vec![
+            nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
+            tokio::spawn(client.clone().run_uplink()),
+        ];
+        let node_id = joined.node_id;
+        let mut h = ClientHandle { client, tun, routes, node_id, _tasks: tasks, sync: None, cfg, identity, keys };
+        h.start_sync(joined);
+        h
+    }
+
+    /// Is this CIDR installed in the (recorded) OS routing table?
+    fn os_has(&self, cidr: &str) -> bool {
+        self.routes.installed().iter().any(|n| n.to_string() == cidr)
+    }
+
+    /// Which node does the in-VPN table seal traffic for `dst` to?
+    fn exit_for(&self, dst: &str) -> Option<NodeId> {
+        self.client.engine.peers.lock().unwrap().owner_of(dst.parse().unwrap())
     }
 }
 
@@ -735,7 +769,7 @@ impl ClientHandle {
         let joined = join(&cfg, &identity, &keys).await;
         let tun = FakeTun::new(joined.mtu);
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
-        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false);
+        let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false, None);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
@@ -973,6 +1007,46 @@ async fn a_preferred_relay_is_used_when_available_and_not_required() -> Result<(
     r2.kill();
     wait_until("a falls back", Duration::from_secs(30), || a.attached_to() == Some(r1.node_id)).await?;
     all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+    Ok(())
+}
+
+// ---- route-all: pick the internet exit gateway, never blackhole ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_all_via_names_the_internet_exit_gateway() -> Result<()> {
+    // Two relays both front the internet default (0.0.0.0/0): each is a
+    // valid exit. A route-all client with --via must pick the named one,
+    // install the def1 catch-all halves, and seal internet-bound traffic
+    // to that node — not the other.
+    let (w, rp) = World::new(&[1, 2], &[10]).await;
+    // A relay registers (and thus owns) its routed cidrs at join time, so
+    // grant the default before the relays start.
+    w.coord().configure("r1", |s| s.local_cidrs = vec!["0.0.0.0/0".parse().unwrap()]);
+    w.coord().configure("r2", |s| s.local_cidrs = vec!["0.0.0.0/0".parse().unwrap()]);
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+
+    let a = ClientHandle::start_route_all(&w.url(), 10, Some("r2")).await;
+    wait_until("route-all routes the internet to the named exit", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r2.node_id) && a.os_has("0.0.0.0/1") && a.os_has("128.0.0.0/1")
+    })
+    .await?;
+    assert_ne!(a.exit_for("8.8.8.8"), Some(r1.node_id), "the unnamed exit is not chosen");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_all_withholds_the_catch_all_when_no_exit_owns_the_default() -> Result<()> {
+    // --via names a node that fronts no default (r1 is a plain forwarder):
+    // route-all must leave the real default route in place rather than
+    // blackholing every packet into a tunnel that has nowhere to send it.
+    let (w, rp) = World::new(&[1], &[10]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start_route_all(&w.url(), 10, Some("r1")).await;
+    wait_until("the client attaches and reconciles", Duration::from_secs(20), || a.attached_to().is_some()).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!a.os_has("0.0.0.0/1") && !a.os_has("128.0.0.0/1"), "no exit owns 0.0.0.0/0: the catch-all is withheld");
+    assert_eq!(a.exit_for("8.8.8.8"), None, "and internet-bound traffic is not pulled into the tunnel");
     Ok(())
 }
 

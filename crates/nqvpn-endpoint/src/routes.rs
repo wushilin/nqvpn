@@ -86,25 +86,51 @@ pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
     s.into_iter().collect()
 }
 
-/// The catch-all halves that are safe to install: a family's halves go in
-/// only if every underlay host of that family that needed pinning was
-/// pinned. If a family's transport could not be protected (no gateway),
-/// its halves are withheld so route-all never severs the tunnel.
-pub fn route_all_nets(to_pin: &[IpAddr], pinned: &[IpAddr]) -> Vec<IpNet> {
-    let mut out = Vec::new();
-    let family_ok = |v6: bool| {
-        to_pin
-            .iter()
-            .filter(|ip| ip.is_ipv6() == v6)
-            .all(|ip| pinned.contains(ip))
-    };
-    if family_ok(false) {
-        out.extend(catch_all_halves(false));
+/// The exit gateway a route-all client seals otherwise-unrouted (internet)
+/// traffic to, for one address family. A candidate must be online and own
+/// the family's default route (`0.0.0.0/0` or `::/0`) — the exact prefix
+/// that makes *its* ingress filter accept internet-bound packets, so a
+/// client never seals traffic to a node that would only drop it. With
+/// `via` set, only the node of that name qualifies (and only if it owns
+/// the default); without it, the lowest node id among candidates is picked
+/// so the choice is deterministic when several nodes advertise a default.
+/// `None` means no usable exit for this family — the caller must withhold
+/// its catch-all so route-all cannot blackhole.
+pub fn exit_gateway(view: &Snapshot, via: Option<&str>, v6: bool) -> Option<NodeId> {
+    let default: IpNet = if v6 { "::/0" } else { "0.0.0.0/0" }.parse().unwrap();
+    let owns_default =
+        |m: &nqvpn_proto::control::PeerInfo| m.online && m.prefixes.iter().any(|p| p.trunc() == default);
+    match via {
+        Some(name) => view.members.iter().find(|m| m.name == name && owns_default(m)).map(|m| m.node_id),
+        None => view.members.iter().filter(|m| owns_default(m)).map(|m| m.node_id).min(),
     }
-    if family_ok(true) {
-        out.extend(catch_all_halves(true));
+}
+
+/// The route-all decision for both families at once: which catch-all
+/// halves to install in the OS table (they point at the TUN), and which
+/// exit each family's otherwise-unrouted traffic is sealed to. A family is
+/// activated only when BOTH its transport is pinned (so the tunnel's own
+/// path to the coordinator/relays is safe) AND a usable exit gateway
+/// exists for it (so traffic is not blackholed) — otherwise that family is
+/// left on the real default route, untouched.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RouteAllPlan {
+    /// Catch-all halves to add to the OS routing table.
+    pub nets: Vec<IpNet>,
+    /// `(is_v6, exit node)` defaults to assert in the in-VPN routing table.
+    pub exits: Vec<(bool, NodeId)>,
+}
+
+pub fn route_all_plan(view: &Snapshot, via: Option<&str>, to_pin: &[IpAddr], pinned: &[IpAddr]) -> RouteAllPlan {
+    let pinned_ok = |v6: bool| to_pin.iter().filter(|ip| ip.is_ipv6() == v6).all(|ip| pinned.contains(ip));
+    let mut plan = RouteAllPlan::default();
+    for v6 in [false, true] {
+        if let (true, Some(node)) = (pinned_ok(v6), exit_gateway(view, via, v6)) {
+            plan.nets.extend(catch_all_halves(v6));
+            plan.exits.push((v6, node));
+        }
     }
-    out
+    plan
 }
 
 /// Routes the view says this node should have, before local exclusion.
@@ -583,17 +609,50 @@ mod tests {
     }
 
     #[test]
-    fn route_all_installs_a_familys_halves_only_when_its_transport_is_pinned() {
-        let to_pin = [ip("203.0.113.7"), ip("2001:db8::5")];
-        // Both families pinned -> both v4 and v6 halves.
-        let all = route_all_nets(&to_pin, &to_pin);
-        assert_eq!(all, vec![net("0.0.0.0/1"), net("128.0.0.0/1"), net("::/1"), net("8000::/1")]);
-        // v6 transport could not be pinned (no v6 gateway): withhold ::/1
-        // so route-all never severs the tunnel, but keep the v4 halves.
-        let v4_only = route_all_nets(&to_pin, &[ip("203.0.113.7")]);
-        assert_eq!(v4_only, vec![net("0.0.0.0/1"), net("128.0.0.0/1")]);
-        // Nothing pinned -> no override at all.
-        assert!(route_all_nets(&to_pin, &[]).is_empty());
+    fn exit_gateway_requires_an_online_owner_of_the_default() {
+        let mut s = view(); // node 3 = "gw", a relay; no default owner yet
+        assert_eq!(exit_gateway(&s, None, false), None, "no default owner, no exit");
+        // Make the relay front the v4 default: it becomes an internet exit.
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
+        assert_eq!(exit_gateway(&s, None, false), Some(3));
+        assert_eq!(exit_gateway(&s, None, true), None, "it owns no v6 default");
+        // An offline owner is not a candidate.
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = false;
+        assert_eq!(exit_gateway(&s, None, false), None, "offline exits do not count");
+    }
+
+    #[test]
+    fn via_selects_the_named_exit_among_several_and_rejects_a_non_owner() {
+        let mut s = view();
+        // Two nodes own the v4 default (names: 2 = "b", 3 = "gw").
+        for id in [2, 3] {
+            s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.push(net("0.0.0.0/0"));
+        }
+        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "the named exit wins over the lowest id");
+        assert_eq!(exit_gateway(&s, None, false), Some(2), "no name: lowest id, deterministically");
+        assert_eq!(exit_gateway(&s, Some("me"), false), None, "a named node that owns no default is not an exit");
+        assert_eq!(exit_gateway(&s, Some("nope"), false), None, "a named node that does not exist is not an exit");
+    }
+
+    #[test]
+    fn route_all_plan_needs_both_a_pinned_transport_and_an_exit() {
+        let mut s = view();
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
+        let to_pin = [ip("203.0.113.7")];
+        // Pinned transport + an exit -> the v4 halves and that exit.
+        let p = route_all_plan(&s, Some("gw"), &to_pin, &to_pin);
+        assert_eq!(p.nets, vec![net("0.0.0.0/1"), net("128.0.0.0/1")]);
+        assert_eq!(p.exits, vec![(false, 3)]);
+        // Transport not pinned -> nothing at all, even with an exit, so
+        // route-all never severs the tunnel's own path.
+        let p = route_all_plan(&s, Some("gw"), &to_pin, &[]);
+        assert_eq!(p, RouteAllPlan::default());
+        // No exit for the named node -> withheld (no blackhole).
+        let p = route_all_plan(&s, Some("nope"), &to_pin, &to_pin);
+        assert_eq!(p, RouteAllPlan::default());
+        // v4 has an exit, v6 does not: only v4 activates.
+        let p = route_all_plan(&s, None, &to_pin, &to_pin);
+        assert_eq!(p.exits, vec![(false, 3)], "the v6 family is left alone");
     }
 
     fn view() -> Snapshot {

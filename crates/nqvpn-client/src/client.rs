@@ -134,6 +134,10 @@ pub struct Client {
     /// default override), pinning the underlay transport to the real
     /// gateway so it is not swallowed.
     route_all: bool,
+    /// `--via <name>`: with route-all, the exit gateway to seal
+    /// internet-bound traffic to, by member name. `None` picks whichever
+    /// online node advertises a default (lowest id, deterministically).
+    via: Option<String>,
 }
 
 #[derive(Default)]
@@ -153,6 +157,7 @@ impl Client {
         routes: Arc<dyn RouteSink>,
         preferred_relay: Option<String>,
         route_all: bool,
+        via: Option<String>,
     ) -> Arc<Client> {
         let mut hosts = Vec::new();
         if let Some(ip) = joined.ip4 {
@@ -185,6 +190,7 @@ impl Client {
             underlay: Mutex::new(Vec::new()),
             counters: ClientCounters::default(),
             route_all,
+            via,
         })
     }
 
@@ -462,20 +468,34 @@ impl Client {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
         }
         // --route-all: pin the underlay transport to the real gateway, then
-        // add the catch-all halves for whichever families we could protect,
-        // so all other traffic goes through the tunnel without cutting off
-        // the tunnel's own path to the coordinator and relays.
+        // for each family that has both a safe transport and a reachable
+        // exit gateway, install the catch-all halves (so all other traffic
+        // enters the tunnel) and point that family's in-VPN default at the
+        // exit (so it is sealed there rather than dropped as no-route).
         if c.route_all {
             let to_pin = nqvpn_endpoint::routes::underlay_to_pin(&underlay, &local);
             let pinned = c.routes.pin_underlay(&to_pin).unwrap_or_else(|e| {
                 tracing::warn!("route-all: pinning underlay failed: {e:#}");
                 Vec::new()
             });
-            let nets = nqvpn_endpoint::routes::route_all_nets(&to_pin, &pinned);
-            if nets.is_empty() {
-                tracing::warn!("route-all: no family could be protected; not overriding the default route");
+            let plan = nqvpn_endpoint::routes::route_all_plan(view, c.via.as_deref(), &to_pin, &pinned);
+            if plan.nets.is_empty() {
+                tracing::warn!(
+                    via = ?c.via,
+                    "route-all: no family has both a pinned transport and a reachable exit gateway (an online node owning 0.0.0.0/0 or ::/0); leaving the default route in place"
+                );
             }
-            keep.extend(nets);
+            // Assert the chosen exit(s) in the outbound table, overriding the
+            // published default's owner. `replace_all` above wiped any prior
+            // assertion, so this runs every reconcile.
+            if !plan.exits.is_empty() {
+                let mut peers = c.engine.peers.lock().unwrap();
+                for (v6, node) in &plan.exits {
+                    let d: ipnet::IpNet = if *v6 { "::/0".parse().unwrap() } else { "0.0.0.0/0".parse().unwrap() };
+                    peers.set_default_exit(d, *node);
+                }
+            }
+            keep.extend(plan.nets);
         }
         if let Err(e) = c.routes.reconcile(&keep, &mine) {
             tracing::warn!("route reconcile: {e:#}");

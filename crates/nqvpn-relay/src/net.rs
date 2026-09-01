@@ -85,6 +85,11 @@ pub struct RelayNet {
     endpoint: RwLock<Option<Arc<LocalEndpoint>>>,
     chaos: RwLock<Option<Chaos>>,
     chaos_seq: AtomicU64,
+    /// This relay is a designated internet exit (granted a default route).
+    exit_designated: std::sync::atomic::AtomicBool,
+    /// The last self-check of egress readiness, refreshed on a slow timer
+    /// and carried in each heartbeat (never re-run per heartbeat).
+    exit_ready: RwLock<Option<nqvpn_proto::control::ExitReadiness>>,
 }
 
 impl RelayNet {
@@ -125,7 +130,29 @@ impl RelayNet {
             endpoint: RwLock::new(None),
             chaos: RwLock::new(None),
             chaos_seq: AtomicU64::new(0),
+            exit_designated: std::sync::atomic::AtomicBool::new(false),
+            exit_ready: RwLock::new(None),
         })
+    }
+
+    /// Learn from a join whether this relay is an internet exit gateway
+    /// (the coordinator grants it a default route). Drives the periodic
+    /// egress self-check.
+    pub fn set_exit_designated(&self, granted_cidrs: &[ipnet::IpNet]) {
+        let is_exit = granted_cidrs.iter().any(|c| c.prefix_len() == 0);
+        self.exit_designated.store(is_exit, std::sync::atomic::Ordering::Relaxed);
+        if !is_exit {
+            *self.exit_ready.write().unwrap() = None;
+        }
+    }
+
+    /// Re-run the egress readiness self-check (IP forwarding + masquerade)
+    /// if this relay is a designated exit; otherwise clear it. Called on a
+    /// slow timer so the heartbeat only ever reads the cached value.
+    pub fn refresh_exit_readiness(&self) {
+        let designated = self.exit_designated.load(std::sync::atomic::Ordering::Relaxed);
+        let next = designated.then(crate::exitcheck::detect);
+        *self.exit_ready.write().unwrap() = next;
     }
 
     /// Misbehave on purpose (tests only).
@@ -523,6 +550,7 @@ impl LocalFacts for RelayNet {
             attached_to: None,
             usable_mtu: 0,
             traffic: Some(self.traffic_report()),
+            exit_ready: *self.exit_ready.read().unwrap(),
         }
     }
 }

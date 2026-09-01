@@ -569,7 +569,19 @@ function memberRow(st, m) {
   const role = el('td'); role.append(el('span', 'pill rolepill', m.role)); tr.append(role);
   const state = el('td'); state.append(pill(m)); tr.append(state);
   const ip = el('td'); ip.append(el('code', null, addrOf(m) || '—')); tr.append(ip);
-  const cidrs = el('td'); cidrs.append(el('code', null, (m.registered_cidrs || []).join(' ') || '—')); tr.append(cidrs);
+  const cidrs = el('td'); cidrs.append(el('code', null, (m.registered_cidrs || []).join(' ') || '—'));
+  if (m.internet_gateway) {
+    const er = m.exit_ready, ready = er && er.ip_forward && er.masquerade;
+    const b = el('span', 'pill ' + (ready ? 'on' : 'dis'), 'internet exit');
+    if (ready) b.title = 'Ready: IP forwarding is on and a masquerade rule covers VPN traffic.';
+    else {
+      const miss = !er ? 'waiting for the relay to report' :
+        [er.ip_forward ? null : 'IP forwarding off', er.masquerade ? null : 'no masquerade rule'].filter(Boolean).join(', ');
+      b.title = 'Internet exit is enabled but the host is not ready (' + miss + '). Enable IP forwarding and masquerade on this host — clients cannot egress until then.';
+    }
+    cidrs.append(document.createTextNode(' '), b);
+  }
+  tr.append(cidrs);
   const relay = el('td');
   if (m.role === 'relay') {
     if (m.advertised_reachable === 'unreachable') { relay.append(el('span', 'pill dis', 'not dialable')); relay.title = 'The coordinator cannot dial this relay\'s address. Other relays will fail to mesh with it — check the firewall and its address.'; }
@@ -639,6 +651,7 @@ async function memberForm(st, existing) {
 
   const relayAddr = inp(cur.relay_addr ?? 'auto:4444', { placeholder: 'host:port or auto:port' });
   const cidrs = el('textarea'); cidrs.value = (cur.local_cidrs || []).join('\n'); cidrs.placeholder = '192.168.1.0/24\none per line';
+  const exitGw = el('input'); exitGw.type = 'checkbox'; exitGw.checked = cur.internet_gateway === true;
   const ip4 = inp(cur.preferred_ip4 ?? '', { placeholder: 'auto' });
   const ip6 = inp(cur.preferred_ip6 ?? '', { placeholder: 'auto' });
   const wantIp = el('select'); [['', 'yes (default)'], ['true', 'yes'], ['false', 'no — headless']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; wantIp.append(o); });
@@ -650,6 +663,7 @@ async function memberForm(st, existing) {
   const relayBox = el('div'), clientBox = el('div');
   relayBox.append(field('Relay address', relayAddr, 'What the fleet and clients dial. auto:PORT = the address this relay joins from, on PORT.'));
   relayBox.append(field('Routed LANs', cidrs, 'Prefixes behind this relay, made reachable to every member. Two relays declaring the same prefix are a failover pair.'));
+  relayBox.append(field('Enable Internet Gateway', exitGw, 'All-traffic clients can egress to the internet through this relay (client --route-all / --via). The host must have IP forwarding and a masquerade rule; the relay reports whether they are present.'));
   const g3 = el('div', 'grid2'); g3.append(field('Per-client cap (Mbps)', cap, 'Bandwidth cap for each attached client; blank = network default, 0 = none.')); relayBox.append(g3);
   clientBox.append(field('Preferred relay', pref, 'Attached when reachable; falls back to the lowest latency relay otherwise, and returns on its own.'));
   const g2 = el('div', 'grid2');
@@ -679,6 +693,7 @@ async function memberForm(st, existing) {
       want_vpn_ip: wantIp.value === '' ? null : wantIp.value === 'true',
       max_session_mbps: isRelay ? optNum(cap.value.trim()) : null,
       preferred_relay: isRelay ? null : optStr(pref.value),
+      internet_gateway: isRelay ? exitGw.checked : null,
     };
     if (existing) { await api(memberPath(net, existing.name), { method: 'PUT', body: spec }); msg('Saved ' + existing.name + '; it is re-joining'); closeModal(); }
     else { const r = await api(netPath(net) + '/members', { method: 'POST', body: { name: name.value.trim(), role: roleSel.value, ...spec } }); paintToken(openModal(r.name, net + ' · new ' + r.role), r, true); }

@@ -369,13 +369,19 @@ impl AppState {
         };
 
         // Routes: exactly what the configuration declares; ages survive
-        // for CIDRs that stay continuously declared.
+        // for CIDRs that stay continuously declared. An internet-gateway
+        // relay is granted the default route (v4 + v6) internally — the
+        // operator sets a flag, never types `0.0.0.0/0`.
+        let mut declared: Vec<IpNet> = local_cidrs.iter().map(|c| c.trunc()).collect();
+        if role == Role::Relay && member_cfg.internet_gateway == Some(true) {
+            declared.push("0.0.0.0/0".parse().expect("v4 default"));
+            declared.push("::/0".parse().expect("v6 default"));
+        }
         let mut routes: Vec<RouteReg> = existing.as_ref().map(|r| r.routes.clone()).unwrap_or_default();
-        routes.retain(|r| local_cidrs.iter().any(|c| c.trunc() == r.cidr));
-        for c in &local_cidrs {
-            let c = c.trunc();
-            if !routes.iter().any(|r| r.cidr == c) {
-                routes.push(RouteReg { cidr: c, first_granted_unix: now });
+        routes.retain(|r| declared.contains(&r.cidr));
+        for c in &declared {
+            if !routes.iter().any(|r| r.cidr == *c) {
+                routes.push(RouteReg { cidr: *c, first_granted_unix: now });
             }
         }
 

@@ -306,6 +306,33 @@ pub struct Heartbeat {
     pub usable_mtu: u16,
     /// Relays: cumulative data-plane counters for the traffic matrix.
     pub traffic: Option<TrafficReport>,
+    /// Internet-exit relays only: the last self-check of whether this host
+    /// can actually egress VPN traffic to the internet (IP forwarding on,
+    /// and a masquerade rule covering tun-sourced traffic). `None` on a
+    /// node that is not a designated exit. Advisory — it drives a UI hint,
+    /// never routing.
+    #[serde(default)]
+    pub exit_ready: Option<ExitReadiness>,
+}
+
+/// A designated internet-exit node's self-assessment of whether the host
+/// is configured to forward and masquerade VPN traffic to the internet.
+/// Checked on a slow timer and cached; the heartbeat carries the last
+/// value so the check never runs per-heartbeat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitReadiness {
+    /// `net.ipv4.ip_forward` (or the v6 equivalent) is enabled.
+    pub ip_forward: bool,
+    /// A MASQUERADE/SNAT rule covers tun-sourced traffic leaving the
+    /// internet uplink.
+    pub masquerade: bool,
+}
+
+impl ExitReadiness {
+    /// Both prerequisites are in place.
+    pub fn ok(&self) -> bool {
+        self.ip_forward && self.masquerade
+    }
 }
 
 /// Member -> coordinator: my generation cannot be caught up by deltas;

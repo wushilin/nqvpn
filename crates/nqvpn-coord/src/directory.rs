@@ -70,6 +70,9 @@ pub struct Directory {
     pub reachability: HashMap<NodeId, crate::reach::Reachability>,
     pub reported_mtu: HashMap<NodeId, u16>,
     pub traffic: HashMap<NodeId, TrafficSample>,
+    /// Internet-exit relays: their last self-reported readiness (IP
+    /// forwarding + masquerade). Admin/UI only; never published to members.
+    pub exit_readiness: HashMap<NodeId, nqvpn_proto::control::ExitReadiness>,
 }
 
 impl Directory {
@@ -86,6 +89,7 @@ impl Directory {
             reachability: HashMap::new(),
             reported_mtu: HashMap::new(),
             traffic: HashMap::new(),
+            exit_readiness: HashMap::new(),
         }
     }
 

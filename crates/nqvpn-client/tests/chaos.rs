@@ -1021,8 +1021,8 @@ async fn route_all_via_names_the_internet_exit_gateway() -> Result<()> {
     let (w, rp) = World::new(&[1, 2], &[10]).await;
     // A relay registers (and thus owns) its routed cidrs at join time, so
     // grant the default before the relays start.
-    w.coord().configure("r1", |s| s.local_cidrs = vec!["0.0.0.0/0".parse().unwrap()]);
-    w.coord().configure("r2", |s| s.local_cidrs = vec!["0.0.0.0/0".parse().unwrap()]);
+    w.coord().configure("r1", |s| s.internet_gateway = Some(true));
+    w.coord().configure("r2", |s| s.internet_gateway = Some(true));
     let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
     let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
 

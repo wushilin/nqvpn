@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::control::KeyInfo;
+use crate::control::{ExitReadiness, KeyInfo};
 use crate::types::{NodeId, Role};
 
 fn d_role() -> Role {
@@ -178,6 +178,13 @@ pub struct MemberStatus {
     pub digest_ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat_unix: Option<u64>,
+    /// Relays: is this node a designated internet exit gateway?
+    #[serde(default)]
+    pub internet_gateway: bool,
+    /// Internet-exit relays: their last self-reported egress readiness
+    /// (IP forwarding + masquerade). `None` until the relay reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_ready: Option<ExitReadiness>,
 }
 
 /// One relay's row of the fleet traffic matrix.

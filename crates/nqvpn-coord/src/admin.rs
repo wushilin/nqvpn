@@ -48,6 +48,9 @@ pub struct MemberSpec {
     pub max_session_mbps: Option<u32>,
     #[serde(default)]
     pub preferred_relay: Option<String>,
+    /// Relays only: make this node an internet exit gateway.
+    #[serde(default)]
+    pub internet_gateway: Option<bool>,
 }
 
 impl MemberSpec {
@@ -60,6 +63,7 @@ impl MemberSpec {
         m.want_vpn_ip = self.want_vpn_ip;
         m.max_session_mbps = self.max_session_mbps;
         m.preferred_relay = self.preferred_relay.clone();
+        m.internet_gateway = self.internet_gateway;
     }
 
     pub fn from_cfg(m: &MemberCfg) -> MemberSpec {
@@ -72,6 +76,7 @@ impl MemberSpec {
             want_vpn_ip: m.want_vpn_ip,
             max_session_mbps: m.max_session_mbps,
             preferred_relay: m.preferred_relay.clone(),
+            internet_gateway: m.internet_gateway,
         }
     }
 }
@@ -376,6 +381,7 @@ impl MemberCfg {
             && self.want_vpn_ip == other.want_vpn_ip
             && self.max_session_mbps == other.max_session_mbps
             && self.preferred_relay == other.preferred_relay
+            && self.internet_gateway == other.internet_gateway
     }
 }
 

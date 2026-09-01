@@ -350,7 +350,11 @@ pub fn status_of(ns: &crate::state::NetState, id: &str) -> NetworkStatus {
             disabled: rec.map(|r| r.disabled).unwrap_or(false),
             ip4: rec.and_then(|r| r.ip4).or(m.preferred_ip4),
             ip6: rec.and_then(|r| r.ip6).or(m.preferred_ip6),
-            registered_cidrs: rec.map(|r| r.routes.iter().map(|x| x.cidr).collect()).unwrap_or_else(|| m.local_cidrs.clone()),
+            // The internally-granted default route (the internet-gateway
+            // mechanism) is surfaced via `internet_gateway`, not as a CIDR.
+            registered_cidrs: rec
+                .map(|r| r.routes.iter().map(|x| x.cidr).filter(|c| c.prefix_len() != 0).collect())
+                .unwrap_or_else(|| m.local_cidrs.clone()),
             attached_relay: attachments.get(&node_id).map(|r| name_of(*r)),
             advertised_reachable: (role == Role::Relay)
                 .then(|| ns.directory.reachability.get(&node_id).copied())
@@ -364,6 +368,10 @@ pub fn status_of(ns: &crate::state::NetState, id: &str) -> NetworkStatus {
             reported_gen: report.map(|r| r.gen),
             digest_ok: report.map(|r| r.gen == ns.directory.gen && r.digest == ns.directory.published_digest).unwrap_or(false),
             last_heartbeat_unix: ns.leases.last_seen(node_id).map(|ms| ms / 1000),
+            internet_gateway: role == Role::Relay && m.internet_gateway == Some(true),
+            exit_ready: (role == Role::Relay && m.internet_gateway == Some(true))
+                .then(|| ns.directory.exit_readiness.get(&node_id).copied())
+                .flatten(),
         });
     }
 

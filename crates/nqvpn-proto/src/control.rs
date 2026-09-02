@@ -306,13 +306,12 @@ pub struct Heartbeat {
     pub usable_mtu: u16,
     /// Relays: cumulative data-plane counters for the traffic matrix.
     pub traffic: Option<TrafficReport>,
-    /// Internet-exit relays only: the last self-check of whether this host
-    /// can actually egress VPN traffic to the internet (IP forwarding on,
-    /// and a masquerade rule covering tun-sourced traffic). `None` on a
-    /// node that is not a designated exit. Advisory — it drives a UI hint,
-    /// never routing.
-    #[serde(default)]
-    pub exit_ready: Option<ExitReadiness>,
+    // NOTE: the control payload is bincode (not self-describing), so a
+    // trailing field is NOT wire-compatible even with #[serde(default)] —
+    // an older peer that omits it makes the new decoder hit EOF. Exit
+    // readiness is therefore NOT carried on the heartbeat; it is reported
+    // out of band (a dedicated Kind) so it never breaks a mixed-version
+    // fleet. Do not append fields to this struct; add a new Kind instead.
 }
 
 /// A designated internet-exit node's self-assessment of whether the host
@@ -497,5 +496,50 @@ mod tests {
         assert_eq!(s.member(2).unwrap().name, "n2");
         assert_eq!(s.attachment_of(2), Some(9));
         assert_eq!(s.attachment_of(1), None);
+    }
+
+    /// Wire-stability tripwire for the member->coordinator Heartbeat.
+    ///
+    /// The control payload is bincode, which is NOT self-describing: a
+    /// struct is a bare concatenation of its fields with no names, tags or
+    /// count. Appending a field (even `Option` + `#[serde(default)]`)
+    /// therefore shifts the wire, and a peer that predates the field makes
+    /// the new decoder run past the end of the buffer — a decode error
+    /// that drops the control session. That is exactly how adding
+    /// `exit_ready` to this struct knocked every not-yet-upgraded client
+    /// into a reconnect loop in prod.
+    ///
+    /// So this size is load-bearing: if you changed it, you changed the
+    /// heartbeat wire and will break a mixed-version fleet. Carry new
+    /// facts in a NEW `Kind` (old peers skip an unknown kind) instead of a
+    /// new field here, and only then update the constant.
+    #[test]
+    fn heartbeat_wire_is_stable_so_a_field_append_cannot_slip_through() {
+        let hb = Heartbeat {
+            gen: 42,
+            digest: 7,
+            attached: vec![AttachedClient { node_id: 3, session_id: 11 }],
+            mesh_up: vec![9, 4],
+            attached_to: Some(9),
+            usable_mtu: 1350,
+            traffic: Some(TrafficReport {
+                links: vec![LinkTraffic { peer_id: 9, tx_bytes: 100, tx_pkts: 1, rx_bytes: 200, rx_pkts: 2, up: true }],
+                local_bytes: 0,
+                local_pkts: 0,
+                terminated_bytes: 0,
+                terminated_pkts: 0,
+            }),
+        };
+        let bytes = crate::envelope::encode_payload(&hb).unwrap();
+        assert_eq!(
+            bytes.len(),
+            25,
+            "Heartbeat wire size changed — a field was added/removed. bincode is not \
+             self-describing, so this breaks not-yet-upgraded peers. Use a new Kind, \
+             not a new field (see the doc comment on this test)."
+        );
+        let back: Heartbeat = crate::envelope::decode_payload(&bytes).unwrap();
+        assert_eq!(back.gen, hb.gen);
+        assert_eq!(back.attached_to, Some(9));
     }
 }

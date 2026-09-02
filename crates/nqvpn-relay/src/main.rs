@@ -56,7 +56,6 @@ impl nqvpn_sync::link::MemberHooks for Hooks {
     fn joined(&self, r: &nqvpn_proto::api::JoinResponse) {
         self.net.set_credential(&r.credential);
         self.net.set_signing_keys(&r.coordinator_signing_keys);
-        self.net.set_exit_designated(&r.granted_cidrs);
         // Facts the operator may have changed since the last join.
         let hosts = host_prefixes(r);
         match self.net.endpoint() {
@@ -151,7 +150,6 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
             joined.keepalive_secs.max(1) as u64,
         );
         net.set_signing_keys(&joined.coordinator_signing_keys);
-        net.set_exit_designated(&joined.granted_cidrs);
 
         // Endpoint role: an address, or a LAN to front.
         let hosts = host_prefixes(&joined);
@@ -198,19 +196,6 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
         } else {
             tracing::info!(network = %network_id, "pure forwarder: no address, no gateway prefixes, no TUN");
         }
-
-        // Refresh the internet-exit egress self-check on a slow timer; the
-        // heartbeat only ever reads the cached value (see exitcheck).
-        tokio::spawn({
-            let net = net.clone();
-            async move {
-                let mut t = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    t.tick().await;
-                    net.refresh_exit_readiness();
-                }
-            }
-        });
 
         nqvpn_sync::spawn_reconciler(net.view.clone(), Arc::new(nqvpn_relay::net::NetReconciler(net.clone())), Duration::from_secs(20));
         tokio::spawn({

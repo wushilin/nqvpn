@@ -314,11 +314,6 @@ async fn reader_loop(
                         ns.directory.record_traffic(node_id, t.clone(), now);
                     }
                 }
-                if let Some(er) = hb.exit_ready {
-                    ns.directory.exit_readiness.insert(node_id, er);
-                } else {
-                    ns.directory.exit_readiness.remove(&node_id);
-                }
                 state.publish(&mut ns);
                 if ns.in_grace(now) {
                     continue;

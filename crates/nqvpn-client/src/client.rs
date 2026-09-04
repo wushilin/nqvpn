@@ -473,7 +473,12 @@ impl Client {
         // enters the tunnel) and point that family's in-VPN default at the
         // exit (so it is sealed there rather than dropped as no-route).
         if c.route_all {
-            let to_pin = nqvpn_endpoint::routes::underlay_to_pin(&underlay, &local);
+            // The transports we must keep reachable over the real gateway,
+            // plus the resolvers: route-all leaves DNS alone, so an off-LAN
+            // resolver must not fall into the tunnel or nothing resolves.
+            let mut keep_off_tunnel = underlay.clone();
+            keep_off_tunnel.extend(nqvpn_endpoint::routes::system_resolvers());
+            let to_pin = nqvpn_endpoint::routes::underlay_to_pin(&keep_off_tunnel, &local);
             let pinned = c.routes.pin_underlay(&to_pin).unwrap_or_else(|e| {
                 tracing::warn!("route-all: pinning underlay failed: {e:#}");
                 Vec::new()

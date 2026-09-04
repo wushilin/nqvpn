@@ -77,6 +77,25 @@ pub fn catch_all_halves(v6: bool) -> [IpNet; 2] {
 /// carried by a connected local route (a relay on the same LAN is reached
 /// by its own more-specific connected route, which already outranks the
 /// catch-all — pinning it via the gateway would be wrong).
+/// The resolvers this host uses, from `/etc/resolv.conf`.
+///
+/// route-all does not take DNS over, so name resolution must keep working
+/// exactly as it did — and it cannot work *through* the tunnel before the
+/// tunnel exists: resolving the coordinator and the relays is what brings
+/// the tunnel up. An off-LAN resolver (8.8.8.8, say) therefore has to stay
+/// reachable over the real gateway, or route-all deadlocks: DNS into a
+/// tunnel that has no relay, and no relay without DNS.
+pub fn system_resolvers() -> Vec<IpAddr> {
+    let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter_map(|l| l.strip_prefix("nameserver"))
+        .filter_map(|rest| rest.trim().split('%').next().unwrap_or("").parse::<IpAddr>().ok())
+        .collect()
+}
+
 pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
     let s: BTreeSet<IpAddr> = underlay
         .iter()
@@ -691,6 +710,28 @@ mod tests {
         let gw = wanted_routes(&view(), 9, &[net("10.99.0.4/32"), net("192.168.7.0/24")]);
         assert!(!gw.contains(&net("192.168.7.0/24")));
         assert!(gw.contains(&net("192.168.9.0/24")));
+    }
+
+    #[test]
+    fn route_all_pins_off_lan_resolvers_so_dns_cannot_deadlock_the_tunnel() {
+        // The client merges its resolvers into the pin set. An off-LAN
+        // resolver must be pinned to the real gateway: route-all leaves
+        // DNS alone, and resolving the coordinator/relays is what brings
+        // the tunnel up, so a resolver inside the catch-all deadlocks it.
+        let local = [net("172.20.54.0/24")];
+        let underlay = [ip("3.1.237.225")];
+        let resolvers = [ip("8.8.8.8"), ip("1.1.1.1")];
+        let all: Vec<IpAddr> = underlay.iter().chain(resolvers.iter()).copied().collect();
+        let pinned = underlay_to_pin(&all, &local);
+        for r in resolvers {
+            assert!(pinned.contains(&r), "{r} must be pinned or DNS dies under route-all");
+        }
+        assert!(pinned.contains(&ip("3.1.237.225")), "the transport is still pinned");
+
+        // A resolver on our own LAN is reached by its connected route and
+        // is never pinned — same rule as a relay on the LAN.
+        let pinned = underlay_to_pin(&[ip("172.20.54.53")], &local);
+        assert!(pinned.is_empty(), "an on-LAN resolver needs no pin");
     }
 
     #[test]

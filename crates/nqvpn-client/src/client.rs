@@ -17,6 +17,7 @@ use nqvpn_session::{End, Session, SessionConfig};
 use nqvpn_sync::link::MemberHooks;
 use nqvpn_session::{Refused, CLOSE_EVICTED, CLOSE_STALE_LOGIN};
 use nqvpn_sync::{LinkHandle, LocalFacts, Reconcile, View};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -129,6 +130,14 @@ pub struct Client {
     pub prefer_recheck: Mutex<Duration>,
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
+    /// Relay transport address -> its resolved IPs, resolved once and kept.
+    ///
+    /// Under route-all these are the hosts we pin to the real gateway, so
+    /// re-resolving them on every reconcile would make the tunnel depend on
+    /// working DNS *forever* — and DNS is one of the things the tunnel
+    /// captures. Resolving once, before the catch-all is armed, is what
+    /// keeps that from becoming circular.
+    relay_addrs: Mutex<HashMap<String, Vec<IpAddr>>>,
     pub counters: ClientCounters,
     /// `--route-all`: send all traffic through the tunnel (the two-/1
     /// default override), pinning the underlay transport to the real
@@ -188,6 +197,7 @@ impl Client {
             preferred_relay: Mutex::new(preferred_relay.or_else(|| joined.preferred_relay.clone())),
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
+            relay_addrs: Mutex::new(HashMap::new()),
             counters: ClientCounters::default(),
             route_all,
             via,
@@ -456,11 +466,31 @@ impl Client {
         let wanted = wanted_routes(view, c.node_id, &mine);
         let local = nqvpn_endpoint::ifaces::local_prefixes(&c.device);
         let mut underlay = c.underlay.lock().unwrap().clone();
-        // Relay addresses from the view, resolved once per address.
-        use std::net::ToSocketAddrs;
-        for r in &view.relays {
-            if let Ok(it) = r.addr.to_socket_addrs() {
-                underlay.extend(it.map(|s| s.ip()));
+        // Relay addresses from the view, resolved once per address and kept:
+        // a relay that joins later is resolved and pinned on the reconcile
+        // its snapshot triggers, and never looked up again.
+        {
+            use std::net::ToSocketAddrs;
+            let mut cache = c.relay_addrs.lock().unwrap();
+            for r in &view.relays {
+                let ips = cache.entry(r.addr.clone()).or_insert_with(|| {
+                    match r.addr.to_socket_addrs() {
+                        Ok(it) => it.map(|s| s.ip()).collect(),
+                        Err(e) => {
+                            // Left uncached (empty is cached, an error is not)
+                            // so the next reconcile tries again. Unpinned, this
+                            // relay's transport falls into the catch-all and is
+                            // unreachable, so say so rather than failing mutely.
+                            tracing::warn!(relay = %r.name, addr = %r.addr, "cannot resolve this relay's address; it will not be pinned and may be unreachable under route-all: {e}");
+                            Vec::new()
+                        }
+                    }
+                });
+                if ips.is_empty() {
+                    cache.remove(&r.addr);
+                    continue;
+                }
+                underlay.extend(ips.iter().copied());
             }
         }
         let (mut keep, excluded) = exclude_local(wanted, &local, &underlay);

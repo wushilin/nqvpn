@@ -96,6 +96,71 @@ pub fn system_resolvers() -> Vec<IpAddr> {
         .collect()
 }
 
+/// The routing-table operations underlay pinning needs, behind a trait so
+/// the rules in `reconcile_pins` are exercised without touching an OS.
+pub trait HostRouteTable {
+    fn default_gateway(&self, v6: bool) -> Option<IpAddr>;
+    /// `Ok(true)` when this call created the route; `Ok(false)` when an
+    /// identical one was already present, and so is not ours to remove.
+    fn add_host_route(&self, ip: IpAddr, gw: IpAddr) -> std::io::Result<bool>;
+    fn del_host_route(&self, ip: IpAddr, gw: IpAddr);
+}
+
+/// Bring the underlay pins in line with `want` and the *current* default
+/// gateway, returning the hosts route-all may now count as reachable off
+/// the tunnel. Three rules, and the pin map is the whole state:
+///
+///  * `pinned` records only routes **we** created, so tearing down can
+///    never delete a route the host already had;
+///  * a pin is only correct while it names the current default gateway —
+///    after a DHCP change or a move to another network, one left on the old
+///    gateway silently blackholes exactly the hosts route-all cannot lose;
+///  * a host that drops out of `want` (a relay left the fleet) loses its pin.
+pub fn reconcile_pins(
+    table: &dyn HostRouteTable,
+    want: &[IpAddr],
+    pinned: &mut std::collections::BTreeMap<IpAddr, IpAddr>,
+) -> Vec<IpAddr> {
+    let want: BTreeSet<IpAddr> = want.iter().copied().collect();
+    let stale: Vec<IpAddr> = pinned.keys().copied().filter(|ip| !want.contains(ip)).collect();
+    for ip in stale {
+        if let Some(gw) = pinned.remove(&ip) {
+            table.del_host_route(ip, gw);
+        }
+    }
+    let mut ok = Vec::new();
+    for ip in want {
+        let Some(gw) = table.default_gateway(ip.is_ipv6()) else {
+            tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host; withholding its family's catch-all so the tunnel is not cut off");
+            continue;
+        };
+        match pinned.get(&ip).copied() {
+            Some(had) if had == gw => {
+                ok.push(ip);
+                continue;
+            }
+            Some(had) => {
+                table.del_host_route(ip, had);
+                pinned.remove(&ip);
+                tracing::info!(target: "nqvpn::os_routes", %ip, old_gateway = %had, new_gateway = %gw, "route-all: default gateway moved; re-pinning underlay host");
+            }
+            None => {}
+        }
+        match table.add_host_route(ip, gw) {
+            Ok(true) => {
+                tracing::info!(target: "nqvpn::os_routes", %ip, %gw, "route-all: pinned underlay host to gateway");
+                pinned.insert(ip, gw);
+                ok.push(ip);
+            }
+            // Already routed the way we want, by someone else: usable, but
+            // not ours, so it is not recorded and never torn down.
+            Ok(false) => ok.push(ip),
+            Err(e) => tracing::warn!(%ip, %gw, "route-all: pinning underlay host failed: {e}"),
+        }
+    }
+    ok
+}
+
 pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
     let s: BTreeSet<IpAddr> = underlay
         .iter()
@@ -479,7 +544,7 @@ impl NetRouteProgrammer {
 
     /// The current default route's gateway for a family, ignoring any
     /// default that points at our own TUN. `None` if there is none.
-    fn default_gateway(&self, v6: bool) -> Option<IpAddr> {
+    fn current_default_gateway(&self, v6: bool) -> Option<IpAddr> {
         let mytun = self.ifindex();
         let routes = self.mgr.lock().unwrap().list().ok()?;
         routes
@@ -548,39 +613,24 @@ impl RouteProgrammer for NetRouteProgrammer {
     }
 
     fn pin_underlay(&self, ips: &[IpAddr]) -> Result<Vec<IpAddr>> {
-        let want: BTreeSet<IpAddr> = ips.iter().copied().collect();
         let mut pinned = self.pinned.lock().unwrap();
-        // Drop pins no longer wanted (a relay left the fleet).
-        let stale: Vec<IpAddr> = pinned.keys().copied().filter(|ip| !want.contains(ip)).collect();
-        for ip in stale {
-            if let Some(gw) = pinned.remove(&ip) {
-                let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
-            }
+        Ok(reconcile_pins(self, ips, &mut pinned))
+    }
+}
+
+impl HostRouteTable for NetRouteProgrammer {
+    fn default_gateway(&self, v6: bool) -> Option<IpAddr> {
+        self.current_default_gateway(v6)
+    }
+    fn add_host_route(&self, ip: IpAddr, gw: IpAddr) -> std::io::Result<bool> {
+        match self.mgr.lock().unwrap().add(&host_route(ip).with_gateway(gw)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
         }
-        // Add pins we don't have yet, via the family's real gateway.
-        let mut ok = Vec::new();
-        for ip in want {
-            if pinned.contains_key(&ip) {
-                ok.push(ip);
-                continue;
-            }
-            let Some(gw) = self.default_gateway(ip.is_ipv6()) else {
-                tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host; withholding its family's catch-all so the tunnel is not cut off");
-                continue;
-            };
-            match self.mgr.lock().unwrap().add(&host_route(ip).with_gateway(gw)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    tracing::warn!(%ip, %gw, "route-all: pinning underlay host failed: {e}");
-                    continue;
-                }
-            }
-            tracing::info!(target: "nqvpn::os_routes", %ip, %gw, "route-all: pinned underlay host to gateway");
-            pinned.insert(ip, gw);
-            ok.push(ip);
-        }
-        Ok(ok)
+    }
+    fn del_host_route(&self, ip: IpAddr, gw: IpAddr) {
+        let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
     }
 }
 
@@ -613,6 +663,7 @@ mod tests {
     use super::*;
     use nqvpn_proto::control::{NetworkMtu, PeerInfo};
     use nqvpn_proto::types::Role;
+    use std::collections::BTreeMap;
 
     fn net(s: &str) -> IpNet {
         s.parse().unwrap()
@@ -710,6 +761,108 @@ mod tests {
         let gw = wanted_routes(&view(), 9, &[net("10.99.0.4/32"), net("192.168.7.0/24")]);
         assert!(!gw.contains(&net("192.168.7.0/24")));
         assert!(gw.contains(&net("192.168.9.0/24")));
+    }
+
+    /// A routing table that records what was asked of it. `preexisting`
+    /// are host routes the machine already had, which we must never claim.
+    struct FakeTable {
+        gw: Mutex<Option<IpAddr>>,
+        preexisting: Mutex<BTreeSet<(IpAddr, IpAddr)>>,
+        added: Mutex<Vec<(IpAddr, IpAddr)>>,
+        deleted: Mutex<Vec<(IpAddr, IpAddr)>>,
+    }
+
+    impl FakeTable {
+        fn with_gateway(gw: &str) -> Self {
+            FakeTable {
+                gw: Mutex::new(Some(ip(gw))),
+                preexisting: Mutex::new(BTreeSet::new()),
+                added: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HostRouteTable for FakeTable {
+        fn default_gateway(&self, _v6: bool) -> Option<IpAddr> {
+            *self.gw.lock().unwrap()
+        }
+        fn add_host_route(&self, i: IpAddr, gw: IpAddr) -> std::io::Result<bool> {
+            if self.preexisting.lock().unwrap().contains(&(i, gw)) {
+                return Ok(false);
+            }
+            self.added.lock().unwrap().push((i, gw));
+            Ok(true)
+        }
+        fn del_host_route(&self, i: IpAddr, gw: IpAddr) {
+            self.deleted.lock().unwrap().push((i, gw));
+        }
+    }
+
+    #[test]
+    fn a_pin_follows_the_default_gateway_when_the_network_moves() {
+        // The bug this exists for: a laptop that changes networks while the
+        // client runs kept its pins on the old gateway, blackholing the
+        // relays and resolvers — no crash needed.
+        let t = FakeTable::with_gateway("192.168.1.1");
+        let mut pinned = BTreeMap::new();
+        let want = [ip("3.1.237.225"), ip("8.8.8.8")];
+        let ok = reconcile_pins(&t, &want, &mut pinned);
+        assert_eq!(ok.len(), 2);
+        assert_eq!(pinned.get(&ip("8.8.8.8")), Some(&ip("192.168.1.1")));
+
+        // Same want set, new gateway: every pin is re-pointed, not skipped.
+        *t.gw.lock().unwrap() = Some(ip("10.0.0.1"));
+        let ok = reconcile_pins(&t, &want, &mut pinned);
+        assert_eq!(ok.len(), 2);
+        for host in want {
+            assert!(t.deleted.lock().unwrap().contains(&(host, ip("192.168.1.1"))), "{host} unpinned from the old gateway");
+            assert!(t.added.lock().unwrap().contains(&(host, ip("10.0.0.1"))), "{host} re-pinned to the new gateway");
+            assert_eq!(pinned.get(&host), Some(&ip("10.0.0.1")));
+        }
+
+        // Steady state: nothing is touched when the gateway is unchanged.
+        let (a, d) = (t.added.lock().unwrap().len(), t.deleted.lock().unwrap().len());
+        reconcile_pins(&t, &want, &mut pinned);
+        assert_eq!((t.added.lock().unwrap().len(), t.deleted.lock().unwrap().len()), (a, d));
+    }
+
+    #[test]
+    fn tearing_down_never_deletes_a_host_route_we_did_not_create() {
+        // The host already routes this relay via the gateway. We may use it,
+        // but it is not ours, so it must not be recorded and must survive us.
+        let t = FakeTable::with_gateway("192.168.1.1");
+        t.preexisting.lock().unwrap().insert((ip("3.1.237.225"), ip("192.168.1.1")));
+        let mut pinned = BTreeMap::new();
+        let ok = reconcile_pins(&t, &[ip("3.1.237.225"), ip("8.8.8.8")], &mut pinned);
+        assert!(ok.contains(&ip("3.1.237.225")), "a route already in place still counts as reachable");
+        assert!(!pinned.contains_key(&ip("3.1.237.225")), "not ours: never recorded, so never torn down");
+        assert_eq!(pinned.keys().copied().collect::<Vec<_>>(), vec![ip("8.8.8.8")], "only what we created");
+    }
+
+    #[test]
+    fn a_relay_that_leaves_the_fleet_loses_its_pin() {
+        let t = FakeTable::with_gateway("192.168.1.1");
+        let mut pinned = BTreeMap::new();
+        reconcile_pins(&t, &[ip("3.1.237.225"), ip("47.237.120.106")], &mut pinned);
+        // A new snapshot drops one relay and adds another.
+        let ok = reconcile_pins(&t, &[ip("3.1.237.225"), ip("43.230.99.31")], &mut pinned);
+        assert!(t.deleted.lock().unwrap().contains(&(ip("47.237.120.106"), ip("192.168.1.1"))), "the departed relay is unpinned");
+        assert!(ok.contains(&ip("43.230.99.31")), "a relay added later is pinned on the reconcile its snapshot triggers");
+        assert_eq!(pinned.len(), 2);
+    }
+
+    #[test]
+    fn without_a_default_gateway_nothing_is_pinned_and_the_caller_arms_nothing() {
+        // No gateway to pin through: report the host as unpinned so
+        // route_all_plan withholds the catch-all rather than cutting the box off.
+        let t = FakeTable::with_gateway("192.168.1.1");
+        *t.gw.lock().unwrap() = None;
+        let mut pinned = BTreeMap::new();
+        let ok = reconcile_pins(&t, &[ip("3.1.237.225")], &mut pinned);
+        assert!(ok.is_empty() && pinned.is_empty());
+        let plan = route_all_plan(&view(), None, &[ip("3.1.237.225")], &ok);
+        assert!(plan.nets.is_empty(), "an unpinned transport must never arm a catch-all");
     }
 
     #[test]

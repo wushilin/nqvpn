@@ -130,6 +130,9 @@ pub struct Client {
     pub prefer_recheck: Mutex<Duration>,
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
+    /// The exit each family is currently sealed to, so a change of exit is
+    /// reported once rather than every reconcile.
+    exit_chosen: Mutex<std::collections::BTreeMap<bool, NodeId>>,
     /// Relay transport address -> its resolved IPs, resolved once and kept.
     ///
     /// Under route-all these are the hosts we pin to the real gateway, so
@@ -198,6 +201,7 @@ impl Client {
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
             relay_addrs: Mutex::new(HashMap::new()),
+            exit_chosen: Mutex::new(std::collections::BTreeMap::new()),
             counters: ClientCounters::default(),
             route_all,
             via,
@@ -528,6 +532,28 @@ impl Client {
                 for (v6, node) in &plan.exits {
                     let d: ipnet::IpNet = if *v6 { "::/0".parse().unwrap() } else { "0.0.0.0/0".parse().unwrap() };
                     peers.set_default_exit(d, *node);
+                }
+            }
+            // Say which exit we are on, but only when it changes: --via is a
+            // preference, so falling back and returning are both normal and
+            // both worth seeing in the log.
+            {
+                let mut chosen = c.exit_chosen.lock().unwrap();
+                let families: Vec<bool> = plan.exits.iter().map(|(v6, _)| *v6).collect();
+                chosen.retain(|v6, _| families.contains(v6));
+                for (v6, node) in &plan.exits {
+                    if chosen.insert(*v6, *node) == Some(*node) {
+                        continue;
+                    }
+                    let family = if *v6 { "v6" } else { "v4" };
+                    let name = view.members.iter().find(|m| m.node_id == *node).map(|m| m.name.as_str()).unwrap_or("?");
+                    match c.via.as_deref() {
+                        Some(pref) if pref != name => {
+                            tracing::warn!(family, preferred = pref, using = name, node = node, "preferred internet exit is not available; using another")
+                        }
+                        Some(pref) => tracing::info!(family, exit = pref, node = node, "on the preferred internet exit"),
+                        None => tracing::info!(family, exit = name, node = node, "internet exit selected"),
+                    }
                 }
             }
             keep.extend(plan.nets);

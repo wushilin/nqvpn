@@ -38,11 +38,13 @@ struct Cli {
     /// gateway so it is not captured. DNS is not changed.
     #[arg(long)]
     route_all: bool,
-    /// With route-all, seal internet-bound traffic to this exit gateway by
-    /// member name (a node that fronts 0.0.0.0/0 / ::/0 and masquerades).
-    /// Implies --route-all. Without it, route-all uses whichever online
-    /// node advertises a default (lowest id). Only affects the exit choice;
-    /// which relay carries the traffic is still picked normally.
+    /// With route-all, prefer this exit gateway by member name (a node that
+    /// fronts 0.0.0.0/0 / ::/0 and masquerades). Implies --route-all. This
+    /// is a preference, not a pin: if that node is offline or stops
+    /// advertising a default, another exit is used until it returns, and
+    /// the preference is restored on its own. Without it, route-all uses
+    /// whichever online node advertises a default (lowest id). Only affects
+    /// the exit choice; which relay carries the traffic is picked normally.
     #[arg(long)]
     via: Option<String>,
 }

@@ -174,20 +174,28 @@ pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
 /// traffic to, for one address family. A candidate must be online and own
 /// the family's default route (`0.0.0.0/0` or `::/0`) — the exact prefix
 /// that makes *its* ingress filter accept internet-bound packets, so a
-/// client never seals traffic to a node that would only drop it. With
-/// `via` set, only the node of that name qualifies (and only if it owns
-/// the default); without it, the lowest node id among candidates is picked
-/// so the choice is deterministic when several nodes advertise a default.
+/// client never seals traffic to a node that would only drop it.
+///
+/// `via` is a **preference, not a pin**: the node of that name is used
+/// whenever it qualifies, and any other usable exit is taken when it does
+/// not, because being on the operator's preferred exit matters less than
+/// having internet at all. Among the rest the lowest node id wins, so the
+/// fallback is deterministic when several advertise a default.
+///
+/// Nothing here is sticky — this is recomputed from the view on every
+/// reconcile, so the preference is restored by itself the moment the
+/// preferred node is online and owning the default again.
+///
 /// `None` means no usable exit for this family — the caller must withhold
 /// its catch-all so route-all cannot blackhole.
 pub fn exit_gateway(view: &Snapshot, via: Option<&str>, v6: bool) -> Option<NodeId> {
     let default: IpNet = if v6 { "::/0" } else { "0.0.0.0/0" }.parse().unwrap();
     let owns_default =
         |m: &nqvpn_proto::control::PeerInfo| m.online && m.prefixes.iter().any(|p| p.trunc() == default);
-    match via {
-        Some(name) => view.members.iter().find(|m| m.name == name && owns_default(m)).map(|m| m.node_id),
-        None => view.members.iter().filter(|m| owns_default(m)).map(|m| m.node_id).min(),
-    }
+    let preferred = via
+        .and_then(|name| view.members.iter().find(|m| m.name == name && owns_default(m)))
+        .map(|m| m.node_id);
+    preferred.or_else(|| view.members.iter().filter(|m| owns_default(m)).map(|m| m.node_id).min())
 }
 
 /// The route-all decision for both families at once: which catch-all
@@ -706,8 +714,42 @@ mod tests {
         }
         assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "the named exit wins over the lowest id");
         assert_eq!(exit_gateway(&s, None, false), Some(2), "no name: lowest id, deterministically");
-        assert_eq!(exit_gateway(&s, Some("me"), false), None, "a named node that owns no default is not an exit");
-        assert_eq!(exit_gateway(&s, Some("nope"), false), None, "a named node that does not exist is not an exit");
+        // --via is a preference: a name that is not a usable exit falls back
+        // to one that is, rather than leaving the client with no internet.
+        assert_eq!(exit_gateway(&s, Some("me"), false), Some(2), "a named non-owner falls back to a real exit");
+        assert_eq!(exit_gateway(&s, Some("nope"), false), Some(2), "an unknown name falls back too");
+    }
+
+    #[test]
+    fn a_preferred_exit_is_fallen_back_from_and_returned_to_by_itself() {
+        // The operator prefers "gw"; "b" is the other exit. Losing the
+        // preferred one must not cost the client its internet, and getting
+        // it back must not need a restart or any sticky state.
+        let mut s = view();
+        for id in [2, 3] {
+            s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.push(net("0.0.0.0/0"));
+        }
+        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "preferred while it qualifies");
+
+        // It goes offline (the coordinator stops vouching for it).
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = false;
+        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(2), "falls back to the remaining exit");
+
+        // Its default is withdrawn instead (an exit that stopped being ready).
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = true;
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.retain(|p| p.prefix_len() != 0);
+        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(2), "owning no default is not an exit either");
+
+        // Back online and owning the default again: the preference returns
+        // on its own, because the choice is recomputed, never remembered.
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
+        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "preference restores itself");
+
+        // With no exit at all the caller still gets None and withholds.
+        for id in [2, 3] {
+            s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.retain(|p| p.prefix_len() != 0);
+        }
+        assert_eq!(exit_gateway(&s, Some("gw"), false), None, "no exits: nothing to fall back to");
     }
 
     #[test]
@@ -723,8 +765,12 @@ mod tests {
         // route-all never severs the tunnel's own path.
         let p = route_all_plan(&s, Some("gw"), &to_pin, &[]);
         assert_eq!(p, RouteAllPlan::default());
-        // No exit for the named node -> withheld (no blackhole).
+        // The preferred node is not a usable exit -> fall back to one that
+        // is, rather than leaving the client with no internet at all.
         let p = route_all_plan(&s, Some("nope"), &to_pin, &to_pin);
+        assert_eq!(p.exits, vec![(false, 3)], "--via is a preference, not a pin");
+        // Nothing owns a default anywhere -> withheld (no blackhole).
+        let p = route_all_plan(&view(), Some("gw"), &to_pin, &to_pin);
         assert_eq!(p, RouteAllPlan::default());
         // v4 has an exit, v6 does not: only v4 activates.
         let p = route_all_plan(&s, None, &to_pin, &to_pin);

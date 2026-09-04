@@ -1041,6 +1041,42 @@ async fn route_all_via_names_the_internet_exit_gateway() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preferred_exit_falls_back_when_it_goes_away_and_is_returned_to_when_it_comes_back() -> Result<()> {
+    // --via names a preference, not a pin. Losing the preferred exit must
+    // cost the client nothing but the preference, and getting it back must
+    // need no restart: the exit is recomputed every reconcile, never stored.
+    use nqvpn_proto::control::ExitReadiness;
+    let (w, rp) = World::new(&[1, 2], &[10]).await;
+    w.coord().configure("r1", |s| s.internet_gateway = Some(true));
+    w.coord().configure("r2", |s| s.internet_gateway = Some(true));
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+
+    let a = ClientHandle::start_route_all(&w.url(), 10, Some("r2")).await;
+    wait_until("the preferred exit is chosen", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r2.node_id) && a.os_has("0.0.0.0/1")
+    })
+    .await?;
+
+    // The preferred exit stops being a usable exit (its host stopped
+    // masquerading), so the coordinator withdraws its default.
+    r2.net.set_exit_readiness(ExitReadiness { ip_forward: true, masquerade: false });
+    wait_until("falls back to the other exit rather than losing the internet", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r1.node_id)
+    })
+    .await?;
+    assert!(a.os_has("0.0.0.0/1") && a.os_has("128.0.0.0/1"), "the catch-all stays armed on the fallback exit");
+
+    // It becomes usable again: the preference returns on its own.
+    r2.net.set_exit_readiness(ExitReadiness { ip_forward: true, masquerade: true });
+    wait_until("the preference is restored without a restart", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r2.node_id)
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn route_all_withholds_the_catch_all_until_the_named_exit_reports_ready() -> Result<()> {
     // r2 is designated an exit but its host is not masquerading: the
     // coordinator must not publish its default, so the client neither

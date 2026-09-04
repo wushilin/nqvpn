@@ -124,8 +124,12 @@ impl Directory {
             }
             for (cidr, owner) in &self.owners {
                 if owner == id {
+                    // Defaults are published per exit below, never as an
+                    // age-resolved single owner.
                     if let Ok(net) = cidr.parse::<IpNet>() {
-                        prefixes.push(net);
+                        if net.prefix_len() != 0 {
+                            prefixes.push(net);
+                        }
                     }
                 }
             }
@@ -136,8 +140,14 @@ impl Directory {
             // longest-prefix match keeps every specific route local, so the
             // extra default entries never shadow real routes. Specific LANs
             // stay single-owner (active/standby failover) above.
+            //
+            // Only while the exit reports itself ready (forwarding on and
+            // a masquerade rule in place): a designated but misconfigured
+            // host must not attract traffic it would drop. The flag alone
+            // shows in the admin view; the route needs the report.
+            let exit_ready = self.exit_readiness.get(id).map(|r| r.ok()).unwrap_or(false);
             for r in &rec.routes {
-                if r.cidr.prefix_len() == 0 && !prefixes.contains(&r.cidr) {
+                if r.cidr.prefix_len() == 0 && exit_ready && !prefixes.contains(&r.cidr) {
                     prefixes.push(r.cidr);
                 }
             }
@@ -163,9 +173,13 @@ impl Directory {
             .map(|(node_id, relay_id)| AttachmentEntry { node_id, relay_id })
             .collect();
 
+        // Reserved prefixes are sites members keep routing into the tunnel
+        // even while unowned. A default is an exit designation, not a
+        // site: reserving it would blackhole a member's whole internet
+        // whenever no exit is ready.
         let mut reserved: Vec<IpNet> = cfg.cidrs.clone();
         for rec in reg.members.values().filter(|m| !m.disabled) {
-            reserved.extend(rec.routes.iter().map(|r| r.cidr));
+            reserved.extend(rec.routes.iter().map(|r| r.cidr).filter(|c| c.prefix_len() != 0));
         }
 
         let mut next = Snapshot {
@@ -310,7 +324,7 @@ pub fn relay_endpoints(cfg: &NetworkConfig, reg: &Registry) -> Vec<RelayEndpoint
 mod tests {
     use super::*;
     use crate::registry::RouteReg;
-    use nqvpn_proto::control::{AttachedClient, Heartbeat};
+    use nqvpn_proto::control::{AttachedClient, ExitReadiness, Heartbeat};
 
     fn cfg() -> NetworkConfig {
         toml::from_str(
@@ -400,6 +414,32 @@ local_cidrs = ["192.168.1.0/24"]
         assert!(!old.online);
         // The CIDR stays reserved so members keep routing it into the tunnel.
         assert!(d.published.reserved_prefixes.iter().any(|p| p.to_string() == "192.168.1.0/24"));
+    }
+
+    #[test]
+    fn an_exit_publishes_the_default_only_while_it_reports_ready() {
+        let (c, mut reg) = (cfg(), registry());
+        let v4: IpNet = "0.0.0.0/0".parse().unwrap();
+        reg.member_mut(1, "old", Role::Relay, 1).routes.push(RouteReg { cidr: v4, first_granted_unix: 1 });
+        let mut l = Leases::default();
+        let mut d = Directory::new(1, 60);
+        online(&mut l, &[1], 1000);
+        d.recompute(&c, &reg, &l, &[], 1000, 1000);
+        let has_default = |d: &Directory| d.published.member(1).unwrap().prefixes.contains(&v4);
+        assert!(!has_default(&d), "designated but unreported: the default is withheld");
+        assert!(!d.published.reserved_prefixes.contains(&v4), "a default is never a reserved (blackholed) site");
+
+        d.exit_readiness.insert(1, ExitReadiness { ip_forward: true, masquerade: false });
+        d.recompute(&c, &reg, &l, &[], 1001, 1001);
+        assert!(!has_default(&d), "forwarding without masquerade is not an exit");
+
+        d.exit_readiness.insert(1, ExitReadiness { ip_forward: true, masquerade: true });
+        d.recompute(&c, &reg, &l, &[], 1002, 1002).expect("the exit appeared");
+        assert!(has_default(&d));
+
+        d.exit_readiness.remove(&1);
+        d.recompute(&c, &reg, &l, &[], 1003, 1003).expect("the exit vanished");
+        assert!(!has_default(&d));
     }
 
     #[test]

@@ -514,6 +514,13 @@ mod tests {
     /// facts in a NEW `Kind` (old peers skip an unknown kind) instead of a
     /// new field here, and only then update the constant.
     #[test]
+    fn exit_readiness_wire_is_stable() {
+        let er = ExitReadiness { ip_forward: true, masquerade: false };
+        let bytes = crate::envelope::encode_payload(&er).unwrap();
+        assert_eq!(bytes, vec![1, 0], "ExitReadiness wire changed: carry new facts in a new Kind, never a new field");
+    }
+
+    #[test]
     fn heartbeat_wire_is_stable_so_a_field_append_cannot_slip_through() {
         let hb = Heartbeat {
             gen: 42,

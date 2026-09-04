@@ -200,6 +200,11 @@ impl RelayHandle {
         let node_id = joined.node_id;
         let net = RelayNet::new(NET.into(), joined.network_uuid.clone(), node_id, identity.clone(), joined.credential.clone(), Mode::parse(&joined.transport), 1, 0, 1);
         net.set_signing_keys(&joined.coordinator_signing_keys);
+        // A relay granted the default is an internet exit; this host is
+        // not one for real, so stand in for the egress self-check: ready
+        // unless a test says otherwise.
+        net.set_exit_designated(&joined.granted_cidrs);
+        net.set_exit_readiness(nqvpn_proto::control::ExitReadiness { ip_forward: true, masquerade: true });
         let mut nets = HashMap::new();
         nets.insert(NET.to_string(), net.clone());
         let tasks = vec![
@@ -1032,6 +1037,35 @@ async fn route_all_via_names_the_internet_exit_gateway() -> Result<()> {
     })
     .await?;
     assert_ne!(a.exit_for("8.8.8.8"), Some(r1.node_id), "the unnamed exit is not chosen");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_all_withholds_the_catch_all_until_the_named_exit_reports_ready() -> Result<()> {
+    // r2 is designated an exit but its host is not masquerading: the
+    // coordinator must not publish its default, so the client neither
+    // picks it nor installs the catch-all. Once the host reports ready
+    // the exit appears — no restart of anything.
+    use nqvpn_proto::control::ExitReadiness;
+    let (w, rp) = World::new(&[1, 2], &[10]).await;
+    // r1 is a plain forwarder; r2 is the only designated exit.
+    w.coord().configure("r2", |s| s.internet_gateway = Some(true));
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    r2.net.set_exit_readiness(ExitReadiness { ip_forward: true, masquerade: false });
+
+    let a = ClientHandle::start_route_all(&w.url(), 10, Some("r2")).await;
+    wait_until("the client attaches and reconciles", Duration::from_secs(20), || a.attached_to().is_some()).await?;
+    wait_until("the unready exit is withdrawn", Duration::from_secs(20), || a.exit_for("8.8.8.8").is_none()).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!a.os_has("0.0.0.0/1") && !a.os_has("128.0.0.0/1"), "no ready exit: the catch-all is withheld");
+    assert_eq!(a.exit_for("8.8.8.8"), None, "an exit that is not ready is not an exit");
+
+    r2.net.set_exit_readiness(ExitReadiness { ip_forward: true, masquerade: true });
+    wait_until("the exit appears once its host reports ready", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r2.node_id) && a.os_has("0.0.0.0/1") && a.os_has("128.0.0.0/1")
+    })
+    .await?;
     Ok(())
 }
 

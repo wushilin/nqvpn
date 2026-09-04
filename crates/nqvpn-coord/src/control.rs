@@ -228,8 +228,10 @@ async fn handle_conn(state: Arc<AppState>, conn: quinn::Connection) -> Result<()
             // and a member that is merely reconnecting is back before
             // anyone acts on it.
             ns.leases.offline(node_id);
-            // A member that left should stop constraining everyone else.
+            // A member that left should stop constraining everyone else,
+            // and an exit that left is no exit until it reports again.
             ns.directory.reported_mtu.remove(&node_id);
+            ns.directory.exit_readiness.remove(&node_id);
             state.publish(&mut ns);
             tracing::info!(network = %network_id, node_id, "control session closed");
         }
@@ -329,6 +331,23 @@ async fn reader_loop(
                         "member holds a different view at the same generation — resyncing (this is a bug)"
                     );
                     catch_up(&mut ns, node_id, 0);
+                }
+            }
+            k if k == Kind::ExitReadiness as u16 => {
+                let er: nqvpn_proto::control::ExitReadiness = parse(&env)?;
+                if role != Role::Relay {
+                    anyhow::bail!("ExitReadiness from non-relay node {node_id}");
+                }
+                let net = state.net(network_id).expect("verified");
+                let mut ns = net.lock().unwrap();
+                // The default route is published for this exit only while
+                // it reports ready, so a change is a view change.
+                if ns.directory.exit_readiness.insert(node_id, er) != Some(er) {
+                    tracing::info!(
+                        network = %network_id, node_id, ip_forward = er.ip_forward, masquerade = er.masquerade,
+                        "internet exit readiness reported"
+                    );
+                    state.publish(&mut ns);
                 }
             }
             k if k == Kind::Resync as u16 => {

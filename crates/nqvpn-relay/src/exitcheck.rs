@@ -1,9 +1,13 @@
 //! Best-effort self-check for an internet-exit relay: is the host actually
 //! configured to egress VPN traffic to the internet — IP forwarding on,
 //! and a masquerade rule covering tun-sourced traffic leaving the internet
-//! uplink? Advisory only: it drives a UI hint, never routing, so a
-//! false negative (e.g. no permission to read the firewall) never severs a
-//! working exit. Linux-only; elsewhere it reports "unknown" (both false).
+//! uplink? The reading is reported to the coordinator as its own control
+//! message; the coordinator publishes this relay's default route only
+//! while both are true, so a designated-but-misconfigured host never
+//! attracts traffic it would drop. The admin view shows which check is
+//! missing. Runs as root on a relay, so the firewall is readable; a host
+//! whose masquerade is configured in a way this cannot see is treated as
+//! not ready. Linux-only; elsewhere it reports "unknown" (both false).
 
 use nqvpn_proto::control::ExitReadiness;
 use std::process::Command;

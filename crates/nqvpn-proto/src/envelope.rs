@@ -41,6 +41,11 @@ pub enum Kind {
     Resync = 6,
     /// Member -> any acceptor: a renewed credential for this session.
     Refresh = 7,
+    /// Relay -> coordinator: `ExitReadiness`, the internet-exit egress
+    /// self-check. Its own kind (not a heartbeat field) so peers on
+    /// either side that predate it simply skip it — see the wire note
+    /// on `Heartbeat`.
+    ExitReadiness = 8,
     /// Correlated request/response (see DESIGN-RPC.md).
     Request = 16,
     Response = 17,

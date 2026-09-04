@@ -85,6 +85,12 @@ pub trait LocalFacts: Send + Sync {
     /// Filled in whole on every heartbeat; `gen`/`digest` are added by
     /// the link.
     fn heartbeat(&self) -> Heartbeat;
+
+    /// An internet exit's egress self-check (`None` when not one). Sent
+    /// as its own message when it changes, and once per connection.
+    fn exit_readiness(&self) -> Option<nqvpn_proto::control::ExitReadiness> {
+        None
+    }
 }
 
 /// A task that must not outlive the future that spawned it. Dropping
@@ -297,6 +303,10 @@ pub async fn run_session(
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // What this connection has told the coordinator about exit
+            // readiness; a fresh connection (or a restarted coordinator)
+            // starts from nothing and is told again.
+            let mut reported_readiness = None;
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
@@ -315,6 +325,15 @@ pub async fn run_session(
                 hb.gen = gen;
                 hb.digest = digest;
                 write_msg(&mut tx, Kind::Heartbeat, &hb).await?;
+                // Exit readiness is its own kind, not a heartbeat field:
+                // appending to the heartbeat breaks every older peer.
+                let readiness = facts.exit_readiness();
+                if let Some(er) = readiness {
+                    if readiness != reported_readiness {
+                        write_msg(&mut tx, Kind::ExitReadiness, &er).await?;
+                        reported_readiness = readiness;
+                    }
+                }
             }
             #[allow(unreachable_code)]
             Ok::<_, nqvpn_proto::stream::StreamError>(())

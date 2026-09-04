@@ -146,7 +146,13 @@ pub fn wanted_routes(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet]) -> Vec
     // on the device, and a gateway's own LAN is the wire behind it. A
     // wider prefix that merely contains something of ours is fine — the
     // kernel prefers our more specific connected route for that part.
-    set.retain(|w| !mine.iter().any(|m| m.contains(w)));
+    //
+    // An internet exit owns the default (`0.0.0.0/0` / `::/0`), which
+    // "contains" every member prefix — but the default is the space
+    // *behind* us, not ours. Replies from the internet (and from our own
+    // address) to a member must still enter the tunnel, so the default
+    // never excludes anything.
+    set.retain(|w| !mine.iter().any(|m| m.prefix_len() > 0 && m.contains(w)));
     set.into_iter().collect()
 }
 
@@ -685,6 +691,24 @@ mod tests {
         let gw = wanted_routes(&view(), 9, &[net("10.99.0.4/32"), net("192.168.7.0/24")]);
         assert!(!gw.contains(&net("192.168.7.0/24")));
         assert!(gw.contains(&net("192.168.9.0/24")));
+    }
+
+    #[test]
+    fn an_internet_exit_owning_the_default_still_routes_every_member_into_the_tunnel() {
+        // The exit's own space is its address plus the default it fronts.
+        // The default contains every member prefix, yet replies from the
+        // internet (and from the exit itself) must re-enter the tunnel:
+        // without these routes the kernel sends them out the uplink.
+        let mine = [net("10.99.0.4/32"), net("0.0.0.0/0"), net("::/0")];
+        let w = wanted_routes(&view(), 9, &mine);
+        for p in ["10.99.0.0/16", "10.99.1.1/32", "10.99.1.2/32", "192.168.7.0/24", "192.168.9.0/24"] {
+            assert!(w.contains(&net(p)), "{p} must be routed into the tunnel on an internet exit");
+        }
+        assert!(!w.contains(&net("10.99.0.4/32")), "never my own host address");
+        // A real LAN of ours is still excluded; the default just never is.
+        let w = wanted_routes(&view(), 9, &[net("10.99.0.4/32"), net("192.168.7.0/24"), net("0.0.0.0/0")]);
+        assert!(!w.contains(&net("192.168.7.0/24")));
+        assert!(w.contains(&net("10.99.1.2/32")));
     }
 
     #[test]

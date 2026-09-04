@@ -138,6 +138,63 @@ async fn login_yields_a_session_cookie_that_authorizes() {
     assert_eq!(get(api.addr, "/api/v1/me", &[("Cookie", &cookie)]).await.status, 401, "cookie is dead after logout");
 }
 
+#[tokio::test]
+async fn an_internet_exit_is_a_capability_on_the_member_not_a_row_in_the_prefix_table() {
+    // The prefix table is the LAN active/standby view: one owner, the rest
+    // on standby. A default route is neither — every ready exit publishes
+    // it and clients choose among them — so listing it there would tell the
+    // operator the exact opposite of how exits behave. It belongs on the
+    // member row, as the internet_gateway flag.
+    let api = spawn().await;
+    let a = api.addr;
+    let net = r#"{"network_id":"acme","cidrs":["10.9.0.0/16"],"pools":{"default":{"cidr":"10.9.1.0/24"}},"settings":{}}"#;
+    assert_eq!(post(a, "/api/v1/networks", &bearer(), net).await.status, 200);
+    // Both must actually join: routes (the LAN and the internally granted
+    // default) are registered at join time, not at configuration time.
+    for (i, name) in ["exit-a", "exit-b"].iter().enumerate() {
+        let body = format!(
+            r#"{{"name":"{name}","role":"relay","relay_addr":"203.0.113.7:4444","local_cidrs":["192.168.1.0/24"],"internet_gateway":true}}"#
+        );
+        let create = post(a, "/api/v1/networks/acme/members", &bearer(), &body).await;
+        assert_eq!(create.status, 200);
+        let token = create.json()["token"].as_str().unwrap().to_string();
+        let secret = Token::parse(&token).unwrap().secret;
+        let k = [7u8 + i as u8; 32];
+        let join_body = format!(
+            r#"{{"secret":"{secret}","pubkey":"{}","cert_fingerprint":"sha256:{}"}}"#,
+            base64_std(&k),
+            hex::encode(k)
+        );
+        let j = post(a, "/api/v1/join", &[], &join_body).await;
+        assert_eq!(j.status, 200, "join body: {}", j.body);
+        // The default is granted internally, never as a typed CIDR.
+        let granted = j.json()["granted_cidrs"].as_array().cloned().unwrap_or_default();
+        assert!(granted.iter().any(|c| c == "0.0.0.0/0"), "{name} is granted the default by the flag");
+    }
+
+    let net = get(a, "/api/v1/networks/acme/status", &bearer()).await.json();
+
+    for row in net["prefix_table"].as_array().unwrap() {
+        let cidr = row["cidr"].as_str().unwrap();
+        assert!(cidr != "0.0.0.0/0" && cidr != "::/0", "a default must not be shown as an owned prefix, got {cidr}");
+    }
+    // The real LAN still is, with one owner and the other on standby.
+    assert!(
+        net["prefix_table"].as_array().unwrap().iter().any(|r| r["cidr"] == "192.168.1.0/24"),
+        "a genuine site prefix is still listed"
+    );
+    // Both exits carry the capability on their own row, neither as standby.
+    let members = net["members"].as_array().unwrap();
+    for name in ["exit-a", "exit-b"] {
+        let m = members.iter().find(|m| m["name"] == name).unwrap();
+        assert_eq!(m["internet_gateway"], true, "{name} is an exit on its own row");
+        assert!(
+            !m["registered_cidrs"].as_array().unwrap().iter().any(|c| c == "0.0.0.0/0" || c == "::/0"),
+            "{name} never surfaces the default as one of its CIDRs"
+        );
+    }
+}
+
 /// The whole operator lifecycle over HTTP, then a member actually
 /// joining with the token the API handed out.
 #[tokio::test]

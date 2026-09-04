@@ -377,6 +377,15 @@ pub fn status_of(ns: &crate::state::NetState, id: &str) -> NetworkStatus {
 
     let mut prefix_table = Vec::new();
     for (cidr, regs) in ns.registry.resolve_owners() {
+        // A default route is an internet-exit designation, not a site, and
+        // ownership of it is not exclusive: every ready exit publishes it,
+        // and clients pick among them. Showing it here would run it through
+        // the LAN active/standby lens and claim one owner with the rest on
+        // standby — the exact opposite of how exits are actually used. The
+        // member rows carry it as the `internet_gateway` pill instead.
+        if cidr.prefix_len() == 0 {
+            continue;
+        }
         let key = cidr.to_string();
         match ns.directory.owners.get(&key) {
             None => prefix_table.push(PrefixOwner {

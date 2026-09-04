@@ -316,8 +316,9 @@ pub struct Heartbeat {
 
 /// A designated internet-exit node's self-assessment of whether the host
 /// is configured to forward and masquerade VPN traffic to the internet.
-/// Checked on a slow timer and cached; the heartbeat carries the last
-/// value so the check never runs per-heartbeat.
+/// Checked on a slow timer and cached, then sent under its own
+/// `Kind::ExitReadiness` whenever it changes — never on the heartbeat,
+/// whose wire must not grow (see the note above).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitReadiness {
     /// `net.ipv4.ip_forward` (or the v6 equivalent) is enabled.

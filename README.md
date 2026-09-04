@@ -32,6 +32,7 @@ keeps running when the coordinator, or the path to it, is gone.
 | Hops between two clients | 2 (always via the hub) | 1 | 1 or 2, by table lookup |
 | Who learns your IP | the hub | every peer | **only your relay** |
 | Site-to-site (LAN behind a node) | hub is the gateway | every node routes | **any relay is a gateway; two of them fail over by age** |
+| Full-tunnel internet exit | the hub, if any | every node | **any relay, flagged and health-checked; clients prefer one and fall back** |
 | What breaks when the control plane is down | nothing… until keys expire | discovery, NAT punching | **nothing for 15 min; sessions live until credentials expire** |
 | Forwarding logic | trivial | complex | **one page** (§6 of DESIGN.md) |
 
@@ -115,7 +116,7 @@ sequenceDiagram
 
 ## What a member does when things go wrong
 
-Three rules, each with a chaos test behind it:
+Four rules, each with a chaos test behind it:
 
 1. **A valid member connects eventually.** As long as the coordinator is
    reachable, a member with a valid name and secret gets in: join and
@@ -143,12 +144,55 @@ Three rules, each with a chaos test behind it:
    lowest-RTT relay when it is not (or does not exist), and moves back on
    its own once the preferred relay answers again. Nothing ever waits for
    a relay that is not there.
+4. **So is a preferred exit.** With `--route-all --via <name>`, internet
+   traffic is sealed to that exit while it qualifies, to any other ready
+   exit when it does not — keeping the machine's internet rather than the
+   operator's preference — and back to the preferred one the moment it
+   returns. The choice is recomputed from the view on every reconcile, so
+   nothing is sticky and nothing needs a restart.
 
 And one guarantee for the clients of a relay that was replaced from another
 machine: the coordinator publishes the relay's new address and session
 certificate; every client attached to the old process sees its fleet entry
 change under it, drops the zombie even though it still answers, and
 re-attaches to the fleet as published.
+
+## Full-tunnel exit
+
+A relay can also be the fleet's way out to the internet. That is a
+**capability, not a prefix**: the operator sets `internet_gateway` on the
+member and the coordinator grants that relay `0.0.0.0/0` and `::/0`
+internally — typing a default route as a routed LAN is refused, with an
+error pointing at the flag. Several exits coexist; ownership of a default
+is never exclusive, so it is not an active/standby site prefix and is not
+shown as one.
+
+The grant alone does not make an exit. A designated relay self-checks its
+egress — IP forwarding on, and a masquerade rule covering its uplink — and
+reports the result to the coordinator on its own control message, so the
+default is published **only while that exit reports ready**. A relay whose
+host was never set up to NAT appears in the admin as an internet exit that
+is *not* ready, with the missing half named, and no client is ever routed
+through it. nqvpn never edits firewall rules or sysctls itself: it reports
+and refuses, because that state has no owner to clean it up.
+
+A client opts in with `--route-all`, which takes OpenVPN's `def1`
+approach — `0.0.0.0/1` + `128.0.0.0/1` (and `::/1` + `8000::/1`) laid
+*over* the real default route rather than replacing it — and pins the
+coordinator, every relay, and the system resolvers to the real gateway so
+the tunnel's own path is never swallowed by the tunnel. A family's halves
+are withheld unless it has both a pinned transport **and** a ready exit, so
+route-all cannot blackhole a machine, and the pins follow the default
+gateway if it moves.
+
+Teardown is symmetric. A clean exit restores the routing table exactly as
+it was; and because every tunnel route is bound to the TUN, a process
+killed outright loses them all the moment the kernel destroys the device.
+What survives is only host routes that duplicate the default route anyway.
+
+```sh
+nqvpn-client --token "nqv1.…" --route-all --via cloud-exit
+```
 
 ## What's in the box
 
@@ -157,7 +201,7 @@ re-attaches to the fleet as published.
 | `nqvpn-proto` | wire format, Noise IK sealing (two-phase replay window), credentials, the shared `Snapshot`/`Delta`/digest logic, the HTTPS join client |
 | `nqvpn-session` | "one task owns one connection": Hello, Refresh, probes, expiry |
 | `nqvpn-sync` | member side of the generation protocol + the reconciler driver |
-| `nqvpn-endpoint` | Noise engine, ingress filter, TUN, routes as a function of the view with local-LAN/underlay exclusion |
+| `nqvpn-endpoint` | Noise engine, ingress filter, TUN, routes as a function of the view with local-LAN/underlay exclusion, route-all's catch-all and underlay pins |
 | `nqvpn-relay` | one `RelayNet` per network (multi-tenant), the one-page forwarding rule, mesh dialers, hop guard, trace notes |
 | `nqvpn-client` | ~500 lines of wiring |
 | `nqvpn-coord` | networks and members in SQLite, join by token, leases, directory with generations and a delta ring, HTTPS API, embedded live admin UI |
@@ -243,10 +287,12 @@ built around breaking things:
   token regeneration, preferred-relay fallback and return, a byzantine
   relay that duplicates, corrupts and drops frames, a member reconfigured
   live from the coordinator (new address, a LAN added and withdrawn), a
-  relay with an `auto:` address, and a coordinator reloading everything
-  from its database — each asserting that traffic converges without anyone
-  restarting anything by hand, and that a kicked-out instance stops
-  instead of fighting back.
+  relay with an `auto:` address, an internet exit whose host stops
+  masquerading (the catch-all is withheld until it reports ready, and a
+  preferred exit lost mid-run is fallen back from and returned to), and a
+  coordinator reloading everything from its database — each asserting that
+  traffic converges without anyone restarting anything by hand, and that a
+  kicked-out instance stops instead of fighting back.
 
 ```sh
 cargo test                      # everything, ~2 minutes
@@ -271,5 +317,7 @@ cross toolchain for the other architecture).
 
 ## Status
 
-Linux and macOS clients and relays; Windows, DNS and full-tunnel exit nodes
-are not implemented. Apache-2.0.
+Linux and macOS clients and relays, including full-tunnel exit nodes
+(`--route-all`). Windows is not implemented, and DNS is never touched: a
+full-tunnel client keeps its own resolvers, which are pinned to the real
+gateway rather than pushed or captured. Apache-2.0.

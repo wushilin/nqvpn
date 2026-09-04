@@ -73,10 +73,6 @@ pub fn catch_all_halves(v6: bool) -> [IpNet; 2] {
     }
 }
 
-/// Which underlay hosts need pinning under route-all: those NOT already
-/// carried by a connected local route (a relay on the same LAN is reached
-/// by its own more-specific connected route, which already outranks the
-/// catch-all — pinning it via the gateway would be wrong).
 /// The resolvers this host uses, from `/etc/resolv.conf`.
 ///
 /// route-all does not take DNS over, so name resolution must keep working
@@ -161,6 +157,10 @@ pub fn reconcile_pins(
     ok
 }
 
+/// Which underlay hosts need pinning under route-all: those NOT already
+/// carried by a connected local route (a relay on the same LAN is reached
+/// by its own more-specific connected route, which already outranks the
+/// catch-all — pinning it via the gateway would be wrong).
 pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
     let s: BTreeSet<IpAddr> = underlay
         .iter()
@@ -177,10 +177,22 @@ pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
 /// client never seals traffic to a node that would only drop it.
 ///
 /// `via` is a **preference, not a pin**: the node of that name is used
-/// whenever it qualifies, and any other usable exit is taken when it does
+/// whenever it qualifies, and another usable exit is taken when it does
 /// not, because being on the operator's preferred exit matters less than
-/// having internet at all. Among the rest the lowest node id wins, so the
-/// fallback is deterministic when several advertise a default.
+/// having internet at all.
+///
+/// With no preference — or when the preferred one is unusable — the exit
+/// we are **already attached to** wins if it is one. Internet traffic then
+/// terminates on the relay holding our only session, crossing no mesh
+/// link at all, where any other exit costs a hop (§6). It is also the
+/// stablest choice: it changes only when our attachment does.
+///
+/// Deliberately not by ping. A probe measures the *underlay* path to an
+/// exit's transport, which is not the path this traffic takes (client →
+/// attached relay → mesh → exit), and RTT jitter would reshuffle the
+/// choice — while changing exits costs a fresh end-to-end handshake and a
+/// visible gap. Stability is worth more here than a few milliseconds.
+/// Failing all that, the lowest node id, so the choice is deterministic.
 ///
 /// Nothing here is sticky — this is recomputed from the view on every
 /// reconcile, so the preference is restored by itself the moment the
@@ -188,14 +200,14 @@ pub fn underlay_to_pin(underlay: &[IpAddr], local: &[IpNet]) -> Vec<IpAddr> {
 ///
 /// `None` means no usable exit for this family — the caller must withhold
 /// its catch-all so route-all cannot blackhole.
-pub fn exit_gateway(view: &Snapshot, via: Option<&str>, v6: bool) -> Option<NodeId> {
+pub fn exit_gateway(view: &Snapshot, via: Option<&str>, attached: Option<NodeId>, v6: bool) -> Option<NodeId> {
     let default: IpNet = if v6 { "::/0" } else { "0.0.0.0/0" }.parse().unwrap();
     let owns_default =
         |m: &nqvpn_proto::control::PeerInfo| m.online && m.prefixes.iter().any(|p| p.trunc() == default);
-    let preferred = via
-        .and_then(|name| view.members.iter().find(|m| m.name == name && owns_default(m)))
-        .map(|m| m.node_id);
-    preferred.or_else(|| view.members.iter().filter(|m| owns_default(m)).map(|m| m.node_id).min())
+    let usable = |id: NodeId| view.members.iter().any(|m| m.node_id == id && owns_default(m));
+    via.and_then(|name| view.members.iter().find(|m| m.name == name && owns_default(m)).map(|m| m.node_id))
+        .or_else(|| attached.filter(|id| usable(*id)))
+        .or_else(|| view.members.iter().filter(|m| owns_default(m)).map(|m| m.node_id).min())
 }
 
 /// The route-all decision for both families at once: which catch-all
@@ -213,11 +225,17 @@ pub struct RouteAllPlan {
     pub exits: Vec<(bool, NodeId)>,
 }
 
-pub fn route_all_plan(view: &Snapshot, via: Option<&str>, to_pin: &[IpAddr], pinned: &[IpAddr]) -> RouteAllPlan {
+pub fn route_all_plan(
+    view: &Snapshot,
+    via: Option<&str>,
+    attached: Option<NodeId>,
+    to_pin: &[IpAddr],
+    pinned: &[IpAddr],
+) -> RouteAllPlan {
     let pinned_ok = |v6: bool| to_pin.iter().filter(|ip| ip.is_ipv6() == v6).all(|ip| pinned.contains(ip));
     let mut plan = RouteAllPlan::default();
     for v6 in [false, true] {
-        if let (true, Some(node)) = (pinned_ok(v6), exit_gateway(view, via, v6)) {
+        if let (true, Some(node)) = (pinned_ok(v6), exit_gateway(view, via, attached, v6)) {
             plan.nets.extend(catch_all_halves(v6));
             plan.exits.push((v6, node));
         }
@@ -695,14 +713,14 @@ mod tests {
     #[test]
     fn exit_gateway_requires_an_online_owner_of_the_default() {
         let mut s = view(); // node 3 = "gw", a relay; no default owner yet
-        assert_eq!(exit_gateway(&s, None, false), None, "no default owner, no exit");
+        assert_eq!(exit_gateway(&s, None, None, false), None, "no default owner, no exit");
         // Make the relay front the v4 default: it becomes an internet exit.
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
-        assert_eq!(exit_gateway(&s, None, false), Some(3));
-        assert_eq!(exit_gateway(&s, None, true), None, "it owns no v6 default");
+        assert_eq!(exit_gateway(&s, None, None, false), Some(3));
+        assert_eq!(exit_gateway(&s, None, None, true), None, "it owns no v6 default");
         // An offline owner is not a candidate.
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = false;
-        assert_eq!(exit_gateway(&s, None, false), None, "offline exits do not count");
+        assert_eq!(exit_gateway(&s, None, None, false), None, "offline exits do not count");
     }
 
     #[test]
@@ -712,12 +730,33 @@ mod tests {
         for id in [2, 3] {
             s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.push(net("0.0.0.0/0"));
         }
-        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "the named exit wins over the lowest id");
-        assert_eq!(exit_gateway(&s, None, false), Some(2), "no name: lowest id, deterministically");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), Some(3), "the named exit wins over the lowest id");
+        assert_eq!(exit_gateway(&s, None, None, false), Some(2), "no name: lowest id, deterministically");
         // --via is a preference: a name that is not a usable exit falls back
         // to one that is, rather than leaving the client with no internet.
-        assert_eq!(exit_gateway(&s, Some("me"), false), Some(2), "a named non-owner falls back to a real exit");
-        assert_eq!(exit_gateway(&s, Some("nope"), false), Some(2), "an unknown name falls back too");
+        assert_eq!(exit_gateway(&s, Some("me"), None, false), Some(2), "a named non-owner falls back to a real exit");
+        assert_eq!(exit_gateway(&s, Some("nope"), None, false), Some(2), "an unknown name falls back too");
+    }
+
+    #[test]
+    fn with_no_preference_our_own_relay_is_the_exit_because_it_costs_no_mesh_hop() {
+        // Both 2 ("b") and 3 ("gw") are exits; 3 is the relay we hold our
+        // session to. Picking it means internet traffic terminates on the
+        // node we are already talking to — no mesh link — where node-id
+        // order would have sent it to 2 and paid a hop.
+        let mut s = view();
+        for id in [2, 3] {
+            s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.push(net("0.0.0.0/0"));
+        }
+        assert_eq!(exit_gateway(&s, None, Some(3), false), Some(3), "our own relay, no hop");
+        assert_eq!(exit_gateway(&s, None, None, false), Some(2), "unattached: lowest id, deterministic");
+        // An attachment to a relay that is not an exit changes nothing.
+        assert_eq!(exit_gateway(&s, None, Some(1), false), Some(2), "our relay is no exit: fall through");
+        // A named preference still outranks our own relay.
+        assert_eq!(exit_gateway(&s, Some("b"), Some(3), false), Some(2), "the operator's choice wins");
+        // And our relay is only preferred while it really is a usable exit.
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = false;
+        assert_eq!(exit_gateway(&s, None, Some(3), false), Some(2), "offline: not an exit, hop or not");
     }
 
     #[test]
@@ -729,27 +768,27 @@ mod tests {
         for id in [2, 3] {
             s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.push(net("0.0.0.0/0"));
         }
-        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "preferred while it qualifies");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), Some(3), "preferred while it qualifies");
 
         // It goes offline (the coordinator stops vouching for it).
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = false;
-        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(2), "falls back to the remaining exit");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), Some(2), "falls back to the remaining exit");
 
         // Its default is withdrawn instead (an exit that stopped being ready).
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().online = true;
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.retain(|p| p.prefix_len() != 0);
-        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(2), "owning no default is not an exit either");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), Some(2), "owning no default is not an exit either");
 
         // Back online and owning the default again: the preference returns
         // on its own, because the choice is recomputed, never remembered.
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
-        assert_eq!(exit_gateway(&s, Some("gw"), false), Some(3), "preference restores itself");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), Some(3), "preference restores itself");
 
         // With no exit at all the caller still gets None and withholds.
         for id in [2, 3] {
             s.members.iter_mut().find(|m| m.node_id == id).unwrap().prefixes.retain(|p| p.prefix_len() != 0);
         }
-        assert_eq!(exit_gateway(&s, Some("gw"), false), None, "no exits: nothing to fall back to");
+        assert_eq!(exit_gateway(&s, Some("gw"), None, false), None, "no exits: nothing to fall back to");
     }
 
     #[test]
@@ -758,22 +797,22 @@ mod tests {
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
         let to_pin = [ip("203.0.113.7")];
         // Pinned transport + an exit -> the v4 halves and that exit.
-        let p = route_all_plan(&s, Some("gw"), &to_pin, &to_pin);
+        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &to_pin);
         assert_eq!(p.nets, vec![net("0.0.0.0/1"), net("128.0.0.0/1")]);
         assert_eq!(p.exits, vec![(false, 3)]);
         // Transport not pinned -> nothing at all, even with an exit, so
         // route-all never severs the tunnel's own path.
-        let p = route_all_plan(&s, Some("gw"), &to_pin, &[]);
+        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &[]);
         assert_eq!(p, RouteAllPlan::default());
         // The preferred node is not a usable exit -> fall back to one that
         // is, rather than leaving the client with no internet at all.
-        let p = route_all_plan(&s, Some("nope"), &to_pin, &to_pin);
+        let p = route_all_plan(&s, Some("nope"), None, &to_pin, &to_pin);
         assert_eq!(p.exits, vec![(false, 3)], "--via is a preference, not a pin");
         // Nothing owns a default anywhere -> withheld (no blackhole).
-        let p = route_all_plan(&view(), Some("gw"), &to_pin, &to_pin);
+        let p = route_all_plan(&view(), Some("gw"), None, &to_pin, &to_pin);
         assert_eq!(p, RouteAllPlan::default());
         // v4 has an exit, v6 does not: only v4 activates.
-        let p = route_all_plan(&s, None, &to_pin, &to_pin);
+        let p = route_all_plan(&s, None, None, &to_pin, &to_pin);
         assert_eq!(p.exits, vec![(false, 3)], "the v6 family is left alone");
     }
 
@@ -907,7 +946,7 @@ mod tests {
         let mut pinned = BTreeMap::new();
         let ok = reconcile_pins(&t, &[ip("3.1.237.225")], &mut pinned);
         assert!(ok.is_empty() && pinned.is_empty());
-        let plan = route_all_plan(&view(), None, &[ip("3.1.237.225")], &ok);
+        let plan = route_all_plan(&view(), None, None, &[ip("3.1.237.225")], &ok);
         assert!(plan.nets.is_empty(), "an unpinned transport must never arm a catch-all");
     }
 

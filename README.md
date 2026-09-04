@@ -144,7 +144,7 @@ Four rules, each with a chaos test behind it:
    lowest-RTT relay when it is not (or does not exist), and moves back on
    its own once the preferred relay answers again. Nothing ever waits for
    a relay that is not there.
-4. **So is a preferred exit.** With `--route-all --via <name>`, internet
+4. **So is a preferred exit.** With `--route-all-via <name>`, internet
    traffic is sealed to that exit while it qualifies, to any other ready
    exit when it does not — keeping the machine's internet rather than the
    operator's preference — and back to the preferred one the moment it
@@ -176,7 +176,17 @@ is *not* ready, with the missing half named, and no client is ever routed
 through it. nqvpn never edits firewall rules or sysctls itself: it reports
 and refuses, because that state has no owner to clean it up.
 
-A client opts in with `--route-all`, which takes OpenVPN's `def1`
+A client opts in with `--route-all` — or `--route-all-via <name>`, which
+is the same thing plus a preferred exit, so the two are alternatives
+rather than flags to combine. With no preference the exit is the relay the
+client is **already attached to**, when that relay is one: internet
+traffic then terminates on the node holding its only session and crosses
+no mesh link, where any other exit costs a hop. Deliberately not by ping —
+a probe measures the underlay path to an exit, not the path the traffic
+takes, and RTT jitter would reshuffle a choice whose every change costs a
+fresh end-to-end handshake.
+
+Either way it takes OpenVPN's `def1`
 approach — `0.0.0.0/1` + `128.0.0.0/1` (and `::/1` + `8000::/1`) laid
 *over* the real default route rather than replacing it — and pins the
 coordinator, every relay, and the system resolvers to the real gateway so
@@ -191,7 +201,8 @@ killed outright loses them all the moment the kernel destroys the device.
 What survives is only host routes that duplicate the default route anyway.
 
 ```sh
-nqvpn-client --token "nqv1.…" --route-all --via cloud-exit
+nqvpn-client --token "nqv1.…" --route-all                  # nearest ready exit
+nqvpn-client --token "nqv1.…" --route-all-via cloud-exit   # prefer this one
 ```
 
 ## What's in the box

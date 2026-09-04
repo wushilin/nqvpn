@@ -517,7 +517,11 @@ impl Client {
                 tracing::warn!("route-all: pinning underlay failed: {e:#}");
                 Vec::new()
             });
-            let plan = nqvpn_endpoint::routes::route_all_plan(view, c.via.as_deref(), &to_pin, &pinned);
+            // With no usable preference, the relay we already hold a session
+            // to is the best exit there is: no mesh hop, and it moves only
+            // when our attachment does.
+            let attached_relay = c.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id);
+            let plan = nqvpn_endpoint::routes::route_all_plan(view, c.via.as_deref(), attached_relay, &to_pin, &pinned);
             if plan.nets.is_empty() {
                 tracing::warn!(
                     via = ?c.via,

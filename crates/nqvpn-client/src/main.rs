@@ -34,19 +34,23 @@ struct Cli {
     token: Option<String>,
     /// Send ALL traffic through the tunnel (like OpenVPN's redirect-gateway):
     /// installs the 0.0.0.0/1 + 128.0.0.0/1 (and ::/1 + 8000::/1) default
-    /// override and pins the coordinator/relay transport to the real
-    /// gateway so it is not captured. DNS is not changed.
-    #[arg(long)]
+    /// override and pins the coordinator/relay transport and the system
+    /// resolvers to the real gateway so they are not captured. DNS is not
+    /// changed. The exit is whichever ready one needs no extra hop — the
+    /// relay we are attached to, if it is one — else the lowest node id.
+    /// Use --route-all-via to name one instead.
+    #[arg(long, conflicts_with = "route_all_via")]
     route_all: bool,
-    /// With route-all, prefer this exit gateway by member name (a node that
-    /// fronts 0.0.0.0/0 / ::/0 and masquerades). Implies --route-all. This
-    /// is a preference, not a pin: if that node is offline or stops
-    /// advertising a default, another exit is used until it returns, and
-    /// the preference is restored on its own. Without it, route-all uses
-    /// whichever online node advertises a default (lowest id). Only affects
-    /// the exit choice; which relay carries the traffic is picked normally.
-    #[arg(long)]
-    via: Option<String>,
+    /// Route-all, out through this exit gateway by member name (a node that
+    /// fronts 0.0.0.0/0 / ::/0 and masquerades). This is the whole of
+    /// --route-all plus a preference, so the two are alternatives.
+    ///
+    /// A preference, not a pin: if that node goes offline or stops
+    /// advertising a default, another ready exit is used until it returns,
+    /// and the preference is restored on its own. Only affects the exit
+    /// choice; which relay carries the traffic is picked normally.
+    #[arg(long, visible_alias = "via")]
+    route_all_via: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -127,8 +131,9 @@ async fn run(cli: Cli) -> Result<i32> {
 
     // --via names an exit; it is meaningless without the catch-all, so it
     // turns route-all on.
-    let route_all = cli.route_all || cli.via.is_some();
-    let client = Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, route_all, cli.via.clone());
+    let route_all = cli.route_all || cli.route_all_via.is_some();
+    let client =
+        Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, route_all, cli.route_all_via.clone());
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
         use std::net::ToSocketAddrs;
         if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {

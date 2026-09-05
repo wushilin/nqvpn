@@ -20,9 +20,11 @@ pub enum ErrorCode {
     PrefixConflict,
     /// The requested address is assigned to someone else.
     AddressInUse,
-    /// The pool has no free address of that family.
+    /// The network CIDR has no free address of that family.
+    AddressSpaceExhausted,
+    /// Legacy pre-unification code, retained for wire compatibility.
     PoolExhausted,
-    /// No such pool in this network.
+    /// Legacy pre-unification code, retained for wire compatibility.
     UnknownPool,
     /// The coordinator cannot dial the relay address being advertised,
     /// and this network requires relays to be dialable (§3.2).
@@ -51,6 +53,7 @@ impl ErrorCode {
             ErrorCode::ClientDisabled => "client_disabled",
             ErrorCode::PrefixConflict => "prefix_conflict",
             ErrorCode::AddressInUse => "address_in_use",
+            ErrorCode::AddressSpaceExhausted => "address_space_exhausted",
             ErrorCode::PoolExhausted => "pool_exhausted",
             ErrorCode::UnknownPool => "unknown_pool",
             ErrorCode::RelayUnreachable => "relay_unreachable",
@@ -71,6 +74,7 @@ impl ErrorCode {
             "client_disabled" => ErrorCode::ClientDisabled,
             "prefix_conflict" => ErrorCode::PrefixConflict,
             "address_in_use" => ErrorCode::AddressInUse,
+            "address_space_exhausted" => ErrorCode::AddressSpaceExhausted,
             "pool_exhausted" => ErrorCode::PoolExhausted,
             "unknown_pool" => ErrorCode::UnknownPool,
             "relay_unreachable" => ErrorCode::RelayUnreachable,
@@ -110,7 +114,8 @@ impl ErrorCode {
             ErrorCode::ClientDisabled => "an admin disabled this member; enable it to rejoin",
             ErrorCode::PrefixConflict => "the requested CIDR is not allowed here, or another member owns it",
             ErrorCode::AddressInUse => "that address is assigned elsewhere; release it or pick another",
-            ErrorCode::PoolExhausted => "the address pool is full; widen it or free addresses",
+            ErrorCode::AddressSpaceExhausted => "the network address range is full; widen it or free addresses",
+            ErrorCode::PoolExhausted => "the address range is full; widen it or free addresses",
             ErrorCode::UnknownPool => "no such pool in this network's config",
             ErrorCode::RelayUnreachable => "nothing answered on the advertised relay_addr; check the firewall and the address",
             ErrorCode::BadRequest => "the request contradicts this member's configuration",
@@ -140,6 +145,7 @@ mod tests {
         ErrorCode::ClientDisabled,
         ErrorCode::PrefixConflict,
         ErrorCode::AddressInUse,
+        ErrorCode::AddressSpaceExhausted,
         ErrorCode::PoolExhausted,
         ErrorCode::UnknownPool,
         ErrorCode::RelayUnreachable,

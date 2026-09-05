@@ -246,11 +246,20 @@ pub fn route_all_plan(
 /// Routes the view says this node should have, before local exclusion.
 pub fn wanted_routes(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet]) -> Vec<IpNet> {
     let mut set: BTreeSet<IpNet> = view.reserved_prefixes.iter().map(|p| p.trunc()).collect();
+    let covers: Vec<IpNet> = set.iter().copied().collect();
     for m in &view.members {
         if m.node_id == my_node_id {
             continue;
         }
-        set.extend(m.prefixes.iter().map(|p| p.trunc()));
+        // Member /32 and /128 prefixes remain in the in-tunnel LPM table
+        // so packets select the right peer, but every member address is
+        // now inside a reserved network CIDR. The host routing table needs
+        // only that covering CIDR, not one route per member.
+        for prefix in m.prefixes.iter().map(|p| p.trunc()) {
+            if !covers.iter().any(|cover| cover.contains(&prefix)) {
+                set.insert(prefix);
+            }
+        }
     }
     // Never route our own space into the tunnel: our host addresses live
     // on the device, and a gateway's own LAN is the wire behind it. A
@@ -839,7 +848,7 @@ mod tests {
         let w = wanted_routes(&view(), 1, &[net("10.99.1.1/32")]);
         assert!(w.contains(&net("10.99.0.0/16")), "covering tunnel route");
         assert!(w.contains(&net("192.168.9.0/24")), "a reserved but unowned site stays blackholed into the tunnel");
-        assert!(w.contains(&net("10.99.1.2/32")));
+        assert!(!w.contains(&net("10.99.1.2/32")), "the covering tunnel CIDR makes per-member OS routes redundant");
         assert!(!w.contains(&net("10.99.1.1/32")), "never my own host address");
         // A gateway never routes its own LAN into the tunnel, even when
         // another node currently owns it.
@@ -980,14 +989,15 @@ mod tests {
         // without these routes the kernel sends them out the uplink.
         let mine = [net("10.99.0.4/32"), net("0.0.0.0/0"), net("::/0")];
         let w = wanted_routes(&view(), 9, &mine);
-        for p in ["10.99.0.0/16", "10.99.1.1/32", "10.99.1.2/32", "192.168.7.0/24", "192.168.9.0/24"] {
+        for p in ["10.99.0.0/16", "192.168.7.0/24", "192.168.9.0/24"] {
             assert!(w.contains(&net(p)), "{p} must be routed into the tunnel on an internet exit");
         }
+        assert!(!w.contains(&net("10.99.1.1/32")) && !w.contains(&net("10.99.1.2/32")), "member host routes are covered by tunnel CIDR");
         assert!(!w.contains(&net("10.99.0.4/32")), "never my own host address");
         // A real LAN of ours is still excluded; the default just never is.
         let w = wanted_routes(&view(), 9, &[net("10.99.0.4/32"), net("192.168.7.0/24"), net("0.0.0.0/0")]);
         assert!(!w.contains(&net("192.168.7.0/24")));
-        assert!(w.contains(&net("10.99.1.2/32")));
+        assert!(w.contains(&net("10.99.0.0/16")));
     }
 
     #[test]

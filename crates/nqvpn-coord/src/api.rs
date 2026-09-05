@@ -310,8 +310,8 @@ async fn network_config(
         .collect();
     Ok(Json(serde_json::json!({
         "network_id": c.network_id,
-        "cidrs": c.cidrs,
-        "pools": c.pools,
+        "ipv4_cidr": c.ipv4_cidr(),
+        "ipv6_cidr": c.ipv6_cidr(),
         "settings": c.settings,
         "members": members,
     })))

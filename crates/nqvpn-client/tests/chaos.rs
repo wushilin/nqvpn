@@ -1175,19 +1175,17 @@ async fn editing_a_member_at_the_coordinator_reconfigures_it_live() -> Result<()
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
     let old_ip = a.ip4();
 
-    // A new address for a, outside the tunnel cidrs even. The
-    // coordinator tells a to re-join; a applies it to its device, and
-    // everyone routes the new host prefix.
-    let new_ip: Ipv4Addr = "172.20.0.7".parse().unwrap();
+    // A new static address for a, inside the network CIDR. The
+    // coordinator tells a to re-join and apply it, while every endpoint
+    // keeps only the single covering network route in its OS table.
+    let new_ip: Ipv4Addr = "10.99.0.7".parse().unwrap();
     w.coord().configure("c10", |s| s.preferred_ip4 = Some(new_ip));
     wait_until("a carries its new address", Duration::from_secs(15), || a.ip4() == new_ip).await?;
     assert_eq!(a.tun.addresses(), vec![ipnet::IpNet::from(ipnet::Ipv4Net::new(new_ip, 32).unwrap())]);
-    wait_until("b routes a's new address", Duration::from_secs(15), || {
-        b.routes.installed().iter().any(|n| n.to_string() == "172.20.0.7/32")
-    })
-    .await?;
+    assert!(b.routes.installed().iter().any(|n| n.to_string() == "10.99.0.0/16"));
+    assert!(!b.routes.installed().iter().any(|n| n.to_string() == "10.99.0.7/32"), "the covering CIDR replaces per-member OS routes");
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
-    assert!(!b.routes.installed().iter().any(|n| n.to_string() == format!("{old_ip}/32")), "the old address is gone");
+    assert!(!b.routes.installed().iter().any(|n| n.to_string() == format!("{old_ip}/32")), "member host routes are never needed");
 
     // The relay starts fronting a LAN: every client learns the route.
     w.coord().configure("r1", |s| s.local_cidrs = vec!["100.64.77.0/24".parse().unwrap()]);

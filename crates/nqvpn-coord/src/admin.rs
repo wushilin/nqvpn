@@ -9,9 +9,9 @@ use nqvpn_proto::token::Token;
 use nqvpn_proto::types::{NodeId, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::config::{validate_network, MemberCfg, NetworkConfig, PoolCfg, SettingsCfg};
+use crate::config::{validate_network, MemberCfg, NetworkConfig, SettingsCfg};
 use crate::error::ApiError;
 use crate::registry::Registry;
 use crate::secrets::generate_secret;
@@ -21,9 +21,9 @@ use crate::state::{now_unix, AppState, NetState};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSpec {
     pub network_id: String,
-    pub cidrs: Vec<IpNet>,
+    pub ipv4_cidr: ipnet::Ipv4Net,
     #[serde(default)]
-    pub pools: BTreeMap<String, PoolCfg>,
+    pub ipv6_cidr: Option<ipnet::Ipv6Net>,
     #[serde(default)]
     pub settings: SettingsCfg,
 }
@@ -41,8 +41,6 @@ pub struct MemberSpec {
     #[serde(default)]
     pub preferred_ip6: Option<Ipv6Addr>,
     #[serde(default)]
-    pub pool: Option<String>,
-    #[serde(default)]
     pub want_vpn_ip: Option<bool>,
     #[serde(default)]
     pub max_session_mbps: Option<u32>,
@@ -59,7 +57,6 @@ impl MemberSpec {
         m.local_cidrs = self.local_cidrs.clone();
         m.preferred_ip4 = self.preferred_ip4;
         m.preferred_ip6 = self.preferred_ip6;
-        m.pool = self.pool.clone();
         m.want_vpn_ip = self.want_vpn_ip;
         m.max_session_mbps = self.max_session_mbps;
         m.preferred_relay = self.preferred_relay.clone();
@@ -72,7 +69,6 @@ impl MemberSpec {
             local_cidrs: m.local_cidrs.clone(),
             preferred_ip4: m.preferred_ip4,
             preferred_ip6: m.preferred_ip6,
-            pool: m.pool.clone(),
             want_vpn_ip: m.want_vpn_ip,
             max_session_mbps: m.max_session_mbps,
             preferred_relay: m.preferred_relay.clone(),
@@ -83,6 +79,37 @@ impl MemberSpec {
 
 fn invalid(e: anyhow::Error) -> ApiError {
     ApiError::bad_request(format!("{e:#}"))
+}
+
+/// Validate configuration against durable assignments too. This keeps a
+/// network edit from moving the address space out from under existing
+/// members, and makes a static reservation conflict visible when it is
+/// configured rather than later when the member tries to join.
+fn validate_assignments(cfg: &NetworkConfig, reg: &Registry) -> Result<(), ApiError> {
+    for rec in reg.members.values() {
+        for ip in [rec.ip4.map(IpAddr::V4), rec.ip6.map(IpAddr::V6)].into_iter().flatten() {
+            if !cfg.cidrs.iter().any(|c| c.contains(&ip)) {
+                return Err(ApiError::bad_request(format!(
+                    "member {} currently holds {ip}, outside the proposed tunnel CIDRs",
+                    rec.name
+                )));
+            }
+        }
+    }
+    for (name, m, _) in cfg.members() {
+        for ip in [m.preferred_ip4.map(IpAddr::V4), m.preferred_ip6.map(IpAddr::V6)].into_iter().flatten() {
+            if let Some(owner) = reg.members.values().find(|r| {
+                r.name.as_str() != name.as_str()
+                    && (r.ip4.map(IpAddr::V4) == Some(ip) || r.ip6.map(IpAddr::V6) == Some(ip))
+            }) {
+                return Err(ApiError::address_in_use(format!(
+                    "static address {ip} for {name} is currently assigned to {}",
+                    owner.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn valid_name(name: &str) -> Result<(), ApiError> {
@@ -117,8 +144,9 @@ impl AppState {
         }
         let mut cfg = NetworkConfig {
             network_id: spec.network_id.clone(),
-            cidrs: spec.cidrs,
-            pools: spec.pools,
+            cidrs: std::iter::once(IpNet::V4(spec.ipv4_cidr))
+                .chain(spec.ipv6_cidr.map(IpNet::V6))
+                .collect(),
             settings: spec.settings,
             relays: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -135,17 +163,19 @@ impl AppState {
         Ok(())
     }
 
-    /// Replace a network's address space, pools and settings; members
+    /// Replace a network's IPv4/IPv6 ranges and settings; members
     /// are untouched. Settings every member holds (MTU, transport,
     /// lanes, heartbeat) make everyone re-join.
     pub fn update_network(&self, id: &str, spec: NetworkSpec) -> Result<(), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
         let mut ns = net.lock().unwrap();
         let mut cfg = ns.cfg.clone();
-        cfg.cidrs = spec.cidrs;
-        cfg.pools = spec.pools;
+        cfg.cidrs = std::iter::once(IpNet::V4(spec.ipv4_cidr))
+            .chain(spec.ipv6_cidr.map(IpNet::V6))
+            .collect();
         cfg.settings = spec.settings;
         validate_network(&mut cfg).map_err(invalid)?;
+        validate_assignments(&cfg, &ns.registry)?;
         let s_old = &ns.cfg.settings;
         let s_new = &cfg.settings;
         let everyone = s_old.mtu != s_new.mtu
@@ -202,6 +232,7 @@ impl AppState {
         let mut cfg = ns.cfg.clone();
         cfg.insert_member(name, role, m);
         validate_network(&mut cfg).map_err(invalid)?;
+        validate_assignments(&cfg, &ns.registry)?;
         ns.cfg = cfg;
         ns.save_config()?;
         ns.notify();
@@ -218,6 +249,7 @@ impl AppState {
         let (m, _) = cfg.member_by_name_mut(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         spec.apply(m);
         validate_network(&mut cfg).map_err(invalid)?;
+        validate_assignments(&cfg, &ns.registry)?;
         let changed = changed_members(&ns.cfg, &cfg);
         ns.cfg = cfg;
         ns.save_config()?;
@@ -339,6 +371,7 @@ impl AppState {
             match self.net(&id) {
                 Some(net) => {
                     let mut ns = net.lock().unwrap();
+                    validate_assignments(&cfg, &ns.registry)?;
                     let changed = changed_members(&ns.cfg, &cfg);
                     ns.cfg = cfg;
                     ns.save_config()?;
@@ -356,6 +389,7 @@ impl AppState {
                         .load_registry(&id)
                         .map_err(|e| ApiError::internal(format!("{e:#}")))?
                         .unwrap_or_else(Registry::new);
+                    validate_assignments(&cfg, &registry)?;
                     self.db
                         .save_network_and_registry(&cfg, &registry)
                         .map_err(|e| ApiError::internal(format!("saving network: {e:#}")))?;
@@ -377,7 +411,6 @@ impl MemberCfg {
             && self.local_cidrs == other.local_cidrs
             && self.preferred_ip4 == other.preferred_ip4
             && self.preferred_ip6 == other.preferred_ip6
-            && self.pool == other.pool
             && self.want_vpn_ip == other.want_vpn_ip
             && self.max_session_mbps == other.max_session_mbps
             && self.preferred_relay == other.preferred_relay
@@ -387,3 +420,38 @@ impl MemberCfg {
 
 #[allow(dead_code)]
 fn _ns_type_check(_: &NetState) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "network_id": "n1",
+            "ipv4_cidr": "10.99.0.0/16",
+            "ipv6_cidr": "fd99::/64",
+            "clients": { "a": {}, "b": {} },
+            "relays": {},
+            "settings": {}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn network_edits_cannot_orphan_durable_assignments() {
+        let mut c = cfg();
+        let mut r = Registry::new();
+        r.member_mut(1, "a", Role::Client, 1).ip4 = Some("10.99.1.7".parse().unwrap());
+        c.cidrs = vec!["10.100.0.0/16".parse().unwrap()];
+        assert!(validate_assignments(&c, &r).unwrap_err().message.contains("outside"));
+    }
+
+    #[test]
+    fn a_static_reservation_cannot_take_an_existing_dynamic_address() {
+        let mut c = cfg();
+        let mut r = Registry::new();
+        r.member_mut(1, "a", Role::Client, 1).ip4 = Some("10.99.1.7".parse().unwrap());
+        c.clients.get_mut("b").unwrap().preferred_ip4 = Some("10.99.1.7".parse().unwrap());
+        assert!(validate_assignments(&c, &r).unwrap_err().message.contains("currently assigned"));
+    }
+}

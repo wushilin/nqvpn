@@ -118,28 +118,96 @@ fn default_join_rate() -> u32 {
 
 // ---- per-network ----
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub network_id: String,
     /// Tunnel address space: what auto-allocation draws from and what
-    /// every member routes into the tunnel. Configured addresses may
-    /// lie outside it; they are routed as host prefixes.
+    /// every member routes into the tunnel. Every configured and
+    /// dynamically allocated member address must lie inside one of these
+    /// CIDRs, so hosts need only the covering network routes.
     pub cidrs: Vec<IpNet>,
-    #[serde(default)]
-    pub pools: BTreeMap<String, PoolCfg>,
-    #[serde(default)]
     pub settings: SettingsCfg,
-    #[serde(default)]
     pub relays: BTreeMap<String, MemberCfg>,
-    #[serde(default)]
     pub clients: BTreeMap<String, MemberCfg>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkConfigWire {
+    network_id: String,
+    #[serde(default)]
+    ipv4_cidr: Option<ipnet::Ipv4Net>,
+    #[serde(default)]
+    ipv6_cidr: Option<ipnet::Ipv6Net>,
+    /// Pre-unification storage format.
+    #[serde(default)]
+    cidrs: Vec<IpNet>,
+    /// Pre-unification allocation ranges; deliberately discarded.
+    #[serde(default)]
+    #[serde(rename = "pools")]
+    _legacy_pools: BTreeMap<String, PoolCfg>,
+    #[serde(default)]
+    settings: SettingsCfg,
+    #[serde(default)]
+    relays: BTreeMap<String, MemberCfg>,
+    #[serde(default)]
+    clients: BTreeMap<String, MemberCfg>,
+}
+
+impl<'de> Deserialize<'de> for NetworkConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let wire = NetworkConfigWire::deserialize(deserializer)?;
+        if (!wire.cidrs.is_empty()) && (wire.ipv4_cidr.is_some() || wire.ipv6_cidr.is_some()) {
+            return Err(serde::de::Error::custom("use ipv4_cidr/ipv6_cidr or legacy cidrs, not both"));
+        }
+        let cidrs = if wire.ipv4_cidr.is_some() || wire.ipv6_cidr.is_some() {
+            wire
+                .ipv4_cidr
+                .map(IpNet::V4)
+                .into_iter()
+                .chain(wire.ipv6_cidr.map(IpNet::V6))
+                .collect()
+        } else {
+            wire.cidrs
+        };
+        Ok(NetworkConfig {
+            network_id: wire.network_id,
+            cidrs,
+            settings: wire.settings,
+            relays: wire.relays,
+            clients: wire.clients,
+        })
+    }
+}
+
+impl Serialize for NetworkConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            network_id: &'a str,
+            ipv4_cidr: ipnet::Ipv4Net,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ipv6_cidr: Option<ipnet::Ipv6Net>,
+            settings: &'a SettingsCfg,
+            relays: &'a BTreeMap<String, MemberCfg>,
+            clients: &'a BTreeMap<String, MemberCfg>,
+        }
+        Wire {
+            network_id: &self.network_id,
+            ipv4_cidr: self.ipv4_cidr(),
+            ipv6_cidr: self.ipv6_cidr(),
+            settings: &self.settings,
+            relays: &self.relays,
+            clients: &self.clients,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PoolCfg {
-    pub cidr: IpNet,
+struct PoolCfg {
+    cidr: IpNet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,9 +336,11 @@ pub struct MemberCfg {
     pub preferred_ip4: Option<Ipv4Addr>,
     #[serde(default)]
     pub preferred_ip6: Option<Ipv6Addr>,
-    /// Pin auto-allocation to this pool.
-    #[serde(default)]
-    pub pool: Option<String>,
+    /// Legacy named-pool pin. Accepted while reading an old database,
+    /// ignored, and omitted when the network is saved again.
+    #[serde(default, skip_serializing)]
+    #[serde(rename = "pool")]
+    pub _legacy_pool: Option<String>,
     /// Default true; false is a headless member (relays: pure forwarder).
     #[serde(default)]
     pub want_vpn_ip: Option<bool>,
@@ -282,6 +352,17 @@ pub struct MemberCfg {
 }
 
 impl NetworkConfig {
+    pub fn ipv4_cidr(&self) -> ipnet::Ipv4Net {
+        self.cidrs
+            .iter()
+            .find_map(|c| match c { IpNet::V4(v) => Some(*v), _ => None })
+            .expect("validated networks always have an IPv4 CIDR")
+    }
+
+    pub fn ipv6_cidr(&self) -> Option<ipnet::Ipv6Net> {
+        self.cidrs.iter().find_map(|c| match c { IpNet::V6(v) => Some(*v), _ => None })
+    }
+
     pub fn member_by_name(&self, name: &str) -> Option<(&MemberCfg, Role)> {
         self.clients
             .get(name)
@@ -337,6 +418,9 @@ pub fn load_coord_config(path: &Path) -> Result<CoordConfig> {
 /// masked off to the network address (`172.26.0.0/20`) here, before any
 /// overlap check runs against it.
 pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
+    for c in &mut cfg.cidrs {
+        *c = c.trunc();
+    }
     for m in cfg.relays.values_mut() {
         for c in m.local_cidrs.iter_mut() {
             *c = c.trunc();
@@ -374,33 +458,13 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
             s.restart_grace_secs
         );
     }
-    if cfg.cidrs.is_empty() {
-        bail!("network {}: cidrs must not be empty", cfg.network_id);
+    let v4_count = cfg.cidrs.iter().filter(|c| matches!(c, IpNet::V4(_))).count();
+    let v6_count = cfg.cidrs.iter().filter(|c| matches!(c, IpNet::V6(_))).count();
+    if v4_count != 1 {
+        bail!("network {}: exactly one IPv4 CIDR is required", cfg.network_id);
     }
-    if !cfg.cidrs.iter().any(|c| matches!(c, IpNet::V4(_))) {
-        bail!("network {}: at least one IPv4 tunnel cidr is required", cfg.network_id);
-    }
-    for (i, a) in cfg.cidrs.iter().enumerate() {
-        for b in cfg.cidrs.iter().skip(i + 1) {
-            if overlaps(a, b) {
-                bail!("network cidrs overlap: {a} vs {b}");
-            }
-        }
-    }
-    // Pools: inside a network cidr (the whole pool, not just its first
-    // address), pairwise disjoint.
-    let pools: Vec<(&String, &PoolCfg)> = cfg.pools.iter().collect();
-    for (name, p) in &pools {
-        if !cfg.cidrs.iter().any(|c| c.contains(&p.cidr)) {
-            bail!("pool {name}: {} is not inside any network cidr", p.cidr);
-        }
-    }
-    for (i, (an, a)) in pools.iter().enumerate() {
-        for (bn, b) in pools.iter().skip(i + 1) {
-            if overlaps(&a.cidr, &b.cidr) {
-                bail!("pools {an} and {bn} overlap ({} vs {})", a.cidr, b.cidr);
-            }
-        }
+    if v6_count > 1 {
+        bail!("network {}: at most one IPv6 CIDR is allowed", cfg.network_id);
     }
     for name in cfg.clients.keys() {
         if cfg.relays.contains_key(name) {
@@ -467,21 +531,20 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
                 }
             }
         }
-        if let Some(pool) = &m.pool {
-            if !cfg.pools.contains_key(pool) {
-                bail!("member {name}: unknown pool {pool:?}");
-            }
-        }
         if let Some(p) = &m.preferred_relay {
             if !cfg.relays.contains_key(p) {
                 bail!("member {name}: preferred relay {p:?} is not a relay of this network");
             }
         }
-        // Addresses need not lie inside the tunnel cidrs (they are
-        // routed as host prefixes); they must be unique and routable.
+        // Member addresses are always part of the tunnel address space.
+        // Besides making the model unsurprising, this lets endpoints
+        // install one covering CIDR instead of a route per member.
         if let Some(ip) = m.preferred_ip4 {
             if unroutable(IpAddr::V4(ip)) {
                 bail!("member {name}: preferred_ip4 {ip} is not a usable address");
+            }
+            if !cfg.cidrs.iter().any(|c| c.contains(&IpAddr::V4(ip))) {
+                bail!("member {name}: preferred_ip4 {ip} is outside this network's tunnel CIDRs");
             }
             if let Some(prev) = seen4.insert(ip, name.clone()) {
                 bail!("preferred_ip4 {ip} claimed by both {prev} and {name}");
@@ -490,6 +553,9 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
         if let Some(ip) = m.preferred_ip6 {
             if unroutable(IpAddr::V6(ip)) {
                 bail!("member {name}: preferred_ip6 {ip} is not a usable address");
+            }
+            if !cfg.cidrs.iter().any(|c| c.contains(&IpAddr::V6(ip))) {
+                bail!("member {name}: preferred_ip6 {ip} is outside this network's tunnel CIDRs");
             }
             if let Some(prev) = seen6.insert(ip, name.clone()) {
                 bail!("preferred_ip6 {ip} claimed by both {prev} and {name}");
@@ -615,9 +681,8 @@ mod tests {
     fn base() -> String {
         r#"
 network_id = "n1"
-cidrs = ["10.99.0.0/16", "fd99::/64"]
-[pools.default]
-cidr = "10.99.1.0/24"
+ipv4_cidr = "10.99.0.0/16"
+ipv6_cidr = "fd99::/64"
 [relays.r1]
 secret = "s"
 relay_addr = "1.2.3.4:4444"
@@ -625,7 +690,6 @@ local_cidrs = ["192.168.1.0/24"]
 preferred_ip4 = "10.99.0.1"
 [clients.c1]
 secret = "s"
-pool = "default"
 "#
         .to_string()
     }
@@ -645,19 +709,35 @@ pool = "default"
     }
 
     #[test]
-    fn pool_must_be_entirely_inside_a_cidr() {
-        assert!(validate_network(&mut parse(&base().replace("10.99.1.0/24", "10.200.0.0/24"))).is_err());
-        // Larger than its network: the old check only looked at the
-        // first address and let the allocator hand out tunnel-space
-        // addresses that were outside every route.
-        assert!(validate_network(&mut parse(&base().replace("10.99.1.0/24", "10.0.0.0/8"))).is_err());
+    fn exactly_one_ipv4_and_at_most_one_ipv6_cidr_are_allowed() {
+        assert!(validate_network(&mut parse(&base().replace(
+            "ipv4_cidr = \"10.99.0.0/16\"\nipv6_cidr = \"fd99::/64\"",
+            "ipv6_cidr = \"fd99::/64\""
+        )))
+        .is_err());
+        assert!(validate_network(&mut parse(&base().replace(
+            "ipv4_cidr = \"10.99.0.0/16\"\nipv6_cidr = \"fd99::/64\"",
+            "cidrs = [\"10.99.0.0/16\", \"10.100.0.0/16\", \"fd99::/64\"]"
+        )))
+        .is_err());
+        assert!(validate_network(&mut parse(&base().replace(
+            "ipv4_cidr = \"10.99.0.0/16\"\nipv6_cidr = \"fd99::/64\"",
+            "cidrs = [\"10.99.0.0/16\", \"fd99::/64\", \"fd98::/64\"]"
+        )))
+        .is_err());
     }
 
     #[test]
-    fn overlapping_pools_fail() {
-        let mut s = base();
-        s.push_str("[pools.other]\ncidr = \"10.99.1.128/25\"\n");
-        assert!(validate_network(&mut parse(&s)).is_err());
+    fn legacy_pools_and_member_pins_are_accepted_but_not_saved() {
+        let mut s = base().replace(
+            "ipv4_cidr = \"10.99.0.0/16\"\nipv6_cidr = \"fd99::/64\"",
+            "cidrs = [\"10.99.0.0/16\", \"fd99::/64\"]",
+        );
+        s.push_str("[pools.old]\ncidr = \"10.99.1.0/24\"\n[clients.old]\npool = \"old\"\n");
+        let mut cfg = parse(&s);
+        validate_network(&mut cfg).unwrap();
+        let saved = serde_json::to_string(&cfg).unwrap();
+        assert!(!saved.contains("pools") && !saved.contains("pool"));
     }
 
     #[test]
@@ -714,13 +794,13 @@ pool = "default"
     }
 
     #[test]
-    fn addresses_may_lie_outside_the_tunnel_cidrs_but_must_be_usable_and_unique() {
-        validate_network(&mut parse(&base().replace("10.99.0.1", "172.20.0.7"))).unwrap();
+    fn addresses_must_be_usable_unique_and_inside_the_tunnel_cidrs() {
+        assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "172.20.0.7"))).is_err());
         assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "127.0.0.1"))).is_err());
-        assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "192.168.1.7"))).is_ok(), "inside its own LAN is fine");
+        assert!(validate_network(&mut parse(&base().replace("10.99.0.1", "192.168.1.7"))).is_err());
         let mut s = base();
-        s.push_str("[clients.c2]\npreferred_ip4 = \"192.168.1.9\"\n");
-        assert!(validate_network(&mut parse(&s)).is_err(), "inside another member's routed LAN is not");
+        s.push_str("[clients.c2]\npreferred_ip4 = \"10.99.0.1\"\n");
+        assert!(validate_network(&mut parse(&s)).is_err(), "static addresses stay unique");
     }
 
     #[test]
@@ -731,9 +811,9 @@ pool = "default"
 
     #[test]
     fn a_secret_is_optional_but_not_empty() {
-        let s = base().replace("secret = \"s\"\npool", "pool");
+        let s = base().replacen("[clients.c1]\nsecret = \"s\"", "[clients.c1]", 1);
         validate_network(&mut parse(&s)).expect("an imported member may have none yet");
-        assert!(validate_network(&mut parse(&base().replace("secret = \"s\"\npool", "secret = \"\"\npool"))).is_err());
+        assert!(validate_network(&mut parse(&base().replacen("[clients.c1]\nsecret = \"s\"", "[clients.c1]\nsecret = \"\"", 1))).is_err());
     }
 
     #[test]

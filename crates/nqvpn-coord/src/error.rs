@@ -33,11 +33,8 @@ impl ApiError {
     pub fn address_in_use(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, ErrorCode::AddressInUse, msg)
     }
-    pub fn pool_exhausted(msg: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, ErrorCode::PoolExhausted, msg)
-    }
-    pub fn unknown_pool(msg: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, ErrorCode::UnknownPool, msg)
+    pub fn address_space_exhausted(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, ErrorCode::AddressSpaceExhausted, msg)
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, msg)

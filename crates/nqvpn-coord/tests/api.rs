@@ -147,7 +147,7 @@ async fn an_internet_exit_is_a_capability_on_the_member_not_a_row_in_the_prefix_
     // member row, as the internet_gateway flag.
     let api = spawn().await;
     let a = api.addr;
-    let net = r#"{"network_id":"acme","cidrs":["10.9.0.0/16"],"pools":{"default":{"cidr":"10.9.1.0/24"}},"settings":{}}"#;
+    let net = r#"{"network_id":"acme","ipv4_cidr":"10.9.0.0/16","settings":{}}"#;
     assert_eq!(post(a, "/api/v1/networks", &bearer(), net).await.status, 200);
     // Both must actually join: routes (the LAN and the internally granted
     // default) are registered at join time, not at configuration time.
@@ -203,7 +203,7 @@ async fn network_and_member_lifecycle_over_http() {
     let a = api.addr;
 
     // Create a network.
-    let net = r#"{"network_id":"acme","cidrs":["10.9.0.0/16"],"pools":{"default":{"cidr":"10.9.1.0/24"}},"settings":{}}"#;
+    let net = r#"{"network_id":"acme","ipv4_cidr":"10.9.0.0/16","settings":{}}"#;
     assert_eq!(post(a, "/api/v1/networks", &bearer(), net).await.status, 200);
     assert!(get(a, "/api/v1/status", &bearer()).await.json()["networks"].as_array().unwrap().iter().any(|n| n["network_id"] == "acme"));
 
@@ -221,6 +221,9 @@ async fn network_and_member_lifecycle_over_http() {
 
     // It shows up in the network config the UI reads.
     let cfg = get(a, "/api/v1/networks/acme/config", &bearer()).await.json();
+    assert_eq!(cfg["ipv4_cidr"], "10.9.0.0/16");
+    assert!(cfg["ipv6_cidr"].is_null());
+    assert!(cfg.get("cidrs").is_none() && cfg.get("pools").is_none());
     assert!(cfg["members"].as_array().unwrap().iter().any(|m| m["name"] == "home" && m["role"] == "relay"));
 
     // A real join with that secret is accepted and gets its configured facts.
@@ -274,7 +277,7 @@ async fn network_and_member_lifecycle_over_http() {
 async fn export_import_round_trips() {
     let api = spawn().await;
     let a = api.addr;
-    post(a, "/api/v1/networks", &bearer(), r#"{"network_id":"n","cidrs":["10.0.0.0/16"],"pools":{},"settings":{}}"#).await;
+    post(a, "/api/v1/networks", &bearer(), r#"{"network_id":"n","ipv4_cidr":"10.0.0.0/16","settings":{}}"#).await;
     post(a, "/api/v1/networks/n/members", &bearer(), r#"{"name":"c1","role":"client"}"#).await;
     let export = get(a, "/api/v1/export", &bearer()).await;
     assert_eq!(export.status, 200);
@@ -291,12 +294,66 @@ async fn bad_requests_are_reported_with_a_code() {
     let api = spawn().await;
     let a = api.addr;
     // A relay without an address is refused at creation.
-    post(a, "/api/v1/networks", &bearer(), r#"{"network_id":"n","cidrs":["10.0.0.0/16"],"pools":{},"settings":{}}"#).await;
+    post(a, "/api/v1/networks", &bearer(), r#"{"network_id":"n","ipv4_cidr":"10.0.0.0/16","settings":{}}"#).await;
     let bad = post(a, "/api/v1/networks/n/members", &bearer(), r#"{"name":"r","role":"relay"}"#).await;
     assert_eq!(bad.status, 400);
     assert_eq!(bad.json()["error"]["code"], "bad_request");
     // Unknown network is a 404.
     assert_eq!(get(a, "/api/v1/networks/nope/config", &bearer()).await.status, 404);
+}
+
+#[tokio::test]
+async fn assigning_an_address_held_by_another_member_is_rejected_atomically() {
+    let api = spawn().await;
+    let a = api.addr;
+    let net = r#"{"network_id":"n","ipv4_cidr":"10.8.1.0/29","settings":{}}"#;
+    assert_eq!(post(a, "/api/v1/networks", &bearer(), net).await.status, 200);
+
+    let mut assigned = Vec::new();
+    for (i, name) in ["alice", "bob"].iter().enumerate() {
+        let create = post(
+            a,
+            "/api/v1/networks/n/members",
+            &bearer(),
+            &format!(r#"{{"name":"{name}","role":"client"}}"#),
+        )
+        .await;
+        assert_eq!(create.status, 200);
+        let secret = Token::parse(create.json()["token"].as_str().unwrap()).unwrap().secret;
+        let key = [20 + i as u8; 32];
+        let join = post(
+            a,
+            "/api/v1/join",
+            &[],
+            &format!(
+                r#"{{"secret":"{secret}","pubkey":"{}","cert_fingerprint":"sha256:{}"}}"#,
+                base64_std(&key),
+                hex::encode(key)
+            ),
+        )
+        .await;
+        assert_eq!(join.status, 200, "join body: {}", join.body);
+        assigned.push(join.json()["ip4"].as_str().unwrap().to_string());
+    }
+
+    let edit = put(
+        a,
+        "/api/v1/networks/n/members/alice",
+        &bearer(),
+        &format!(r#"{{"preferred_ip4":"{}"}}"#, assigned[1]),
+    )
+    .await;
+    assert_eq!(edit.status, 409, "conflicting edit must fail: {}", edit.body);
+    assert_eq!(edit.json()["error"]["code"], "address_in_use");
+    assert!(edit.json()["error"]["message"].as_str().unwrap().contains("bob"));
+
+    // Validation happens before both the in-memory swap and the database
+    // commit, so a failed Save cannot linger and take effect later.
+    let cfg = get(a, "/api/v1/networks/n/members/alice", &bearer()).await.json();
+    assert!(cfg["preferred_ip4"].is_null());
+    let status = get(a, "/api/v1/networks/n/status", &bearer()).await.json();
+    let alice = status["members"].as_array().unwrap().iter().find(|m| m["name"] == "alice").unwrap();
+    assert_eq!(alice["ip4"], assigned[0]);
 }
 
 fn base64_std(b: &[u8]) -> String {

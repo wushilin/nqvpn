@@ -349,21 +349,27 @@ impl AppState {
             }
         }
 
-        // Addresses are identity: sticky, unless the configuration now
-        // asks for something else (a new preferred address, or none).
+        // Configured addresses are hard reservations. Dynamic addresses
+        // are durable soft reservations: the allocator returns this
+        // member's existing address while it remains valid, but may take
+        // the longest-gone offline client's reservation when a range is
+        // otherwise exhausted. Never reclaim during restart grace, while
+        // the fleet has not yet had time to prove which members are live.
         let (ip4, ip6) = if want_vpn_ip {
-            let (have4, have6) = existing.as_ref().map(|r| (r.ip4, r.ip6)).unwrap_or((None, None));
             let want4 = member_cfg.preferred_ip4;
             let want6 = member_cfg.preferred_ip6;
-            let keep4 = have4.is_some() && (want4.is_none() || want4 == have4);
-            let keep6 = have6.is_some() && (want6.is_none() || want6 == have6);
-            if keep4 && (keep6 || have6.is_none() && want6.is_none()) {
-                (have4, have6)
-            } else {
-                let NetState { cfg, registry, .. } = &mut *ns;
-                let granted = crate::ipam::allocate(cfg, registry, &name, None, want4.or(have4), want6.or(have6))?;
-                (granted.ip4, granted.ip6)
-            }
+            let allow_reclaim = !ns.in_grace(now);
+            let NetState { cfg, registry, leases, .. } = &mut *ns;
+            let granted = crate::ipam::allocate_for_join(
+                cfg,
+                registry,
+                leases,
+                allow_reclaim,
+                &name,
+                want4,
+                want6,
+            )?;
+            (granted.ip4, granted.ip6)
         } else {
             (None, None)
         };

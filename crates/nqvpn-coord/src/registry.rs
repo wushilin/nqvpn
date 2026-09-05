@@ -70,7 +70,7 @@ fn d_role() -> Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registry {
-    /// Per-pool allocation cursor, so freed addresses are not reissued
+    /// Per-address-family allocation cursor, so freed addresses are not reissued
     /// immediately (DHCP-style cycling). Durable for the same reason.
     #[serde(default)]
     pub alloc_cursor: BTreeMap<String, u64>,

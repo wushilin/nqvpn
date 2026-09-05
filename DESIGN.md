@@ -115,9 +115,10 @@ Five rules keep it reviewable:
   people only ever deal in member **names**.
 - **Clients** own exactly their VPN address(es), advertised as /32 and
   /128. **Relays** register the **local CIDRs** the operator configured
-  for them at the coordinator; a gateway relay may be headless. Addresses
-  need not lie inside the tunnel CIDRs — a configured one is routed as a
-  host prefix — they only have to be unique and routable.
+  for them at the coordinator; a gateway relay may be headless. Every
+  member address lies inside a network tunnel CIDR. The /32 and /128 stay
+  in the encrypted peer table to select the owning node, while the host OS
+  installs only the covering IPv4/IPv6 network CIDR.
 - **Route lifecycle — liveness-bound, age-resolved.** Several relays may
   register overlapping CIDRs; for any prefix the **oldest living
   registration wins** and is the only owner pushed. A node going offline
@@ -135,8 +136,8 @@ Five rules keep it reviewable:
 ### 3.1 Networks: configuration is the coordinator's
 
 The coordinator hosts N isolated networks (`network_id`). Every network —
-tunnel CIDRs, named pools (each entirely inside a tunnel CIDR, pairwise
-disjoint), settings, and its members with everything about them — is
+one IPv4 CIDR, an optional IPv6 CIDR, settings, and its members with
+everything about them — is
 created and edited in the web UI (or the admin API) and kept in one
 SQLite database (`state.dir/nqvpn.db`), together with the registries.
 `coordinator.toml` holds only the process: listen addresses, TLS, the
@@ -145,7 +146,7 @@ network before it is committed; an invalid change leaves the running one
 untouched. Tunnel CIDRs may overlap *across* networks — tenants never see
 each other.
 
-A member's configuration is its *declaration*: address (or pool),
+A member's configuration is its *declaration*: optional static address,
 routed prefixes and advertised address for relays, preferred relay for
 clients, bandwidth cap. Every join applies it in full. When the operator
 changes it, the coordinator closes the member's control session with
@@ -154,10 +155,14 @@ applies the new facts in place — re-addresses its device, re-announces —
 without a restart. Conflicts (overlapping prefixes, duplicate addresses)
 are refused at edit time, where the operator is.
 
-IPAM: a configured `pool` (`409 pool_exhausted` / `400 unknown_pool`)
-or a `preferred_ip4/6` (`409 address_in_use` if taken). Assignments are
-sticky and durable; the allocator cycles forward DHCP-style so a freed
-address is not reissued immediately. Relays use the identical mechanism.
+IPAM allocates directly from the network's IPv4 and IPv6 CIDRs
+(`409 address_space_exhausted`) or honors a `preferred_ip4/6`
+(`409 address_in_use` if taken). Static addresses
+are hard reservations and can never be reassigned. Dynamic client
+addresses are durable soft reservations: they stay with the member until
+a range is exhausted, then the longest-gone offline and detached client's
+reservation is reused. Reclamation is disabled during coordinator restart
+grace. Relays use durable, non-reclaimable assignments.
 A relay's advertised address may be `auto:<port>`: the address it joined
 from, on that port.
 
@@ -251,7 +256,7 @@ scripts. All under `/api/v1/`:
 | `POST login` / `POST logout` / `GET me` | UI session |
 | `GET ws` | live feed: every network's status, pushed on each publish and every 2 s |
 | `GET status` | per network: members, relays, online, current `gen` |
-| `POST networks` / `PUT`/`DELETE networks/{id}` / `GET networks/{id}/config` | create, edit (address space, pools, settings), delete, read a network |
+| `POST networks` / `PUT`/`DELETE networks/{id}` / `GET networks/{id}/config` | create, edit (IPv4/IPv6 CIDRs and settings), delete, read a network |
 | `GET networks/{id}/status` | members (online, address, routes, attached relay, heartbeat age, `reported_gen` + `digest_ok`, last join from, `login_gen`, replaced from), prefix→owner table, traffic matrix |
 | `POST networks/{id}/members` / `GET`/`PUT`/`DELETE …/members/{name}` | declare a member (returns its token), read, edit (the member re-joins), forget |
 | `GET`/`POST …/members/{name}/token` | show / regenerate (the previous stops working now) |
@@ -260,8 +265,8 @@ scripts. All under `/api/v1/`:
 
 Errors are `{error:{code,message}}` with codes `bad_credentials`
 (unknown id, wrong secret, or unknown network — indistinguishable),
-`client_disabled`, `prefix_conflict`, `address_in_use`, `pool_exhausted`,
-`unknown_pool`, `relay_unreachable`, `bad_request`, `rate_limited`. The
+`client_disabled`, `prefix_conflict`, `address_in_use`, `address_space_exhausted`,
+`relay_unreachable`, `bad_request`, `rate_limited`. The
 **web UI** (`/ui`, dependency-free, embedded, responsive, WebSocket-fed)
 is a client of this API: a wizard for networks and members, the token
 for each member with its ready-to-paste config, live topology and traffic

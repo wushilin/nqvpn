@@ -202,8 +202,6 @@ tr:last-child td{border-bottom:none}
 .cfg{padding:14px;font:12.5px/1.6 ui-monospace,Menlo,monospace;white-space:pre;overflow-x:auto;user-select:all;
      background:var(--sunk);border:1px solid var(--line);border-radius:9px}
 .danger-zone{border:1px solid var(--warn);border-radius:10px;padding:14px 16px;margin-top:26px}
-.pools{display:flex;flex-direction:column;gap:6px}
-.pools .row input{flex:1}
 </style>
 </head>
 <body>
@@ -667,10 +665,8 @@ async function memberForm(st, existing) {
   const g3 = el('div', 'grid2'); g3.append(field('Per-client cap (Mbps)', cap, 'Bandwidth cap for each attached client; blank = network default, 0 = none.')); relayBox.append(g3);
   clientBox.append(field('Preferred relay', pref, 'Attached when reachable; falls back to the lowest latency relay otherwise, and returns on its own.'));
   const g2 = el('div', 'grid2');
-  g2.append(field('IPv4 address', ip4, 'Blank = allocated from the pool. May lie outside the tunnel space; it is routed as a host.'));
-  g2.append(field('IPv6 address', ip6, 'Blank = allocated if the network has IPv6.'));
-  const poolInput = inp(cur.pool ?? '', { placeholder: 'default' });
-  g2.append(field('Pool', poolInput, 'Where to allocate from, if not the default.'));
+  g2.append(field('IPv4 address', ip4, 'Blank = a soft reservation allocated from the network IPv4 CIDR. A static address is never reassigned.'));
+  g2.append(field('IPv6 address', ip6, 'Blank = a soft reservation allocated from the optional IPv6 CIDR. A static address is never reassigned.'));
   g2.append(field('Tunnel address', wantIp, 'Headless members carry no address (a pure forwarding relay).'));
   f.append(relayBox, clientBox, g2);
   const sync = () => { const r = roleSel.value === 'relay'; relayBox.hidden = !r; clientBox.hidden = r; };
@@ -685,11 +681,27 @@ async function memberForm(st, existing) {
   // the form has been replaced by the confirm dialog).
   const submit = async (localCidrs) => {
     const isRelay = roleSel.value === 'relay';
+    // Give immediate feedback from the live status snapshot. The API
+    // performs the authoritative check too (including offline soft
+    // reservations and races after this form was opened).
+    const requested = [
+      ['IPv4', ip4.value.trim(), 'ip4'],
+      ['IPv6', ip6.value.trim(), 'ip6'],
+    ];
+    for (const [family, raw, key] of requested) {
+      if (!raw) continue;
+      const parsed = ipToBig(raw);
+      const wanted = parsed ? bigToIp(parsed.v, parsed.v6) : raw;
+      const owner = st.members.find(m => m.name !== (existing?.name || name.value.trim()) && m[key] && (() => {
+        const held = ipToBig(m[key]);
+        return (held ? bigToIp(held.v, held.v6) : m[key]) === wanted;
+      })());
+      if (owner) throw new Error(`${family} address ${raw} is already assigned to ${owner.name}`);
+    }
     const spec = {
       relay_addr: isRelay ? optStr(relayAddr.value.trim()) : null,
       local_cidrs: isRelay ? localCidrs : [],
       preferred_ip4: optStr(ip4.value.trim()), preferred_ip6: optStr(ip6.value.trim()),
-      pool: optStr(poolInput.value.trim()),
       want_vpn_ip: wantIp.value === '' ? null : wantIp.value === 'true',
       max_session_mbps: isRelay ? optNum(cap.value.trim()) : null,
       preferred_relay: isRelay ? null : optStr(pref.value),
@@ -762,16 +774,14 @@ function settingsPane(st) {
   api(netPath(st.network_id) + '/config').then(cfg => {
     box.replaceChildren();
     const f = el('form');
-    const cidrs = el('textarea'); cidrs.value = (cfg.cidrs || []).join('\n');
-    f.append(field('Tunnel address space', cidrs, 'CIDRs auto-allocation draws from and every member routes into the tunnel. One per line; at least one IPv4.'));
-    f.append(el('label', null, 'Pools'));
-    const pools = el('div', 'pools');
-    const addPool = (n = '', c = '') => { const r = el('div', 'row'); const ni = inp(n, { placeholder: 'name' }); const ci = inp(c, { placeholder: '10.99.1.0/24' });
-      const x = el('button', 'ghost', '✕'); x.type = 'button'; x.onclick = () => r.remove(); r.append(ni, ci, x); pools.append(r); };
-    Object.entries(cfg.pools || {}).forEach(([n, p]) => addPool(n, p.cidr));
-    const ap = el('button', null, '+ Pool'); ap.type = 'button'; ap.onclick = () => addPool();
-    f.append(pools, el('div', 'help', 'Named allocation ranges inside the address space, disjoint from each other. Members pick a pool or get "default".'), el('div', 'bar', ''));
-    f.lastChild.append(ap);
+    const cidr4 = inp(cfg.ipv4_cidr || '', { required: '', placeholder: '10.99.0.0/16' });
+    const cidr6 = inp(cfg.ipv6_cidr || '', { placeholder: 'fd99::/64' });
+    const addressGrid = el('div', 'grid2');
+    addressGrid.append(
+      field('IPv4 CIDR', cidr4, 'Required. This is both the node allocation range and the covering tunnel route.'),
+      field('IPv6 CIDR', cidr6, 'Optional. This is both the node allocation range and the covering tunnel route.')
+    );
+    f.append(el('h2', null, 'Tunnel addresses'), addressGrid);
     const s = cfg.settings || {};
     const g = el('div', 'grid2');
     const num = (k, label, help, attrs = {}) => { const i = inp(s[k], { type: 'number', ...attrs }); g.append(field(label, i, help)); return i; };
@@ -793,8 +803,7 @@ function settingsPane(st) {
     f.append(el('p', 'note', 'Changing MTU, transport, lanes, heartbeat, credential lifetime or the default cap makes every member re-join and apply it.'));
     f.onsubmit = async e => {
       e.preventDefault(); save.disabled = true; err.textContent = '';
-      const poolsObj = {}; for (const r of pools.children) { const [n, c] = r.querySelectorAll('input'); if (n.value.trim()) poolsObj[n.value.trim()] = { cidr: c.value.trim() }; }
-      const spec = { network_id: st.network_id, cidrs: lines(cidrs.value), pools: poolsObj, settings: {
+      const spec = { network_id: st.network_id, ipv4_cidr: cidr4.value.trim(), ipv6_cidr: optStr(cidr6.value.trim()), settings: {
         credential_ttl_mins: Number(ttl.value), heartbeat_secs: Number(hb.value), offline_after: Number(off.value), hold_down_secs: Number(hold.value),
         mtu: Number(mtu.value), lanes: Number(lanes.value), max_session_mbps: Number(capd.value), transport: transport.value,
         relay_reachability: reach.value, allow_loopback_relays: loop.value === 'true' } };
@@ -818,11 +827,13 @@ function newNetworkModal() {
   const body = openModal('New network', 'step 1 of 2 · then add members');
   const f = el('form');
   const id = inp('', { placeholder: 'e.g. acme-prod', pattern: '[A-Za-z0-9._-]{1,64}', required: '' });
-  const cidrs = el('textarea'); cidrs.value = '10.99.0.0/16';
-  const pool = inp('10.99.1.0/24');
+  const cidr4 = inp('10.99.0.0/16', { required: '' });
+  const cidr6 = inp('fd99::/64');
   f.append(field('Network id', id, 'Permanent; letters, digits, . _ -'));
-  f.append(field('Tunnel address space', cidrs, 'One CIDR per line. Members get addresses from here unless you assign one.'));
-  f.append(field('Default pool', pool, 'The range auto-allocation uses, inside the space above. Leave blank to allocate from the whole space.'));
+  const addressGrid = el('div', 'grid2');
+  addressGrid.append(field('IPv4 CIDR', cidr4, 'Required. Used for node allocation and as the tunnel route.'),
+    field('IPv6 CIDR', cidr6, 'Optional. Used for node allocation and as the tunnel route.'));
+  f.append(addressGrid);
   const adv = el('details'); adv.append(el('summary', 'muted tiny', 'Advanced (defaults are fine)'));
   const g = el('div', 'grid2'); const mtu = inp('1350', { type: 'number', min: 1280, max: 9000 }); const hb = inp('5', { type: 'number', min: 1 });
   const transport = el('select'); ['stream','datagram'].forEach(v => { const o = el('option', null, v); o.value = v; transport.append(o); });
@@ -830,7 +841,7 @@ function newNetworkModal() {
   const bar = el('div', 'bar'); const create = el('button', 'primary', 'Create network'); const err = el('span', 'msg err'); bar.append(create, err); f.append(bar);
   f.onsubmit = async e => {
     e.preventDefault(); create.disabled = true; err.textContent = '';
-    const spec = { network_id: id.value.trim(), cidrs: lines(cidrs.value), pools: pool.value.trim() ? { default: { cidr: pool.value.trim() } } : {},
+    const spec = { network_id: id.value.trim(), ipv4_cidr: cidr4.value.trim(), ipv6_cidr: optStr(cidr6.value.trim()),
       settings: { mtu: Number(mtu.value), heartbeat_secs: Number(hb.value), transport: transport.value } };
     try { await api('/api/v1/networks', { method: 'POST', body: spec }); closeModal(); msg('Network created — add a relay first'); go('#/n/' + enc(spec.network_id)); }
     catch (ex) { err.textContent = ex.message; create.disabled = false; }

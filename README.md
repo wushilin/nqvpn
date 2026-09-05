@@ -253,6 +253,14 @@ it joins from"), optionally an overlay address and the LANs it routes; a
 client optionally a preferred relay and a fixed address. Every member gets
 a token and a ready-to-paste config.
 
+Every member address must be inside the network's IPv4 or IPv6 CIDR. A
+configured fixed address is a permanent reservation and is never given to
+another member. An automatically allocated client address is a durable
+soft reservation: it normally returns to the same member, but if its CIDR
+is full, the longest-gone offline client that no relay still holds yields
+its address. Endpoints route the covering network CIDRs, not one OS route
+per member.
+
 **3. Members** hold the token and local facts only:
 
 ```toml

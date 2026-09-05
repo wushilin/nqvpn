@@ -224,7 +224,7 @@ fn a_member_created_by_the_operator_joins_with_its_token_only() {
     let spec = MemberSpec {
         relay_addr: Some("auto:5555".into()),
         local_cidrs: vec!["172.20.5.0/24".parse().unwrap()],
-        preferred_ip4: Some("172.20.0.7".parse().unwrap()),
+        preferred_ip4: Some("10.99.0.7".parse().unwrap()),
         ..Default::default()
     };
     let secret = h.state.create_member("n1", "cloud-3", Role::Relay, &spec).unwrap();
@@ -239,8 +239,8 @@ fn a_member_created_by_the_operator_joins_with_its_token_only() {
     assert_eq!(resp.role, Role::Relay);
     assert_eq!(resp.network_id, "n1");
     assert_eq!(resp.name, "cloud-3");
-    assert_eq!(resp.ip4, Some("172.20.0.7".parse().unwrap()), "an address outside the tunnel cidrs, as configured");
-    assert!(resp.subnet4.is_none(), "no containing tunnet cidr");
+    assert_eq!(resp.ip4, Some("10.99.0.7".parse().unwrap()));
+    assert_eq!(resp.subnet4, Some("10.99.0.0/16".parse().unwrap()), "every assigned address has a containing tunnel CIDR");
     assert_eq!(resp.granted_cidrs, vec!["172.20.5.0/24".parse::<ipnet::IpNet>().unwrap()]);
     assert_eq!(resp.relay_addr.as_deref(), Some("203.0.113.9:5555"), "auto resolves to where it joined from");
     // And it is in the fleet at that address.

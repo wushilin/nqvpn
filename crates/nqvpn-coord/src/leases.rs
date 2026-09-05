@@ -40,6 +40,11 @@ pub struct Report {
 #[derive(Debug, Default)]
 pub struct Leases {
     last_seen: HashMap<NodeId, u64>,
+    /// When a member most recently became offline. Kept after
+    /// `last_seen` is removed so IPAM can reclaim the longest-gone soft
+    /// reservation first. This is process-local; after a coordinator
+    /// restart IPAM falls back to the registry's durable last-join time.
+    offline_since: HashMap<NodeId, u64>,
     online_since: HashMap<NodeId, u64>,
     /// relay -> (client -> claim)
     declared: HashMap<NodeId, HashMap<NodeId, Claim>>,
@@ -57,6 +62,7 @@ impl Leases {
         self.last_seen.insert(node, now);
         if !was_online {
             self.online_since.insert(node, now);
+            self.offline_since.remove(&node);
         }
         !was_online
     }
@@ -120,6 +126,7 @@ impl Leases {
     /// every claim on it.
     pub fn remove(&mut self, node: NodeId) {
         self.offline(node);
+        self.offline_since.remove(&node);
         self.reported.remove(&node);
         for claims in self.declared.values_mut() {
             claims.remove(&node);
@@ -135,7 +142,9 @@ impl Leases {
 
     /// The control link is gone. Liveness ends; attachments do not.
     pub fn offline(&mut self, node: NodeId) {
-        self.last_seen.remove(&node);
+        if let Some(last) = self.last_seen.remove(&node) {
+            self.offline_since.insert(node, last);
+        }
         self.online_since.remove(&node);
         self.attached_to.remove(&node);
         self.mesh_up.remove(&node);
@@ -151,6 +160,10 @@ impl Leases {
 
     pub fn last_seen(&self, node: NodeId) -> Option<u64> {
         self.last_seen.get(&node).copied()
+    }
+
+    pub fn offline_since(&self, node: NodeId) -> Option<u64> {
+        self.offline_since.get(&node).copied()
     }
 
     pub fn online_nodes(&self) -> Vec<NodeId> {

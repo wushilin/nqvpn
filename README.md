@@ -198,7 +198,15 @@ gateway if it moves.
 Teardown is symmetric. A clean exit restores the routing table exactly as
 it was; and because every tunnel route is bound to the TUN, a process
 killed outright loses them all the moment the kernel destroys the device.
-What survives is only host routes that duplicate the default route anyway.
+The pins are the one exception — a host route via the real gateway
+outlives a `kill -9`, and on a laptop that then moves networks it points
+at a gateway that no longer exists — so they are journaled write-ahead in
+the state dir (`pins`, one `ip gateway` per line: written before the
+kernel gains a route, removed after it loses one, gone entirely after a
+clean exit). The next start removes whatever the journal lists *before*
+it joins, deleting only the exact address-and-gateway pairs it recorded,
+so the coordinator is never unreachable through a route nothing knew it
+owned and a route the host already had is never touched.
 
 ```sh
 nqvpn-client --token "nqv1.…" --route-all                  # nearest ready exit

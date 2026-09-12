@@ -82,6 +82,22 @@ async fn run(cli: Cli) -> Result<i32> {
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
+    // The routing table is opened before the join on purpose: a previous
+    // run that died under --route-all left its underlay pins in the kernel
+    // (they are the only routes not bound to the TUN), journaled in the
+    // state dir. Opening removes them, so that if this laptop has since
+    // moved networks the coordinator is not unreachable through a stale
+    // host route via a gateway that no longer exists. The TUN does not
+    // exist yet; the programmer is told its name once it does.
+    let programmer = if cli.dry_run {
+        None
+    } else {
+        Some(
+            nqvpn_endpoint::routes::NetRouteProgrammer::open(nqvpn_endpoint::routes::PinJournal::load(cfg.state_dir.join("pins")))
+                .context("opening the routing table (needs root/elevation)")?,
+        )
+    };
+
     let joined = nqvpn_sync::join_with_backoff_async(member.clone(), identity.clone(), keys.clone()).await;
     anyhow::ensure!(
         joined.role == nqvpn_proto::types::Role::Client,
@@ -121,12 +137,12 @@ async fn run(cli: Cli) -> Result<i32> {
     };
     tracing::info!(device = %tun.name(), mtu = joined.mtu, transport = %joined.transport, "TUN ready");
 
-    let routes: Arc<dyn nqvpn_client::client::RouteSink> = if cli.dry_run {
-        Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::RecordingProgrammer::default()))
-    } else {
-        Arc::new(nqvpn_endpoint::routes::RouteSet::new(
-            nqvpn_endpoint::routes::NetRouteProgrammer::new(tun.name()).context("opening the routing table")?,
-        ))
+    let routes: Arc<dyn nqvpn_client::client::RouteSink> = match programmer {
+        None => Arc::new(nqvpn_endpoint::routes::RouteSet::new(nqvpn_endpoint::routes::RecordingProgrammer::default())),
+        Some(p) => {
+            p.set_device(&tun.name());
+            Arc::new(nqvpn_endpoint::routes::RouteSet::new(p))
+        }
     };
 
     // --via names an exit; it is meaningless without the catch-all, so it

@@ -102,9 +102,120 @@ pub trait HostRouteTable {
     fn del_host_route(&self, ip: IpAddr, gw: IpAddr);
 }
 
+/// The pins we created — `ip -> gateway` — optionally journaled to a file
+/// so a process that dies without running its teardown can be cleaned up
+/// by the next one. The pins are the only routes this node installs that
+/// are not bound to the TUN: every tunnel route dies with the device, but
+/// a host route via the real gateway outlives a `kill -9`, and on a
+/// laptop that then moves networks it points at a gateway that no longer
+/// exists — the relays and the coordinator become unreachable through a
+/// route nothing knows it owns.
+///
+/// The journal is **write-ahead** and never under-records: an entry is
+/// written *before* the kernel gains the route and removed *after* the
+/// kernel loses it, so a crash at any instant leaves at worst a phantom
+/// entry, and deleting a route that is not there is a no-op. An entry is
+/// removed on its own only when the add reports the route was already
+/// present (someone else's), so the file lists exactly what we own.
+///
+/// Format: one `ip gateway` per line; an empty journal is no file at all,
+/// which is what a clean exit leaves behind.
+pub struct PinJournal {
+    path: Option<std::path::PathBuf>,
+    map: std::collections::BTreeMap<IpAddr, IpAddr>,
+}
+
+impl PinJournal {
+    /// No file: the pins live and die with the process (relays, dry runs, tests).
+    pub fn in_memory() -> Self {
+        PinJournal { path: None, map: Default::default() }
+    }
+
+    /// Load the journal at `path`, creating none if absent. Entries left by
+    /// a previous run are inherited as pins and dealt with by the first
+    /// `reconcile_pins`, which the caller runs with an empty want set to
+    /// remove them before doing anything that needs the underlay.
+    pub fn load(path: std::path::PathBuf) -> Self {
+        let mut map = std::collections::BTreeMap::new();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    let parsed = line.split_once(' ').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)));
+                    match parsed {
+                        Some((ip, gw)) => {
+                            map.insert(ip, gw);
+                        }
+                        None => tracing::warn!(path = %path.display(), line, "ignoring a malformed pin journal line"),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %path.display(), "cannot read the pin journal (leftover pins, if any, will not be removed): {e}"),
+        }
+        PinJournal { path: Some(path), map }
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn get(&self, ip: &IpAddr) -> Option<IpAddr> {
+        self.map.get(ip).copied()
+    }
+    pub fn contains_key(&self, ip: &IpAddr) -> bool {
+        self.map.contains_key(ip)
+    }
+    pub fn keys(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.map.keys().copied()
+    }
+
+    /// Journal a pin. Called *before* the route is added.
+    pub fn record(&mut self, ip: IpAddr, gw: IpAddr) {
+        self.map.insert(ip, gw);
+        self.persist();
+    }
+
+    /// Drop a pin from the journal. Called *after* the route is deleted
+    /// (or when it turned out never to be ours).
+    pub fn forget(&mut self, ip: &IpAddr) -> Option<IpAddr> {
+        let had = self.map.remove(ip);
+        self.persist();
+        had
+    }
+
+    /// Write the whole map atomically (temp file + rename); an empty map
+    /// removes the file. A failure is logged, not fatal: the pin is still
+    /// programmed, we just lose the crash-safety for it, which is no worse
+    /// than having no journal.
+    fn persist(&self) {
+        let Some(path) = &self.path else { return };
+        let r = if self.map.is_empty() {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            let body: String = self.map.iter().map(|(ip, gw)| format!("{ip} {gw}\n")).collect();
+            let tmp = path.with_extension("tmp");
+            (|| {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&tmp, body)?;
+                std::fs::rename(&tmp, path)
+            })()
+        };
+        if let Err(e) = r {
+            tracing::warn!(path = %path.display(), "cannot write the pin journal: {e}");
+        }
+    }
+}
+
 /// Bring the underlay pins in line with `want` and the *current* default
 /// gateway, returning the hosts route-all may now count as reachable off
-/// the tunnel. Three rules, and the pin map is the whole state:
+/// the tunnel. Three rules, and the pin journal is the whole state:
 ///
 ///  * `pinned` records only routes **we** created, so tearing down can
 ///    never delete a route the host already had;
@@ -112,16 +223,20 @@ pub trait HostRouteTable {
 ///    after a DHCP change or a move to another network, one left on the old
 ///    gateway silently blackholes exactly the hosts route-all cannot lose;
 ///  * a host that drops out of `want` (a relay left the fleet) loses its pin.
-pub fn reconcile_pins(
-    table: &dyn HostRouteTable,
-    want: &[IpAddr],
-    pinned: &mut std::collections::BTreeMap<IpAddr, IpAddr>,
-) -> Vec<IpAddr> {
+///
+/// The same three rules do teardown and crash recovery: run with an empty
+/// `want`, everything pinned — including what a dead predecessor left in
+/// the journal — is stale and removed. There is no separate cleanup path.
+///
+/// Ordering against the journal is write-ahead throughout: record, then
+/// add; delete, then forget. See [`PinJournal`].
+pub fn reconcile_pins(table: &dyn HostRouteTable, want: &[IpAddr], pinned: &mut PinJournal) -> Vec<IpAddr> {
     let want: BTreeSet<IpAddr> = want.iter().copied().collect();
-    let stale: Vec<IpAddr> = pinned.keys().copied().filter(|ip| !want.contains(ip)).collect();
+    let stale: Vec<IpAddr> = pinned.keys().filter(|ip| !want.contains(ip)).collect();
     for ip in stale {
-        if let Some(gw) = pinned.remove(&ip) {
+        if let Some(gw) = pinned.get(&ip) {
             table.del_host_route(ip, gw);
+            pinned.forget(&ip);
         }
     }
     let mut ok = Vec::new();
@@ -130,28 +245,34 @@ pub fn reconcile_pins(
             tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host; withholding its family's catch-all so the tunnel is not cut off");
             continue;
         };
-        match pinned.get(&ip).copied() {
+        match pinned.get(&ip) {
             Some(had) if had == gw => {
                 ok.push(ip);
                 continue;
             }
             Some(had) => {
                 table.del_host_route(ip, had);
-                pinned.remove(&ip);
+                pinned.forget(&ip);
                 tracing::info!(target: "nqvpn::os_routes", %ip, old_gateway = %had, new_gateway = %gw, "route-all: default gateway moved; re-pinning underlay host");
             }
             None => {}
         }
+        pinned.record(ip, gw);
         match table.add_host_route(ip, gw) {
             Ok(true) => {
                 tracing::info!(target: "nqvpn::os_routes", %ip, %gw, "route-all: pinned underlay host to gateway");
-                pinned.insert(ip, gw);
                 ok.push(ip);
             }
             // Already routed the way we want, by someone else: usable, but
             // not ours, so it is not recorded and never torn down.
-            Ok(false) => ok.push(ip),
-            Err(e) => tracing::warn!(%ip, %gw, "route-all: pinning underlay host failed: {e}"),
+            Ok(false) => {
+                pinned.forget(&ip);
+                ok.push(ip);
+            }
+            Err(e) => {
+                pinned.forget(&ip);
+                tracing::warn!(%ip, %gw, "route-all: pinning underlay host failed: {e}");
+            }
         }
     }
     ok
@@ -563,18 +684,56 @@ impl RouteProgrammer for RecordingProgrammer {
 /// just a `RouteManager` behind a lock. Every route is bound to our TUN
 /// by interface, which is also how `list_via_dev` selects what is ours.
 pub struct NetRouteProgrammer {
-    device: String,
+    /// Empty until `set_device`: a programmer is opened before the TUN
+    /// exists so a dead predecessor's pins can be removed before the join
+    /// that needs the underlay reachable.
+    device: Mutex<String>,
     mgr: Mutex<route_manager::RouteManager>,
     /// Underlay host routes we added via the real gateway (route-all), so
     /// we can reconcile and tear them down. ip -> the gateway used.
-    pinned: Mutex<std::collections::BTreeMap<IpAddr, IpAddr>>,
+    pinned: Mutex<PinJournal>,
 }
 
 impl NetRouteProgrammer {
+    /// Open the table for `device`, with no pin journal (the pins live and
+    /// die with the process — fine for a relay, which pins nothing).
     pub fn new(device: String) -> Result<Self> {
+        let p = Self::open(PinJournal::in_memory())?;
+        p.set_device(&device);
+        Ok(p)
+    }
+
+    /// Open the table with a pin journal and, before anything else, remove
+    /// every pin a previous run left behind in it: a run that exits
+    /// cleanly leaves no journal, so any entry here is from a process that
+    /// died without its teardown. This is `reconcile_pins` with an empty
+    /// want set — the ordinary "no longer wanted" rule — not a separate
+    /// cleanup path. The device is set later, once the TUN exists.
+    pub fn open(journal: PinJournal) -> Result<Self> {
         let mgr = route_manager::RouteManager::new()
             .map_err(|e| anyhow::anyhow!("opening the OS routing table: {e}"))?;
-        Ok(NetRouteProgrammer { device, mgr: Mutex::new(mgr), pinned: Mutex::new(std::collections::BTreeMap::new()) })
+        let p = NetRouteProgrammer { device: Mutex::new(String::new()), mgr: Mutex::new(mgr), pinned: Mutex::new(journal) };
+        {
+            let mut pinned = p.pinned.lock().unwrap();
+            if !pinned.is_empty() {
+                tracing::warn!(
+                    target: "nqvpn::os_routes",
+                    pins = pinned.len(),
+                    "a previous run did not exit cleanly and left underlay pins behind; removing them"
+                );
+                reconcile_pins(&p, &[], &mut pinned);
+            }
+        }
+        Ok(p)
+    }
+
+    /// Name the TUN whose routes this programmer owns.
+    pub fn set_device(&self, device: &str) {
+        *self.device.lock().unwrap() = device.to_string();
+    }
+
+    fn device(&self) -> String {
+        self.device.lock().unwrap().clone()
     }
 
     /// The current default route's gateway for a family, ignoring any
@@ -593,7 +752,11 @@ impl NetRouteProgrammer {
     /// still matched as long as the name is stable. `None` means the
     /// device is gone (its routes went with it).
     fn ifindex(&self) -> Option<u32> {
-        let c = std::ffi::CString::new(self.device.as_str()).ok()?;
+        let device = self.device();
+        if device.is_empty() {
+            return None;
+        }
+        let c = std::ffi::CString::new(device).ok()?;
         let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
         (idx != 0).then_some(idx)
     }
@@ -602,14 +765,23 @@ impl NetRouteProgrammer {
         let mut r = route_manager::Route::new(net.addr(), net.prefix_len());
         match self.ifindex() {
             Some(i) => r = r.with_if_index(i),
-            None => r = r.with_if_name(self.device.clone()),
+            None => r = r.with_if_name(self.device()),
         }
         r
     }
 
     /// Is this kernel route one on our device?
     fn ours(&self, r: &route_manager::Route, idx: Option<u32>) -> bool {
-        r.if_name().map(|n| n == &self.device).unwrap_or(false) || (idx.is_some() && r.if_index() == idx)
+        let device = self.device();
+        (!device.is_empty() && r.if_name().map(|n| n == &device).unwrap_or(false)) || (idx.is_some() && r.if_index() == idx)
+    }
+
+    /// Does the kernel hold exactly this host route via exactly this
+    /// gateway? `None` when the table cannot be read.
+    fn has_host_route(&self, ip: IpAddr, gw: IpAddr) -> Option<bool> {
+        let bits = if ip.is_ipv6() { 128 } else { 32 };
+        let routes = self.mgr.lock().unwrap().list().ok()?;
+        Some(routes.iter().any(|r| r.destination() == ip && r.prefix() == bits && r.gateway() == Some(gw)))
     }
 }
 
@@ -665,16 +837,29 @@ impl HostRouteTable for NetRouteProgrammer {
         }
     }
     fn del_host_route(&self, ip: IpAddr, gw: IpAddr) {
+        // Only the exact pair we recorded. A route to the same host via
+        // another gateway is someone else's (or the kernel already replaced
+        // ours when the network changed) and is left alone; the BSD delete
+        // matches on destination, so this check is what makes that true.
+        if self.has_host_route(ip, gw) == Some(false) {
+            return;
+        }
         let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
     }
 }
 
+/// Clean teardown: every pin is now unwanted, so the same reconcile that
+/// added them removes them and empties the journal (which deletes the
+/// file). A process that never gets here leaves the journal for `open`.
 impl Drop for NetRouteProgrammer {
     fn drop(&mut self) {
-        let pinned = std::mem::take(&mut *self.pinned.lock().unwrap());
-        for (ip, gw) in pinned {
-            let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
+        let mut pinned = self.pinned.lock().unwrap();
+        if pinned.is_empty() {
+            return;
         }
+        let n = pinned.len();
+        reconcile_pins(self, &[], &mut pinned);
+        tracing::info!(target: "nqvpn::os_routes", pins = n, "removed our underlay pins on shutdown");
     }
 }
 
@@ -698,7 +883,6 @@ mod tests {
     use super::*;
     use nqvpn_proto::control::{NetworkMtu, PeerInfo};
     use nqvpn_proto::types::Role;
-    use std::collections::BTreeMap;
 
     fn net(s: &str) -> IpNet {
         s.parse().unwrap()
@@ -864,6 +1048,11 @@ mod tests {
         preexisting: Mutex<BTreeSet<(IpAddr, IpAddr)>>,
         added: Mutex<Vec<(IpAddr, IpAddr)>>,
         deleted: Mutex<Vec<(IpAddr, IpAddr)>>,
+        /// When set, every add/del also records whether the journal file
+        /// listed the pair *at that instant* — the write-ahead invariant.
+        journal: Option<std::path::PathBuf>,
+        journaled_at_add: Mutex<Vec<bool>>,
+        journaled_at_del: Mutex<Vec<bool>>,
     }
 
     impl FakeTable {
@@ -873,7 +1062,18 @@ mod tests {
                 preexisting: Mutex::new(BTreeSet::new()),
                 added: Mutex::new(Vec::new()),
                 deleted: Mutex::new(Vec::new()),
+                journal: None,
+                journaled_at_add: Mutex::new(Vec::new()),
+                journaled_at_del: Mutex::new(Vec::new()),
             }
+        }
+        fn watching(mut self, journal: &std::path::Path) -> Self {
+            self.journal = Some(journal.to_path_buf());
+            self
+        }
+        fn journal_lists(&self, i: IpAddr, gw: IpAddr) -> bool {
+            let Some(p) = &self.journal else { return false };
+            std::fs::read_to_string(p).unwrap_or_default().lines().any(|l| l.trim() == format!("{i} {gw}"))
         }
     }
 
@@ -882,6 +1082,7 @@ mod tests {
             *self.gw.lock().unwrap()
         }
         fn add_host_route(&self, i: IpAddr, gw: IpAddr) -> std::io::Result<bool> {
+            self.journaled_at_add.lock().unwrap().push(self.journal_lists(i, gw));
             if self.preexisting.lock().unwrap().contains(&(i, gw)) {
                 return Ok(false);
             }
@@ -889,8 +1090,13 @@ mod tests {
             Ok(true)
         }
         fn del_host_route(&self, i: IpAddr, gw: IpAddr) {
+            self.journaled_at_del.lock().unwrap().push(self.journal_lists(i, gw));
             self.deleted.lock().unwrap().push((i, gw));
         }
+    }
+
+    fn journal_lines(p: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(p).unwrap_or_default().lines().map(str::to_string).collect()
     }
 
     #[test]
@@ -899,11 +1105,11 @@ mod tests {
         // client runs kept its pins on the old gateway, blackholing the
         // relays and resolvers — no crash needed.
         let t = FakeTable::with_gateway("192.168.1.1");
-        let mut pinned = BTreeMap::new();
+        let mut pinned = PinJournal::in_memory();
         let want = [ip("3.1.237.225"), ip("8.8.8.8")];
         let ok = reconcile_pins(&t, &want, &mut pinned);
         assert_eq!(ok.len(), 2);
-        assert_eq!(pinned.get(&ip("8.8.8.8")), Some(&ip("192.168.1.1")));
+        assert_eq!(pinned.get(&ip("8.8.8.8")), Some(ip("192.168.1.1")));
 
         // Same want set, new gateway: every pin is re-pointed, not skipped.
         *t.gw.lock().unwrap() = Some(ip("10.0.0.1"));
@@ -912,7 +1118,7 @@ mod tests {
         for host in want {
             assert!(t.deleted.lock().unwrap().contains(&(host, ip("192.168.1.1"))), "{host} unpinned from the old gateway");
             assert!(t.added.lock().unwrap().contains(&(host, ip("10.0.0.1"))), "{host} re-pinned to the new gateway");
-            assert_eq!(pinned.get(&host), Some(&ip("10.0.0.1")));
+            assert_eq!(pinned.get(&host), Some(ip("10.0.0.1")));
         }
 
         // Steady state: nothing is touched when the gateway is unchanged.
@@ -927,17 +1133,17 @@ mod tests {
         // but it is not ours, so it must not be recorded and must survive us.
         let t = FakeTable::with_gateway("192.168.1.1");
         t.preexisting.lock().unwrap().insert((ip("3.1.237.225"), ip("192.168.1.1")));
-        let mut pinned = BTreeMap::new();
+        let mut pinned = PinJournal::in_memory();
         let ok = reconcile_pins(&t, &[ip("3.1.237.225"), ip("8.8.8.8")], &mut pinned);
         assert!(ok.contains(&ip("3.1.237.225")), "a route already in place still counts as reachable");
         assert!(!pinned.contains_key(&ip("3.1.237.225")), "not ours: never recorded, so never torn down");
-        assert_eq!(pinned.keys().copied().collect::<Vec<_>>(), vec![ip("8.8.8.8")], "only what we created");
+        assert_eq!(pinned.keys().collect::<Vec<_>>(), vec![ip("8.8.8.8")], "only what we created");
     }
 
     #[test]
     fn a_relay_that_leaves_the_fleet_loses_its_pin() {
         let t = FakeTable::with_gateway("192.168.1.1");
-        let mut pinned = BTreeMap::new();
+        let mut pinned = PinJournal::in_memory();
         reconcile_pins(&t, &[ip("3.1.237.225"), ip("47.237.120.106")], &mut pinned);
         // A new snapshot drops one relay and adds another.
         let ok = reconcile_pins(&t, &[ip("3.1.237.225"), ip("43.230.99.31")], &mut pinned);
@@ -952,11 +1158,103 @@ mod tests {
         // route_all_plan withholds the catch-all rather than cutting the box off.
         let t = FakeTable::with_gateway("192.168.1.1");
         *t.gw.lock().unwrap() = None;
-        let mut pinned = BTreeMap::new();
+        let mut pinned = PinJournal::in_memory();
         let ok = reconcile_pins(&t, &[ip("3.1.237.225")], &mut pinned);
         assert!(ok.is_empty() && pinned.is_empty());
         let plan = route_all_plan(&view(), None, None, &[ip("3.1.237.225")], &ok);
         assert!(plan.nets.is_empty(), "an unpinned transport must never arm a catch-all");
+    }
+
+    #[test]
+    fn a_dead_predecessors_pins_are_removed_by_the_first_reconcile_and_the_journal_with_them() {
+        // The bug this exists for: a route-all laptop client killed -9 (or
+        // crashed) leaves its pins — the only routes not bound to the TUN —
+        // pointing at a gateway that, after a move to another network, no
+        // longer exists. The next run must remove them before it joins, or
+        // the coordinator is unreachable through a route nothing knows it
+        // owns. A malformed line must not stop the rest being honoured.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins");
+        std::fs::write(&path, "3.1.237.225 192.168.1.1\ngarbage line\n8.8.8.8 192.168.1.1\n").unwrap();
+        let mut pinned = PinJournal::load(path.clone());
+        assert_eq!(pinned.len(), 2, "the inherited pins, minus the malformed line");
+
+        // The startup pass is the ordinary reconcile with nothing wanted.
+        let t = FakeTable::with_gateway("10.0.0.1").watching(&path);
+        let ok = reconcile_pins(&t, &[], &mut pinned);
+        assert!(ok.is_empty());
+        let deleted = t.deleted.lock().unwrap().clone();
+        assert!(deleted.contains(&(ip("3.1.237.225"), ip("192.168.1.1"))), "removed via the gateway it was recorded with, not today's");
+        assert!(deleted.contains(&(ip("8.8.8.8"), ip("192.168.1.1"))));
+        assert!(t.added.lock().unwrap().is_empty(), "cleanup adds nothing");
+        assert!(pinned.is_empty());
+        assert!(!path.exists(), "an empty journal is no file: the next start has nothing to inherit");
+    }
+
+    #[test]
+    fn the_journal_is_written_before_the_kernel_gains_a_pin_and_after_it_loses_one() {
+        // Write-ahead in both directions, so a crash at any instant leaves
+        // at worst a phantom entry (deleting an absent route is a no-op) and
+        // never an unrecorded live route.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins");
+        let mut pinned = PinJournal::load(path.clone());
+        let t = FakeTable::with_gateway("192.168.1.1").watching(&path);
+        let want = [ip("3.1.237.225"), ip("8.8.8.8")];
+
+        reconcile_pins(&t, &want, &mut pinned);
+        assert_eq!(*t.journaled_at_add.lock().unwrap(), vec![true, true], "each pair was in the journal when the kernel add ran");
+        let mut lines = journal_lines(&path);
+        lines.sort();
+        assert_eq!(lines, vec!["3.1.237.225 192.168.1.1", "8.8.8.8 192.168.1.1"]);
+
+        // The gateway moves: each pin is deleted while still journaled, then
+        // re-recorded before it is re-added.
+        *t.gw.lock().unwrap() = Some(ip("10.0.0.1"));
+        reconcile_pins(&t, &want, &mut pinned);
+        assert_eq!(*t.journaled_at_del.lock().unwrap(), vec![true, true], "each pair was still in the journal when the kernel delete ran");
+        assert_eq!(*t.journaled_at_add.lock().unwrap(), vec![true, true, true, true]);
+        let mut lines = journal_lines(&path);
+        lines.sort();
+        assert_eq!(lines, vec!["3.1.237.225 10.0.0.1", "8.8.8.8 10.0.0.1"], "the journal names the gateway now in use");
+
+        // A relay leaves the fleet: deleted while journaled, then forgotten.
+        reconcile_pins(&t, &[ip("8.8.8.8")], &mut pinned);
+        assert_eq!(t.journaled_at_del.lock().unwrap().len(), 3);
+        assert!(t.journaled_at_del.lock().unwrap().iter().all(|b| *b));
+        assert_eq!(journal_lines(&path), vec!["8.8.8.8 10.0.0.1"]);
+    }
+
+    #[test]
+    fn a_route_someone_else_owns_is_never_left_in_the_journal() {
+        // The write-ahead entry for a pin that turns out to be already
+        // present is withdrawn: the journal lists exactly what we own, so a
+        // successor cleaning up after us cannot delete the host's own route.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins");
+        let mut pinned = PinJournal::load(path.clone());
+        let t = FakeTable::with_gateway("192.168.1.1").watching(&path);
+        t.preexisting.lock().unwrap().insert((ip("3.1.237.225"), ip("192.168.1.1")));
+        let ok = reconcile_pins(&t, &[ip("3.1.237.225"), ip("8.8.8.8")], &mut pinned);
+        assert_eq!(ok.len(), 2, "usable either way");
+        assert_eq!(journal_lines(&path), vec!["8.8.8.8 192.168.1.1"], "only the pin we created");
+    }
+
+    #[test]
+    fn a_clean_teardown_leaves_no_journal() {
+        // Shutdown is the same reconcile with nothing wanted (what the
+        // programmer's Drop runs): every pin goes, and with the last one
+        // the file, so the next start inherits nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins");
+        let mut pinned = PinJournal::load(path.clone());
+        let t = FakeTable::with_gateway("192.168.1.1").watching(&path);
+        reconcile_pins(&t, &[ip("3.1.237.225"), ip("8.8.8.8")], &mut pinned);
+        assert!(path.exists());
+        reconcile_pins(&t, &[], &mut pinned);
+        assert_eq!(t.deleted.lock().unwrap().len(), 2);
+        assert!(pinned.is_empty());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -5,154 +5,320 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NetQ VPN coordinator</title>
 <style>
-:root{--bg:#f6f7fa;--fg:#1c1d23;--muted:#676a78;--line:#e1e3ea;--card:#fff;--sunk:#f0f1f5;
-      --ok:#0a7a44;--okbg:#e3f4ea;--off:#8a8a96;--offbg:#eeeef2;--warn:#a4571a;--warnbg:#fdf1e3;
-      --bad:#b3261e;--badbg:#fbe9e7;
-      --accent:#2456c9;--accent2:#7d3fd1;--heat:36,86,201;--shadow:0 1px 3px rgba(0,0,0,.07),0 8px 24px rgba(0,0,0,.06);
-      --side:236px}
+:root{
+  --bg:#edf2fa;--fg:#0f1b33;--muted:#5a6a86;--faint:#8b99b4;--line:#dbe3f0;--line2:#e8eef7;--card:#fff;--sunk:#f4f7fc;
+  --ok:#0e9a62;--okbg:#e0f5ea;--off:#7f8da6;--offbg:#edf1f7;--warn:#b45309;--warnbg:#fdf0da;--bad:#d1342b;--badbg:#fde8e6;
+  --accent:#2563eb;--accent-h:#1d4ed8;--accent2:#0ea5e9;--accentbg:#e7efff;--on-accent:#fff;--heat:37,99,235;
+  --side-bg:linear-gradient(180deg,#0a1a3d 0%,#0e2a5e 100%);--side-fg:#c9d8f6;--side-muted:#7d93c0;--side-line:rgba(255,255,255,.08);
+  --side-hover:rgba(255,255,255,.06);--side-active:rgba(96,165,250,.18);
+  --glow:rgba(37,99,235,.10);
+  --shadow-sm:0 1px 2px rgba(16,36,82,.06);
+  --shadow:0 1px 2px rgba(16,36,82,.05),0 10px 28px -10px rgba(16,36,82,.18);
+  --shadow-lg:0 30px 70px -18px rgba(8,22,58,.45);
+  --r:14px;--side:252px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 @media (prefers-color-scheme:dark){
-:root{--bg:#121318;--fg:#ececf1;--muted:#9a9ca8;--line:#2a2b34;--card:#1a1b22;--sunk:#15161c;
-      --ok:#54d19a;--okbg:#14301f;--off:#8a8a96;--offbg:#232329;--warn:#e0a35c;--warnbg:#33240f;
-      --bad:#ff7b72;--badbg:#3a1a17;
-      --accent:#7ea2ff;--accent2:#b48cff;--heat:126,162,255;--shadow:0 1px 3px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35)}}
+:root{
+  --bg:#08101f;--fg:#e4ebf9;--muted:#8fa0c3;--faint:#62739a;--line:#1b2945;--line2:#15213a;--card:#0e1830;--sunk:#0b1428;
+  --ok:#34d399;--okbg:#0d2e24;--off:#7c8cae;--offbg:#17223b;--warn:#fbbf24;--warnbg:#33260b;--bad:#f87171;--badbg:#3a1519;
+  --accent:#60a5fa;--accent-h:#93c5fd;--accent2:#38bdf8;--accentbg:#11244a;--on-accent:#061229;--heat:96,165,250;
+  --side-bg:linear-gradient(180deg,#060d1e 0%,#0a1633 100%);--glow:rgba(96,165,250,.08);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.3);--shadow:0 1px 2px rgba(0,0,0,.35),0 12px 30px -10px rgba(0,0,0,.5);--shadow-lg:0 30px 70px -18px rgba(0,0,0,.7)}}
 *{box-sizing:border-box}
-html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);
-     font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+html,body{min-height:100%}
+body{margin:0;color:var(--fg);background:radial-gradient(1100px 420px at 75% -160px,var(--glow),transparent 70%) no-repeat,var(--bg);
+     font:14.5px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
 [hidden]{display:none!important}
 a{color:var(--accent)}
-h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
-h2{font-size:12.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
-   margin:26px 0 10px;font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+h1{font-size:22px;margin:0;font-weight:700;letter-spacing:-.02em}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+   margin:28px 0 12px;font-weight:650;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 h2:first-child{margin-top:4px}
-h2 .gen{font-weight:700;color:var(--accent);text-transform:none;letter-spacing:0}
-h2 .uuid{font-weight:400;text-transform:none;letter-spacing:0;font-family:ui-monospace,Menlo,monospace;font-size:11px}
-h3{font-size:15px;margin:0 0 6px;font-weight:640}
+h2 .gen,.gen{font-weight:600;color:var(--accent);text-transform:none;letter-spacing:0}
+h3{font-size:15px;margin:0 0 4px;font-weight:650;letter-spacing:-.01em}
 .sub{color:var(--muted);font-size:13px}
 .muted{color:var(--muted)}
 .tiny{font-size:12px}
-.note{color:var(--muted);font-size:13px;margin:-4px 0 12px;max-width:74ch}
-code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
-button{font:inherit;font-size:13px;padding:6px 12px;border:1px solid var(--line);
-       border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;white-space:nowrap}
-button:hover{border-color:var(--accent);color:var(--accent)}
+.note{color:var(--muted);font-size:13px;margin:-2px 0 14px;max-width:78ch}
+code{font:12.5px/1.4 var(--mono)}
+.ic{flex:none;display:block}
+
+/* ---- controls ---- */
+button{font:inherit;font-size:13px;font-weight:550;height:34px;padding:0 13px;border:1px solid var(--line);display:inline-flex;align-items:center;gap:7px;
+       border-radius:10px;background:var(--card);color:var(--fg);cursor:pointer;white-space:nowrap;box-shadow:var(--shadow-sm);
+       transition:background-color .12s,border-color .12s,color .12s,box-shadow .12s}
+button:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));color:var(--accent)}
 button:disabled{opacity:.5;cursor:default}
-button.danger{border-color:var(--warn);color:var(--warn)}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-button.primary:hover{filter:brightness(1.08);color:#fff}
-button.ghost{border-color:transparent;background:transparent}
-input,select,textarea{font:inherit;font-size:14px;padding:7px 10px;border:1px solid var(--line);
-      border-radius:8px;background:var(--card);color:var(--fg);width:100%}
-input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
-textarea{min-height:72px;font-family:ui-monospace,Menlo,monospace;font-size:13px;resize:vertical}
-label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:4px;font-weight:600}
-.field{margin-bottom:14px}
-.help{font-size:12px;color:var(--muted);margin-top:4px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+button.primary{background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 88%,#fff),var(--accent));border-color:var(--accent);color:var(--on-accent);
+               box-shadow:0 1px 2px rgba(16,36,82,.15),0 4px 12px -4px color-mix(in srgb,var(--accent) 60%,transparent)}
+button.primary:hover{background:var(--accent-h);border-color:var(--accent-h);color:var(--on-accent)}
+button.danger{color:var(--bad)}
+button.danger:hover{border-color:var(--bad);background:var(--badbg);color:var(--bad)}
+button.ghost{border-color:transparent;background:transparent;box-shadow:none}
+button.sm{height:30px;padding:0 10px;font-size:12.5px;border-radius:9px}
+button.icon{width:30px;padding:0;justify-content:center}
+input,select,textarea{font:inherit;font-size:14px;padding:8px 11px;border:1px solid var(--line);
+      border-radius:10px;background:var(--card);color:var(--fg);width:100%;transition:border-color .12s,box-shadow .12s}
+input:hover,select:hover,textarea:hover{border-color:color-mix(in srgb,var(--accent) 35%,var(--line))}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+input:disabled,select:disabled{background:var(--sunk);color:var(--muted)}
+textarea{min-height:76px;font-family:var(--mono);font-size:13px;resize:vertical}
+label{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--fg);margin-bottom:6px;font-weight:600}
+.field{margin-bottom:16px}
+.help{font-size:12px;color:var(--muted);margin-top:5px;line-height:1.45}
+.tag{font-size:10.5px;padding:1px 7px;border-radius:999px;background:var(--accentbg);color:var(--accent);font-weight:650;letter-spacing:.01em}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
 @media (max-width:640px){.grid2{grid-template-columns:1fr}}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}
+.bar .spacer{flex:1}
 .msg{font-size:13px;color:var(--muted)}
 .err{color:var(--bad)}
-.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+a:focus-visible,button:focus-visible,[tabindex]:focus-visible,.node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.switch{display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:550;margin:0}
+.switch input{appearance:none;-webkit-appearance:none;width:40px;height:22px;border-radius:999px;background:var(--line);position:relative;
+              cursor:pointer;flex:none;padding:0;border:none;transition:background-color .15s}
+.switch input::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;
+                     box-shadow:0 1px 3px rgba(0,0,0,.25);transition:left .15s}
+.switch input:checked{background:var(--accent)}
+.switch input:checked::after{left:21px}
+details.more{border:1px solid var(--line);border-radius:12px;padding:0 16px;margin:4px 0 8px;background:var(--sunk)}
+details.more>summary{cursor:pointer;padding:12px 0;font-weight:600;font-size:13px;list-style:none;display:flex;align-items:center;gap:8px}
+details.more>summary::-webkit-details-marker{display:none}
+details.more>summary::before{content:"›";display:inline-block;transition:transform .15s;color:var(--muted);font-size:16px;line-height:1}
+details.more[open]>summary::before{transform:rotate(90deg)}
+details.more>summary .muted{font-weight:400}
+details.more[open]{padding-bottom:4px}
+
+/* ---- pills ---- */
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;line-height:1.5}
 .on{background:var(--okbg);color:var(--ok)}
 .offl{background:var(--offbg);color:var(--off)}
 .dis{background:var(--warnbg);color:var(--warn)}
 .warnpill{background:var(--warnbg);color:var(--warn)}
 .badpill{background:var(--badbg);color:var(--bad)}
-.rolepill{background:var(--sunk);color:var(--muted);font-weight:600}
+.rolepill{background:var(--accentbg);color:var(--accent);font-weight:600}
+.pill.on::before,.pill.offl::before,.pill.dis::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.pill.on::before{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 22%,transparent)}
+@keyframes flash{from{box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 45%,transparent)}to{box-shadow:0 0 0 4px transparent}}
+.flash{animation:flash 1.4s ease-out}
 .subline{display:block;font-size:11.5px;color:var(--muted);margin-top:2px}
 .subline.warn{color:var(--warn)}
-.name{cursor:pointer;font-weight:560}
-.name:hover{color:var(--accent)}
-.actions{display:flex;gap:5px;flex-wrap:nowrap}
-.actions button{padding:4px 9px;font-size:12.5px}
 
 /* ---- login ---- */
-.login{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px}
-.login .card{width:100%;max-width:380px;padding:28px 28px 22px}
-.brand{display:flex;align-items:center;gap:10px}
-.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));
-      display:inline-block;flex:none;position:relative}
-.logo::after{content:"";position:absolute;inset:8px;border:2px solid #fff;border-radius:50%;opacity:.9}
-.brand .t{font-weight:700;letter-spacing:-.01em}
-.brand .s{font-size:12px;color:var(--muted);display:block;margin-top:-2px}
+.login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+       background:radial-gradient(900px 500px at 20% 0%,rgba(56,130,246,.35),transparent 60%),radial-gradient(700px 500px at 100% 100%,rgba(14,165,233,.25),transparent 60%),#0a1a3d}
+.login .card{width:100%;max-width:390px;padding:30px 30px 24px;box-shadow:var(--shadow-lg);border:none}
+.brand{display:flex;align-items:center;gap:11px}
+.logo{width:32px;height:32px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#0ea5e9);
+      display:inline-block;flex:none;position:relative;box-shadow:0 4px 14px -4px rgba(14,165,233,.7)}
+.logo::after{content:"";position:absolute;inset:9px;border:2.5px solid #fff;border-radius:50%}
+.brand .t{font-weight:750;letter-spacing:-.01em;font-size:15px}
+.brand .s{font-size:11.5px;color:var(--muted);display:block;margin-top:-2px}
 
 /* ---- shell ---- */
-.top{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);
-     background:var(--card);position:sticky;top:0;z-index:20}
+#app{display:grid;grid-template-columns:var(--side) minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--side-bg);color:var(--side-fg);
+      display:flex;flex-direction:column;gap:6px;padding:18px 14px 14px}
+.side .brand{padding:2px 6px 16px;border-bottom:1px solid var(--side-line);margin-bottom:10px}
+.side .brand .t{color:#fff}
+.side .brand .s{color:var(--side-muted)}
+.side .h{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--side-muted);font-weight:650;padding:8px 10px 4px}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav a{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;color:var(--side-fg);text-decoration:none;font-size:14px;font-weight:500;position:relative}
+.nav a:hover{background:var(--side-hover);color:#fff}
+.nav a.active{background:var(--side-active);color:#fff;font-weight:600}
+.nav a.active::before{content:"";position:absolute;left:-14px;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:#60a5fa}
+.nav a .hd{width:7px;height:7px;border-radius:50%;background:var(--side-muted);flex:none}
+.nav a .hd.ok{background:#34d399;box-shadow:0 0 0 3px rgba(52,211,153,.18)}
+.nav a .hd.warn{background:#fbbf24}
+.nav a .cnt{margin-left:auto;font-size:11.5px;color:var(--side-muted);font-variant-numeric:tabular-nums;background:rgba(255,255,255,.06);padding:0 7px;border-radius:999px}
+.side .foot{margin-top:auto;display:flex;flex-direction:column;gap:8px;padding-top:14px}
+.side .foot .pair{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.side .foot button{width:100%;justify-content:center}
+.side .foot button:not(.primary){background:rgba(255,255,255,.05);border-color:var(--side-line);color:var(--side-fg);box-shadow:none}
+.side .foot button:not(.primary):hover{background:rgba(255,255,255,.1);color:#fff}
+.side .me{display:flex;align-items:center;gap:10px;padding:12px 6px 2px;border-top:1px solid var(--side-line);margin-top:6px}
+.side .me .av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#0ea5e9);color:#fff;display:grid;place-items:center;font-weight:700;font-size:13px;text-transform:uppercase;flex:none}
+.side .me .u{font-size:13px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis}
+.side .me .u{flex:1;min-width:0;white-space:nowrap}
+.side .foot .me button{margin-left:auto;width:auto;color:var(--side-muted);background:transparent;border-color:transparent}
+.side .me button:hover{color:#fff;background:var(--side-hover)}
+.mainwrap{min-width:0;display:flex;flex-direction:column}
+.top{display:flex;align-items:center;gap:14px;padding:10px 32px;position:sticky;top:0;z-index:20;
+     background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:saturate(1.4) blur(10px);-webkit-backdrop-filter:saturate(1.4) blur(10px);
+     border-bottom:1px solid color-mix(in srgb,var(--line) 70%,transparent)}
 .top .spacer{flex:1}
-.live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--off);display:inline-block}
+.live{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);font-weight:550;
+      background:var(--card);border:1px solid var(--line);padding:3px 10px 3px 9px;border-radius:999px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--off);display:inline-block}
 .dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--okbg)}
 .dot.bad{background:var(--warn);box-shadow:0 0 0 3px var(--warnbg)}
-.shell{display:grid;grid-template-columns:var(--side) 1fr;min-height:calc(100% - 52px)}
-.side{border-right:1px solid var(--line);background:var(--card);padding:14px 12px;display:flex;flex-direction:column;gap:6px}
-.side .h{font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600;padding:4px 8px}
-.nav{display:flex;flex-direction:column;gap:2px}
-.nav a{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;color:var(--fg);text-decoration:none;font-size:14px}
-.nav a:hover{background:var(--sunk)}
-.nav a.active{background:var(--sunk);color:var(--accent);font-weight:600}
-.nav a .cnt{margin-left:auto;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
-.side .foot{margin-top:auto;display:flex;flex-direction:column;gap:6px;padding-top:12px}
-.side .foot button{width:100%}
-main{padding:20px 24px 70px;min-width:0}
-.crumbs{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;font-size:13px;color:var(--muted)}
-.crumbs a{text-decoration:none}
-.title{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:6px}
-.title h1{font-size:22px}
+#clock{font-variant-numeric:tabular-nums}
+main{padding:24px 32px 90px;width:100%;max-width:1480px}
+#msg{position:fixed;right:22px;bottom:22px;z-index:60;max-width:min(440px,calc(100vw - 44px));padding:11px 16px;border-radius:12px;
+     background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow);font-size:13.5px;color:var(--fg);cursor:pointer;
+     border-left:4px solid var(--ok);animation:toast .18s ease-out}
+#msg.err{border-left-color:var(--bad)}
+#msg:empty{display:none}
+@keyframes toast{from{transform:translateY(8px);opacity:0}}
+.crumbs{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;color:var(--muted)}
+.crumbs a{text-decoration:none;font-weight:550}
+.phead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:8px 0 18px}
+.phead .chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);background:var(--card);border:1px solid var(--line);
+      padding:2px 10px;border-radius:999px;font-weight:550}
+.chip code{font-size:11.5px}
 @media (max-width:860px){
-  .shell{grid-template-columns:1fr}
-  .side{border-right:none;border-bottom:1px solid var(--line);flex-direction:row;align-items:center;overflow-x:auto;gap:8px;padding:8px 12px}
-  .side .h{display:none}
+  #app{display:block}
+  .side{position:sticky;height:auto;z-index:30;flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 12px}
+  .side .nav{order:3;width:100%;overflow-x:auto;scrollbar-width:none}
+  .side .brand{border:none;padding:0 6px 0 0;margin:0}
+  .side .brand .s,.side .h,.side .me .u,.side .me .av{display:none}
   .nav{flex-direction:row}
   .nav a{white-space:nowrap}
-  .side .foot{margin-top:0;margin-left:auto;flex-direction:row;padding-top:0}
+  .nav a.active::before{display:none}
+  .side .foot{margin:0 0 0 auto;flex-direction:row;padding:0}
+  .side .foot .pair{display:flex}
   .side .foot button{width:auto}
-  main{padding:16px 14px 60px}
-  .top{padding:10px 12px}
+  .side .me{border:none;margin:0;padding:0}
+  .top{padding:8px 16px;position:static}
+  main{padding:16px 16px 70px}
   .hide-sm{display:none!important}
 }
+@media (max-width:520px){.side .foot .pair{display:none}}
 
 /* ---- cards ---- */
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.card .n{font-size:24px;font-weight:640;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-.card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
-.netcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.netcard{cursor:pointer;transition:border-color .12s}
-.netcard:hover{border-color:var(--accent)}
-.netcard .nm{font-weight:650;font-size:16px;display:flex;align-items:center;gap:8px}
-.netcard .facts{display:flex;gap:16px;margin-top:10px;font-size:13px;color:var(--muted)}
-.netcard .facts b{color:var(--fg);font-variant-numeric:tabular-nums}
-.empty{color:var(--muted);font-size:13px;padding:18px;text-align:center;border:1px dashed var(--line);border-radius:10px}
-.hero{padding:34px 22px;text-align:center}
-.hero p{max-width:56ch;margin:8px auto 18px;color:var(--muted)}
-
-/* ---- tables ---- */
-.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
-table{border-collapse:collapse;width:100%;font-size:14px}
-th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;
-   letter-spacing:.04em;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
-tr:last-child td{border-bottom:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px 18px;box-shadow:var(--shadow-sm)}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px;margin:14px 0 8px}
+.stat{display:flex;align-items:center;gap:14px}
+.stat .ico{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:var(--accentbg);color:var(--accent);flex:none}
+.stat .ico.ok{background:var(--okbg);color:var(--ok)}
+.stat .n{white-space:nowrap;font-size:22px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.15}
+.stat .l{color:var(--muted);font-size:12px;font-weight:550}
+.netcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.netcard{cursor:pointer;transition:border-color .12s,box-shadow .15s,transform .15s}
+.netcard:hover{border-color:color-mix(in srgb,var(--accent) 50%,var(--line));box-shadow:var(--shadow);transform:translateY(-2px)}
+.netcard .nm{font-weight:700;font-size:16px;display:flex;align-items:center;gap:8px;letter-spacing:-.01em}
+.netcard .nm .gen{margin-left:auto;font-size:11.5px;color:var(--muted);font-weight:500}
+.netcard .facts{display:flex;gap:18px;margin-top:12px;font-size:13px;color:var(--muted)}
+.netcard .facts b{color:var(--fg);font-variant-numeric:tabular-nums;font-weight:650}
+.meter{height:6px;border-radius:999px;background:var(--sunk);overflow:hidden;margin-top:12px;border:1px solid var(--line2)}
+.meter i{display:block;height:100%;background:linear-gradient(90deg,var(--ok),color-mix(in srgb,var(--ok) 70%,#fff));border-radius:999px;transition:width .4s ease}
+.empty{color:var(--muted);font-size:13px;padding:22px;text-align:center;border:1.5px dashed var(--line);border-radius:12px;background:color-mix(in srgb,var(--card) 50%,transparent)}
+.empty.spaced{margin-top:16px}
+.hero{padding:40px 24px;text-align:center}
+.hero p{max-width:56ch;margin:8px auto 20px;color:var(--muted)}
+.hero button{margin:0 auto}
 
 /* ---- tabs ---- */
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:20px;overflow-x:auto}
-.tabs a{border:none;background:none;border-radius:0;padding:9px 14px;color:var(--muted);text-decoration:none;
-        font-weight:560;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;font-size:14px}
-.tabs a:hover{color:var(--fg)}
-.tabs a.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tabs{display:inline-flex;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px;margin-bottom:22px;
+      max-width:100%;overflow-x:auto;box-shadow:var(--shadow-sm)}
+.tabs a{padding:6px 14px;color:var(--muted);text-decoration:none;font-weight:600;border-radius:9px;white-space:nowrap;font-size:13.5px;
+        display:inline-flex;align-items:center;gap:7px;transition:background-color .12s,color .12s}
+.tabs a:hover{color:var(--fg);background:var(--sunk)}
+.tabs a.active{background:var(--accent);color:var(--on-accent)}
+.tabs a .cnt{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;padding:0 6px;border-radius:999px;background:var(--sunk);color:var(--muted)}
+.tabs a.active .cnt{background:rgba(255,255,255,.22);color:inherit}
+
+/* ---- members ---- */
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.toolbar .spacer{flex:1}
+.searchbox{position:relative;width:280px;max-width:100%}
+.searchbox .ic{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--faint);pointer-events:none}
+.searchbox input{padding-left:34px;height:34px;font-size:13.5px}
+.seg{display:inline-flex;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:3px;box-shadow:var(--shadow-sm)}
+.seg button{height:26px;padding:0 10px;border:none;box-shadow:none;border-radius:7px;background:transparent;color:var(--muted);font-size:12.5px}
+.seg button:hover{color:var(--fg);background:var(--sunk)}
+.seg button.sel{background:var(--accentbg);color:var(--accent)}
+.seg button .n{font-variant-numeric:tabular-nums;opacity:.75}
+.seg button.warnseg.sel{background:var(--warnbg);color:var(--warn)}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+.mcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow-sm);display:flex;flex-direction:column;
+       position:relative;overflow:hidden;transition:box-shadow .15s,border-color .15s}
+.mcard:hover{box-shadow:var(--shadow);border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
+.mcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--st,var(--line))}
+.mcard.st-on{--st:var(--ok)} .mcard.st-dis{--st:var(--warn)} .mcard.st-bad{--st:var(--bad)} .mcard.st-off{--st:var(--line)}
+.mhead{display:flex;gap:12px;align-items:center;padding:14px 16px 12px;cursor:pointer}
+.mhead:hover .mname{color:var(--accent)}
+.avatar{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;flex:none;background:var(--accentbg);color:var(--accent)}
+.avatar.relay{background:linear-gradient(135deg,#2563eb,#0ea5e9);color:#fff}
+.mcard.st-off .avatar.relay,.mcard.st-dis .avatar.relay{background:var(--offbg);color:var(--off)}
+.who{min-width:0;flex:1}
+.mname{font-weight:650;font-size:15px;display:flex;align-items:baseline;gap:7px;letter-spacing:-.01em;transition:color .12s}
+.mname span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nid{font:500 11.5px var(--mono);color:var(--faint)}
+.maddr{font:12.5px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mfacts{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin:0;padding:12px 16px;border-top:1px solid var(--line2)}
+.mfacts div{min-width:0}
+.mfacts .wide{grid-column:1/-1}
+.mfacts dt{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);font-weight:650;margin-bottom:2px}
+.mfacts dd{margin:0;font-size:13px;font-weight:500;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mfacts dd.muted{color:var(--muted);font-weight:400}
+.mfacts dd.bad{color:var(--bad)}
+.cidrs{display:flex;flex-wrap:wrap;gap:5px;white-space:normal}
+.cidrs code{background:var(--sunk);border:1px solid var(--line2);border-radius:6px;padding:1px 7px;font-size:12px}
+.issues{margin:0 16px 12px;padding:8px 11px;border-radius:10px;background:var(--badbg);color:var(--bad);font-size:12.5px;line-height:1.45;display:flex;flex-direction:column;gap:3px}
+.issues.warn{background:var(--warnbg);color:var(--warn)}
+.issues div{display:flex;gap:7px;align-items:flex-start}
+.issues .ic{margin-top:2px}
+.mjoin{padding:0 16px 12px;font-size:12px;color:var(--faint)}
+.mfoot{display:flex;gap:6px;align-items:center;padding:10px 12px;border-top:1px solid var(--line2);background:var(--sunk);margin-top:auto}
+.mfoot .spacer{flex:1}
+.mfoot button{box-shadow:none}
+
+/* ---- tables ---- */
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--r);background:var(--card);box-shadow:var(--shadow-sm)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th{text-align:left;font-weight:650;color:var(--faint);font-size:11px;text-transform:uppercase;background:var(--sunk);
+   letter-spacing:.06em;padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid var(--line2);white-space:nowrap;vertical-align:top;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+tbody tr{transition:background-color .12s}
+tbody tr:hover td{background:color-mix(in srgb,var(--accentbg) 45%,transparent)}
+.matrix tbody tr:hover td{background:transparent}
+
+/* ---- settings ---- */
+.settings{display:grid;grid-template-columns:210px minmax(0,1fr);gap:22px;align-items:start}
+.snav{display:flex;flex-direction:column;gap:2px;position:sticky;top:70px}
+.snav button{justify-content:flex-start;border:none;box-shadow:none;background:transparent;color:var(--muted);height:36px;font-size:13.5px}
+.snav button:hover{background:var(--card);color:var(--fg)}
+.snav button.active{background:var(--card);color:var(--accent);box-shadow:var(--shadow-sm);border:1px solid var(--line)}
+.snav button.dz{color:var(--bad)}
+.snav button .ic{opacity:.8}
+.spanel{padding:22px 24px 8px;max-width:760px}
+.spanel>h3{font-size:17px}
+.spanel>.note{margin-bottom:20px}
+.savebar{position:sticky;bottom:14px;display:flex;align-items:center;gap:10px;margin-top:14px;max-width:760px;
+         padding:10px 12px 10px 18px;border-radius:12px;background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow)}
+.savebar .state{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:8px}
+.savebar.dirty .state{color:var(--warn);font-weight:600}
+.savebar.dirty .state::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--warn)}
+.savebar .spacer{flex:1}
+@media (max-width:860px){.settings{grid-template-columns:1fr}.snav{flex-direction:row;overflow-x:auto;position:static}.spanel{padding:18px 16px 4px}}
+.danger-zone{border:1px solid color-mix(in srgb,var(--bad) 40%,var(--line));border-radius:12px;padding:16px 18px;margin:6px 0 16px;background:var(--badbg)}
+.danger-zone p{margin:4px 0 14px;color:var(--fg);font-size:13px}
+
+/* ---- member form ---- */
+.choice{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px}
+.choice button{height:auto;padding:13px 14px;text-align:left;align-items:flex-start;white-space:normal;border-radius:12px;gap:11px;flex-direction:row}
+.choice button .avatar{width:34px;height:34px}
+.choice button b{display:block;font-size:14px;color:var(--fg)}
+.choice button span.d{display:block;font-size:12px;color:var(--muted);font-weight:400;margin-top:2px;line-height:1.4}
+.choice button.sel{border-color:var(--accent);background:var(--accentbg);box-shadow:0 0 0 1px var(--accent) inset}
+.fsec{margin:6px 0 4px}
+.fsec>h4{margin:0 0 12px;font-size:11.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);font-weight:700;display:flex;align-items:center;gap:10px}
+.fsec>h4::after{content:"";flex:1;height:1px;background:var(--line2)}
 
 /* ---- traffic matrix ---- */
 .matrix{border-collapse:separate;border-spacing:0;font-size:13px;width:auto;min-width:100%}
-.matrix th,.matrix td{border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+.matrix th,.matrix td{border-bottom:1px solid var(--line2);border-right:1px solid var(--line2)}
 .matrix th:last-child,.matrix td:last-child{border-right:none}
-.matrix thead th{position:sticky;top:0;background:var(--card);z-index:2;text-align:center;padding:9px 12px}
+.matrix thead th{position:sticky;top:0;z-index:2;text-align:center;padding:9px 12px}
 .matrix tbody th{text-align:left;position:sticky;left:0;background:var(--card);z-index:1;
                  text-transform:none;font-size:13px;letter-spacing:0;color:var(--fg);font-weight:600}
-.matrix td{padding:8px 12px;text-align:right;font-variant-numeric:tabular-nums;position:relative}
-.matrix .corner{background:var(--card);z-index:3;left:0}
+.matrix td{padding:8px 12px;text-align:right;position:relative}
+.matrix .corner{z-index:3;left:0}
 .cell{display:flex;flex-direction:column;gap:1px;align-items:flex-end;position:relative;z-index:1}
 .cell .up{color:var(--fg);font-weight:560}
 .cell .dn{color:var(--muted);font-size:12px}
@@ -166,42 +332,44 @@ tr:last-child td{border-bottom:none}
 .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
 
 /* ---- topology ---- */
-.map{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.map{background:radial-gradient(600px 300px at 50% 45%,color-mix(in srgb,var(--accent) 7%,transparent),transparent),var(--card);
+     border:1px solid var(--line);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow-sm)}
 .map svg{display:block;width:100%;height:auto}
 .node{cursor:pointer}
 .node:hover .ring{stroke-width:3}
-.nlabel{font:600 13px ui-sans-serif,system-ui,sans-serif;fill:var(--fg);text-anchor:middle}
-.nsub{font:11px ui-monospace,Menlo,monospace;fill:var(--muted);text-anchor:middle}
-.clabel{font:10px ui-sans-serif,system-ui,sans-serif;fill:var(--muted);text-anchor:middle}
+.nlabel{font:600 13px Inter,ui-sans-serif,system-ui,sans-serif;fill:var(--fg);text-anchor:middle}
+.nsub{font:11px var(--mono);fill:var(--muted);text-anchor:middle}
+.clabel{font:10.5px Inter,ui-sans-serif,system-ui,sans-serif;fill:var(--muted);text-anchor:middle}
 .link{stroke:var(--accent);stroke-linecap:round}
 .link.dead{stroke:var(--off);stroke-dasharray:5 5;opacity:.4}
 
 /* ---- modal ---- */
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;
-         justify-content:center;padding:24px;z-index:50;backdrop-filter:blur(2px)}
-.modal{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);
-       max-width:680px;width:100%;max-height:88vh;overflow:auto}
-.modal header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 22px;border-bottom:1px solid var(--line);
-              position:sticky;top:0;background:var(--card);border-radius:14px 14px 0 0;z-index:1}
-.modal .body{padding:18px 22px 22px}
-@media (max-width:640px){.overlay{padding:0;align-items:stretch}.modal{max-height:100vh;border-radius:0;max-width:none}}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;font-size:13px;margin-bottom:18px}
+.overlay{position:fixed;inset:0;background:rgba(6,16,40,.5);display:flex;align-items:center;
+         justify-content:center;padding:24px;z-index:50;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-lg);
+       max-width:680px;width:100%;max-height:88vh;overflow:auto;animation:pop .16s ease-out}
+@keyframes pop{from{transform:translateY(6px) scale(.985);opacity:0}}
+.modal header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:16px 22px;border-bottom:1px solid var(--line2);
+              position:sticky;top:0;background:color-mix(in srgb,var(--card) 92%,transparent);backdrop-filter:blur(8px);z-index:1}
+.modal header h1{font-size:17px}
+.modal .body{padding:20px 22px 22px}
+@media (max-width:640px){.overlay{padding:0;align-items:stretch}.modal{max-height:100vh;border-radius:0;max-width:none}.choice{grid-template-columns:1fr}}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;font-size:13px;margin:0 0 18px;padding:14px 16px;border-radius:12px;background:var(--sunk);border:1px solid var(--line2)}
 .kv dt{color:var(--muted)}
-.kv dd{margin:0;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
-.clist{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:9px;overflow:hidden}
-.clist li{display:flex;align-items:center;gap:10px;padding:9px 13px;border-bottom:1px solid var(--line);font-size:13px}
+.kv dd{margin:0;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-word}
+.clist{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.clist li{display:flex;align-items:center;gap:10px;padding:9px 13px;border-bottom:1px solid var(--line2);font-size:13px}
 .clist li:last-child{border-bottom:none}
 .clist .nm{font-weight:560}
-.clist .ips{margin-left:auto;font-family:ui-monospace,Menlo,monospace;color:var(--muted);font-size:12px}
-.tokenbox{border:1px solid var(--accent);border-radius:10px;background:var(--sunk);
-          padding:14px 16px;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
-          word-break:break-all;user-select:all}
-.warnbar{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:9px;
-         background:var(--warnbg);color:var(--warn);font-size:13px;line-height:1.5;margin-bottom:14px}
+.clist .ips{margin-left:auto;font-family:var(--mono);color:var(--muted);font-size:12px}
+.tokenbox{border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:12px;background:var(--accentbg);
+          padding:14px 16px;font:12.5px/1.6 var(--mono);word-break:break-all;user-select:all}
+.warnbar{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:12px;
+         background:var(--okbg);color:var(--ok);font-size:13px;line-height:1.5;margin-bottom:14px}
 .warnbar b{font-weight:680}
-.cfg{padding:14px;font:12.5px/1.6 ui-monospace,Menlo,monospace;white-space:pre;overflow-x:auto;user-select:all;
-     background:var(--sunk);border:1px solid var(--line);border-radius:9px}
-.danger-zone{border:1px solid var(--warn);border-radius:10px;padding:14px 16px;margin-top:26px}
+.cfg{padding:14px 16px;font:12.5px/1.65 var(--mono);white-space:pre;overflow-x:auto;user-select:all;margin:0 0 12px;
+     background:#0b1530;color:#d6e2ff;border:1px solid var(--line);border-radius:12px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
 <body>
@@ -209,38 +377,39 @@ tr:last-child td{border-bottom:none}
 <div id="login" class="login" hidden>
   <div class="card">
     <div class="brand"><span class="logo"></span><div><span class="t">NetQ VPN</span><span class="s">coordinator</span></div></div>
-    <form id="loginForm" style="margin-top:22px">
+    <h1 style="margin:26px 0 4px;font-size:20px">Sign in</h1>
+    <p class="note" style="margin:0 0 18px">Manage your networks, members and relays.</p>
+    <form id="loginForm">
       <div class="field"><label for="lu">User</label><input id="lu" autocomplete="username" required></div>
       <div class="field"><label for="lp">Password</label><input id="lp" type="password" autocomplete="current-password" required></div>
-      <div class="row"><button class="primary" type="submit" id="loginBtn">Sign in</button><span class="msg err" id="loginErr"></span></div>
+      <button class="primary" type="submit" id="loginBtn" style="width:100%;justify-content:center;height:38px">Sign in</button>
+      <div class="msg err" id="loginErr" style="margin-top:10px"></div>
     </form>
-    <p class="note" style="margin-top:18px">No login configured? Set <code>[admin] user</code> and <code>password_hash</code> in
+    <p class="note" style="margin:16px 0 0;font-size:12px">No login configured? Set <code>[admin] user</code> and <code>password_hash</code> in
       <code>coordinator.toml</code> (<code>nqvpn-coord hash-password</code>).</p>
   </div>
 </div>
 
 <div id="app" hidden>
-  <header class="top">
-    <div class="brand"><span class="logo"></span><div><span class="t">NetQ VPN</span><span class="s hide-sm">coordinator</span></div></div>
-    <span class="live"><span class="dot" id="dot"></span><span id="liveText">connecting</span></span>
-    <span class="spacer"></span>
-    <span class="msg" id="msg"></span>
-    <span class="sub hide-sm" id="clock"></span>
-    <span class="sub" id="who"></span>
-    <button class="ghost" id="logout">Sign out</button>
-  </header>
-  <div class="shell">
-    <nav class="side">
-      <div class="h">Networks</div>
-      <div class="nav" id="nav"></div>
-      <div class="foot">
-        <button class="primary" id="newNet">+ New network</button>
-        <button id="exportBtn">Export</button>
-        <button id="importBtn">Import</button>
-      </div>
-    </nav>
+  <nav class="side">
+    <div class="brand"><span class="logo"></span><div><span class="t">NetQ VPN</span><span class="s">coordinator</span></div></div>
+    <div class="h">Networks</div>
+    <div class="nav" id="nav"></div>
+    <div class="foot">
+      <button class="primary" id="newNet">+ New network</button>
+      <div class="pair"><button id="exportBtn">Export</button><button id="importBtn">Import</button></div>
+      <div class="me"><span class="av" id="whoAv"></span><span class="u" id="who"></span><button class="ghost sm" id="logout" title="Sign out">Sign out</button></div>
+    </div>
+  </nav>
+  <div class="mainwrap">
+    <header class="top">
+      <span class="live"><span class="dot" id="dot"></span><span id="liveText">connecting</span></span>
+      <span class="spacer"></span>
+      <span class="sub hide-sm" id="clock"></span>
+    </header>
     <main id="view"></main>
   </div>
+  <div class="msg" id="msg" role="status" aria-live="polite"></div>
 </div>
 
 <div class="overlay" id="overlay" hidden>
@@ -249,7 +418,7 @@ tr:last-child td{border-bottom:none}
       <h1 id="modal-title"></h1>
       <span class="sub" id="modal-sub"></span>
       <span class="spacer" style="flex:1"></span>
-      <button id="modal-close">Close</button>
+      <button id="modal-close" class="sm">Close</button>
     </header>
     <div class="body" id="modal-body"></div>
   </div>
@@ -263,13 +432,42 @@ const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.classN
 const svgEl = (t, attrs = {}) => { const e = document.createElementNS('http://www.w3.org/2000/svg', t);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
 const enc = encodeURIComponent;
+// Line icons, 24-unit grid, drawn with currentColor.
+const ICONS = {
+  server: 'M4 4h16v7H4zM4 13h16v7H4zM8 7.5h.01M8 16.5h.01',
+  laptop: 'M5 5h14v10H5zM2 19h20',
+  key: 'M4 15a4 4 0 1 0 8 0a4 4 0 1 0-8 0M11 12l9-9M16 7l3 3',
+  edit: 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4',
+  power: 'M12 3v9M6.3 7.3a8 8 0 1 0 11.4 0',
+  trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+  globe: 'M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18',
+  search: 'M4 11a7 7 0 1 0 14 0a7 7 0 1 0-14 0M20 20l-4-4',
+  plus: 'M12 5v14M5 12h14',
+  alert: 'M12 4 2.5 20h19zM12 10v4M12 17h.01',
+  users: 'M5 11a3 3 0 1 0 6 0a3 3 0 1 0-6 0M2.5 20c0-3 2.7-5 5.5-5s5.5 2 5.5 5M15 5a3 3 0 0 1 0 6M17 15c2.3.4 4 2.2 4 5',
+  pulse: 'M3 12h4l3-7 4 14 3-7h4',
+  swap: 'M7 4v16M3 8l4-4 4 4M17 20V4M13 16l4 4 4-4',
+  hash: 'M5 9h14M5 15h14M10 3 8 21M16 3l-2 18',
+  clock: 'M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0M12 7v5l3 2',
+  shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z',
+};
+function icon(name, size = 16) {
+  const s = svgEl('svg', { viewBox: '0 0 24 24', width: size, height: size, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.8,
+    'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: 'ic' });
+  s.append(svgEl('path', { d: ICONS[name] })); return s;
+}
 
 /* ---------- state ---------- */
 /** The latest live frame: { networks: [summary], status: {id: NetworkStatus} }. */
 let frame = { networks: [], status: {} };
 let route = { page: 'home' };
-let ws = null, wsBackoff = 1000, staleWhileBusy = false;
+let ws = null, wsBackoff = 1000;
+/** Operator-typed filter on the members table; survives live frames. */
+let memberFilter = '';
+/** Members quick filter (all / online / offline / attention) and the open settings section. */
+let memberState = 'all', settingsSection = 'addressing';
 
+$('#msg').onclick = () => { $('#msg').textContent = ''; };
 function msg(text, isErr) { const m = $('#msg'); m.textContent = text; m.className = isErr ? 'msg err' : 'msg';
   if (!isErr) setTimeout(() => { if (m.textContent === text) m.textContent = ''; }, 6000); }
 
@@ -341,8 +539,12 @@ function heading(st, label) {
   const g = el('span', 'gen'); g.append(fmtGen(st.gen)); h.append(g);
   return h;
 }
-function field(labelText, input, help) {
-  const f = el('div', 'field'); const l = el('label', null, labelText); f.append(l, input);
+let fieldSeq = 0;
+function field(labelText, input, help, tag) {
+  const f = el('div', 'field'); const l = el('label', null, labelText);
+  if (tag) { const t = el('span', 'tag', tag); t.title = 'Changing this makes every member re-join to apply it'; l.append(t); }
+  if (['INPUT', 'SELECT', 'TEXTAREA'].includes(input.tagName)) { if (!input.id) input.id = 'fld' + (++fieldSeq); l.htmlFor = input.id; }
+  f.append(l, input);
   if (help) f.append(el('div', 'help', help)); return f;
 }
 function inp(value, attrs = {}) { const i = el('input'); i.value = value ?? ''; for (const [k, v] of Object.entries(attrs)) i.setAttribute(k, v); return i; }
@@ -392,7 +594,7 @@ function cidrNetwork(s) {
 
 /* ---------- login ---------- */
 function showLogin() { $('#app').hidden = true; $('#login').hidden = false; if (ws) { ws.onclose = null; ws.close(); ws = null; } $('#lu').focus(); }
-function showApp(user) { $('#login').hidden = true; $('#app').hidden = false; $('#who').textContent = user || ''; connectWs(); render(); }
+function showApp(user) { $('#login').hidden = true; $('#app').hidden = false; $('#who').textContent = user || ''; $('#whoAv').textContent = (user || '?').slice(0, 1); connectWs(); render(); }
 $('#loginForm').onsubmit = async e => {
   e.preventDefault(); $('#loginBtn').disabled = true; $('#loginErr').textContent = '';
   try {
@@ -419,10 +621,7 @@ function connectWs() {
     let f; try { f = JSON.parse(ev.data); } catch { return; }
     if (f.type !== 'status') return;
     frame = f;
-    // Re-rendering under an open modal or while typing throws away what
-    // the operator is doing; hold the frame and paint it afterwards.
-    const busy = !$('#overlay').hidden || ['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName);
-    if (busy) { staleWhileBusy = true; renderNav(); } else render();
+    scheduleRender();
   };
   sock.onclose = async () => {
     ws = null;
@@ -438,7 +637,17 @@ function scheduleReconnect() {
   setTimeout(() => { if (!$('#app').hidden) connectWs(); }, wsBackoff);
   wsBackoff = Math.min(wsBackoff * 2, 10000);
 }
-document.addEventListener('focusout', () => { if (staleWhileBusy && $('#overlay').hidden) { staleWhileBusy = false; render(); } });
+// A burst of frames is coalesced into one paint, and a hidden tab is not
+// painted at all: it catches up with the latest frame on return. Not
+// requestAnimationFrame: it stalls in a covered window that is not
+// `hidden`, which would leave the page frozen on its last paint.
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return; renderQueued = true;
+  if (document.hidden) return;
+  setTimeout(() => { renderQueued = false; render(); }, 0);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && renderQueued) { renderQueued = false; render(); } });
 
 /* ---------- routing ---------- */
 function parseRoute() {
@@ -452,14 +661,17 @@ route = parseRoute();
 const go = h => { location.hash = h; };
 
 function renderNav() {
-  const nav = $('#nav'); nav.replaceChildren();
+  const nav = el('div');
   const home = el('a', route.page === 'home' ? 'active' : '', 'Overview'); home.href = '#/'; nav.append(home);
   for (const n of frame.networks) {
     const a = el('a', route.page === 'net' && route.id === n.network_id ? 'active' : '');
     a.href = '#/n/' + enc(n.network_id);
-    a.append(el('span', null, n.network_id), el('span', 'cnt', `${n.members_online}/${n.members_total}`));
+    a.setAttribute('data-key', n.network_id);
+    const hd = el('span', 'hd' + (n.members_online ? ' ok' : '')); hd.title = n.members_online ? 'members online' : 'nobody online';
+    a.append(hd, el('span', null, n.network_id), el('span', 'cnt', `${n.members_online}/${n.members_total}`));
     nav.append(a);
   }
+  patchChildren($('#nav'), nav);
 }
 
 function render() {
@@ -470,7 +682,54 @@ function render() {
     if (!st) { out.append(el('div', 'empty', frame.networks.length ? `No network named “${route.id}”.` : 'Loading…')); }
     else out.append(networkPage(st, route.tab));
   } else out.append(homePage());
-  view.replaceChildren(...out.children);
+  // A new page starts clean; the same page is patched in place (below).
+  const key = JSON.stringify(route);
+  if (key !== renderedRoute) { renderedRoute = key; view.replaceChildren(...out.childNodes); }
+  else patchChildren(view, out);
+}
+let renderedRoute = null;
+
+/* ---------- in-place patching ----------
+ * Pages are built as fresh detached trees, then the live DOM is patched to
+ * match rather than replaced. A node that did not change keeps its
+ * identity, so a click, hover, text selection or scroll that spans a live
+ * frame is not lost. Children carrying `data-key` are matched by key (rows
+ * follow their member when the list reorders); the rest by position.
+ * `data-keep` marks operator-owned subtrees (a form being edited) that
+ * frames must leave alone. Live form state (typed values, selections) is a
+ * property, not an attribute, so patching never clobbers it. */
+const HANDLERS = ['onclick', 'onchange', 'oninput', 'onsubmit', 'onkeydown'];
+function patch(live, next) {
+  if (live.nodeType !== 1) {
+    if (live.nodeValue !== next.nodeValue) {
+      live.nodeValue = next.nodeValue;
+      const p = live.parentElement;
+      if (p && p.classList.contains('pill')) { p.classList.remove('flash'); void p.offsetWidth; p.classList.add('flash'); }
+    }
+    return;
+  }
+  const keep = next.getAttribute('data-keep');
+  if (keep !== null && live.getAttribute('data-keep') === keep) return;
+  for (const a of [...live.attributes]) if (!next.hasAttribute(a.name)) live.removeAttribute(a.name);
+  for (const a of next.attributes) if (live.getAttribute(a.name) !== a.value) live.setAttribute(a.name, a.value);
+  // Handlers close over the frame they were built from; take the new ones.
+  for (const h of HANDLERS) if (live[h] !== next[h]) live[h] = next[h];
+  patchChildren(live, next);
+}
+function patchChildren(live, next) {
+  const keyed = new Map();
+  for (const c of live.children) { const k = c.getAttribute('data-key'); if (k !== null) keyed.set(c.nodeName + '|' + k, c); }
+  let cur = live.firstChild;
+  for (const n of [...next.childNodes]) {
+    const k = n.nodeType === 1 ? n.getAttribute('data-key') : null;
+    let match = null;
+    if (k !== null) { match = keyed.get(n.nodeName + '|' + k) || null; if (match) keyed.delete(n.nodeName + '|' + k); }
+    else if (cur && cur.nodeType === n.nodeType && cur.nodeName === n.nodeName && !(cur.nodeType === 1 && cur.hasAttribute('data-key'))) match = cur;
+    if (!match) { live.insertBefore(n, cur); continue; }
+    if (match === cur) cur = cur.nextSibling; else live.insertBefore(match, cur);
+    patch(match, n);
+  }
+  while (cur) { const x = cur.nextSibling; cur.remove(); cur = x; }
 }
 
 /* ---------- overview ---------- */
@@ -479,11 +738,14 @@ function homePage() {
   const totals = frame.networks.reduce((a, n) => ({ m: a.m + n.members_total, o: a.o + n.members_online, r: a.r + n.relays_total }), { m: 0, o: 0, r: 0 });
   let fleetBytes = 0;
   for (const st of Object.values(frame.status)) for (const row of (st.relay_traffic || [])) fleetBytes += row.links.reduce((a, l) => a + l.tx_bytes, 0) + row.local_bytes;
-  const t = el('div', 'title'); t.append(el('h1', null, 'Overview')); page.append(t);
-  const cards = el('div', 'cards');
-  [['Networks', frame.networks.length], ['Members', totals.m], ['Online', totals.o], ['Relays', totals.r], ['Fleet traffic', fmtBytes(fleetBytes)]]
-    .forEach(([l, n]) => { const c = el('div', 'card'); c.append(el('div', 'n', n), el('div', 'l', l)); cards.append(c); });
-  page.append(cards);
+  const t = el('div', 'phead'); t.append(el('h1', null, 'Overview')); page.append(t);
+  const stats = el('div', 'stats');
+  [['globe', 'Networks', frame.networks.length], ['users', 'Members', totals.m], ['pulse', 'Online now', totals.o, 'ok'], ['server', 'Relays', totals.r], ['swap', 'Fleet traffic', fmtBytes(fleetBytes)]]
+    .forEach(([ic, l, n, cls]) => {
+      const c = el('div', 'card stat'); const i = el('div', 'ico' + (cls ? ' ' + cls : '')); i.append(icon(ic, 20));
+      const tx = el('div'); tx.append(el('div', 'n', n), el('div', 'l', l)); c.append(i, tx); stats.append(c);
+    });
+  page.append(stats);
 
   if (!frame.networks.length) {
     const hero = el('div', 'card hero');
@@ -497,15 +759,19 @@ function homePage() {
   const grid = el('div', 'netcards');
   for (const n of frame.networks) {
     const st = frame.status[n.network_id] || {};
-    const c = el('div', 'card netcard');
+    const c = el('div', 'card netcard'); c.setAttribute('data-key', n.network_id); c.tabIndex = 0;
     c.onclick = () => go('#/n/' + enc(n.network_id));
-    const nm = el('div', 'nm'); const gt = el('span', 'gen tiny'); gt.append(fmtGen(n.gen)); nm.append(el('span', null, n.network_id), gt); c.append(nm);
+    c.onkeydown = e => { if (e.key === 'Enter') go('#/n/' + enc(n.network_id)); };
+    const nm = el('div', 'nm'); const gt = el('span', 'gen'); gt.append(fmtGen(n.gen)); nm.append(el('span', null, n.network_id), gt); c.append(nm);
     const f = el('div', 'facts');
     const fact = (l, v) => { const s = el('span'); s.append(el('b', null, v), document.createTextNode(' ' + l)); return s; };
     f.append(fact('online', n.members_online), fact('members', n.members_total), fact('relays', n.relays_total));
     c.append(f);
-    const dial = (st.members || []).filter(m => m.role === 'relay' && m.advertised_reachable === 'unreachable');
-    if (dial.length) c.append(el('div', 'subline warn', dial.length + ' relay address(es) not dialable'));
+    const meter = el('div', 'meter'); const fill = el('i');
+    fill.style.width = (n.members_total ? Math.round(100 * n.members_online / n.members_total) : 0) + '%';
+    meter.title = `${n.members_online} of ${n.members_total} members online`; meter.append(fill); c.append(meter);
+    const attention = (st.members || []).filter(m => memberIssues(st, m).length).length;
+    if (attention) c.append(el('div', 'subline warn', `${attention} member${attention > 1 ? 's' : ''} need${attention > 1 ? '' : 's'} attention`));
     grid.append(c);
   }
   page.append(grid);
@@ -516,14 +782,19 @@ function homePage() {
 function networkPage(st, tab) {
   const page = el('div');
   const crumbs = el('div', 'crumbs'); const a = el('a', null, 'Overview'); a.href = '#/'; crumbs.append(a, el('span', null, '›'), el('span', null, st.network_id)); page.append(crumbs);
-  const t = el('div', 'title'); t.append(el('h1', null, st.network_id));
-  const gt2 = el('span', 'gen tiny'); gt2.append(fmtGen(st.gen)); t.append(gt2); const u = el('code', 'tiny muted', st.network_uuid); u.title = 'network uuid'; t.append(u);
-  const tr = el('span', 'pill rolepill', st.transport + (st.transport === 'stream' && st.lanes > 1 ? ` ×${st.lanes}` : '')); t.append(tr);
-  page.append(t);
+  const t = el('div', 'phead'); t.append(el('h1', null, st.network_id));
+  const chips = el('div', 'chips');
+  const g = el('span', 'chip'); g.append(fmtGen(st.gen)); chips.append(g);
+  chips.append(el('span', 'chip', st.transport + (st.transport === 'stream' && st.lanes > 1 ? ` × ${st.lanes} lanes` : '')));
+  const u = el('span', 'chip'); u.append(el('code', null, st.network_uuid)); u.title = 'network uuid'; chips.append(u);
+  t.append(chips); page.append(t);
 
   const tabs = el('div', 'tabs');
-  for (const [k, label] of [['members','Members'],['topology','Topology'],['stats','Traffic'],['settings','Settings']]) {
-    const x = el('a', k === tab ? 'active' : '', label); x.href = `#/n/${enc(st.network_id)}/${k}`; tabs.append(x);
+  const counts = { members: `${st.members.filter(m => m.online).length}/${st.members.length}`, topology: String(relaysOf(st).length) };
+  for (const [k, label] of [['members', 'Members'], ['topology', 'Topology'], ['stats', 'Traffic'], ['settings', 'Settings']]) {
+    const x = el('a', k === tab ? 'active' : '', label); x.href = `#/n/${enc(st.network_id)}/${k}`;
+    if (counts[k]) x.append(el('span', 'cnt', counts[k]));
+    tabs.append(x);
   }
   page.append(tabs);
   const panes = { members: membersPane, topology: topologyPane, stats: matrixPane, settings: settingsPane };
@@ -532,24 +803,69 @@ function networkPage(st, tab) {
 }
 
 /* ---------- members ---------- */
+/** What is wrong with a member that the operator can act on, in words. */
+function memberIssues(st, m) {
+  const out = [];
+  if (m.role === 'relay' && m.advertised_reachable === 'unreachable') out.push('The coordinator cannot dial this relay’s address; other relays will fail to mesh with it. Check its firewall and address.');
+  if (m.internet_gateway && m.online) {
+    const er = m.exit_ready;
+    if (!er) out.push('Internet exit: waiting for the relay to report whether the host is ready.');
+    else if (!er.ip_forward || !er.masquerade) out.push('Internet exit is not ready: ' + [er.ip_forward ? null : 'IP forwarding is off', er.masquerade ? null : 'no masquerade rule'].filter(Boolean).join(', ') + '. Clients cannot egress through it.');
+  }
+  if (m.online && m.reported_gen !== undefined && m.reported_gen !== null && viewState(st, m).cls.includes('badpill')) out.push(viewState(st, m).title);
+  if (m.replaced_unix) out.push('Replaced from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix) + '. If that was not you, regenerate the token.');
+  return out;
+}
+
 function membersPane(st) {
   const pane = el('div');
-  const bar = el('div', 'bar');
-  const add = el('button', 'primary', '+ Add member'); add.onclick = () => memberForm(st, null); bar.append(add);
-  bar.append(el('span', 'msg', `${st.members.filter(m => m.online).length} online · ${st.members.length} members`));
-  pane.append(bar);
-  if (!st.members.length) {
-    pane.append(el('div', 'empty', 'No members yet. Add a relay first (clients need one to attach to), then clients.'));
-  } else {
-    const relays = st.members.filter(m => m.role === 'relay'), clients = st.members.filter(m => m.role !== 'relay');
-    const rows = [...relays, ...clients].map(m => memberRow(st, m));
-    pane.append(table(['Member','Role','State','Address','Routes','Relay','Heartbeat','View','Last join','Actions'], rows));
+  const all = st.members;
+  const issues = new Map(all.map(m => [m.name, memberIssues(st, m)]));
+  const inState = { all: () => true, online: m => m.online, offline: m => !m.online, attention: m => issues.get(m.name).length > 0 };
+  if (!inState[memberState]) memberState = 'all';
+  const bar = el('div', 'toolbar');
+  const add = el('button', 'primary'); add.append(icon('plus'), document.createTextNode('Add member')); add.onclick = () => memberForm(st, null);
+  const seg = el('div', 'seg');
+  for (const [k, label] of [['all', 'All'], ['online', 'Online'], ['offline', 'Offline'], ['attention', 'Needs attention']]) {
+    const n = all.filter(inState[k]).length;
+    if (k === 'attention' && !n && memberState !== k) continue;
+    const b = el('button', (memberState === k ? 'sel' : '') + (k === 'attention' ? ' warnseg' : '')); b.type = 'button';
+    b.setAttribute('data-key', k);
+    b.append(document.createTextNode(label + ' '), el('span', 'n', n)); b.onclick = () => { memberState = k; render(); };
+    seg.append(b);
   }
-  pane.append(heading(st, 'Prefix ownership'));
+  const sb = el('div', 'searchbox'); sb.append(icon('search', 15));
+  const q = inp(memberFilter, { type: 'search', placeholder: 'Filter by name, address, relay, route…', 'aria-label': 'Filter members' });
+  q.oninput = e => { memberFilter = e.currentTarget.value; render(); };
+  sb.append(q);
+  bar.append(add, seg, el('span', 'spacer'), sb);
+  pane.append(bar);
+
+  if (!all.length) {
+    pane.append(el('div', 'empty spaced', 'No members yet. Add a relay first (clients need one to attach to), then clients.'));
+  } else {
+    const needle = memberFilter.trim().toLowerCase();
+    const hit = m => inState[memberState](m) && (!needle || [m.name, m.role, m.ip4, m.ip6, m.attached_relay, ...(m.registered_cidrs || [])].some(v => v && String(v).toLowerCase().includes(needle)));
+    const shown = all.filter(hit);
+    if (!shown.length) pane.append(el('div', 'empty spaced', needle ? `No member matches “${memberFilter.trim()}”.` : 'No members in this view.'));
+    for (const [role, title] of [['relay', 'Relays'], ['client', 'Clients']]) {
+      const list = shown.filter(m => (m.role === 'relay') === (role === 'relay'));
+      if (!list.length) continue;
+      const h = el('h2'); h.setAttribute('data-key', 'h-' + role);
+      h.append(el('span', null, title), el('span', 'gen', list.length));
+      const grid = el('div', 'mgrid'); grid.setAttribute('data-key', 'g-' + role);
+      for (const m of list) grid.append(memberCard(st, m, issues.get(m.name)));
+      pane.append(h, grid);
+    }
+    if (!all.some(m => m.role === 'relay')) pane.append(el('div', 'empty', 'This network has no relay yet. Clients attach through a relay — add one first.'));
+  }
+
+  const ph = heading(st, 'Virtual routing table'); ph.setAttribute('data-key', 'h-prefix'); pane.append(ph);
+  pane.append(el('p', 'note', 'Where the network sends each routed prefix: the member that owns it now, and who takes over, in order, if it goes away.'));
   const prefixes = st.prefix_table || [];
-  if (!prefixes.length) pane.append(el('div', 'empty', 'No prefixes are registered in this network yet.'));
-  else pane.append(table(['Prefix','Owner','Standby (age order)'], prefixes.map(p => {
-    const tr = el('tr');
+  if (!prefixes.length) pane.append(el('div', 'empty', 'No routes in this network yet. A relay that routes a LAN or is an internet exit adds one.'));
+  else pane.append(table(['Prefix', 'Owner', 'Standby (failover order)'], prefixes.map(p => {
+    const tr = el('tr'); tr.setAttribute('data-key', p.cidr);
     const c = el('td'); c.append(el('code', null, p.cidr)); tr.append(c);
     const o = el('td'); o.append(document.createTextNode(p.owner + ' '), el('code', 'tiny muted', p.owner_node_id ? '#' + p.owner_node_id : '')); tr.append(o);
     tr.append(el('td', 'muted tiny', (p.standby || []).join(', ') || '—'));
@@ -558,119 +874,143 @@ function membersPane(st) {
   return pane;
 }
 
-function memberRow(st, m) {
+function memberCard(st, m, issues) {
   const net = st.network_id;
-  const tr = el('tr');
-  const nm = el('td'); const nl = el('span', 'name', m.name);
-  nl.onclick = () => (m.role === 'relay' ? showRelay(st, m) : showMember(st, m));
-  nm.append(nl); if (m.node_id) nm.append(el('span', 'subline', '#' + m.node_id)); tr.append(nm);
-  const role = el('td'); role.append(el('span', 'pill rolepill', m.role)); tr.append(role);
-  const state = el('td'); state.append(pill(m)); tr.append(state);
-  const ip = el('td'); ip.append(el('code', null, addrOf(m) || '—')); tr.append(ip);
-  const cidrs = el('td'); cidrs.append(el('code', null, (m.registered_cidrs || []).join(' ') || '—'));
-  if (m.internet_gateway) {
-    const er = m.exit_ready, ready = er && er.ip_forward && er.masquerade;
-    const b = el('span', 'pill ' + (ready ? 'on' : 'dis'), 'internet exit');
-    if (ready) b.title = 'Ready: IP forwarding is on and a masquerade rule covers VPN traffic.';
-    else {
-      const miss = !er ? 'waiting for the relay to report' :
-        [er.ip_forward ? null : 'IP forwarding off', er.masquerade ? null : 'no masquerade rule'].filter(Boolean).join(', ');
-      b.title = 'Internet exit is enabled but the host is not ready (' + miss + '). Enable IP forwarding and masquerade on this host — clients cannot egress until then.';
-    }
-    cidrs.append(document.createTextNode(' '), b);
-  }
-  tr.append(cidrs);
-  const relay = el('td');
-  if (m.role === 'relay') {
-    if (m.advertised_reachable === 'unreachable') { relay.append(el('span', 'pill dis', 'not dialable')); relay.title = 'The coordinator cannot dial this relay\'s address. Other relays will fail to mesh with it — check the firewall and its address.'; }
-    else if (m.advertised_reachable === 'reachable') relay.append(el('span', 'pill on', 'dialable'));
-    else relay.append(el('span', 'muted', m.node_id ? 'not probed' : '—'));
-  } else relay.append(el('span', m.attached_relay ? '' : 'muted', m.attached_relay || '—'));
-  tr.append(relay);
-  const hb = el('td');
-  if (m.last_heartbeat_unix) { hb.append(el('span', null, fmtAge(m.last_heartbeat_unix) + ' ago')); hb.title = fmtTime(m.last_heartbeat_unix); }
-  else hb.append(el('span', 'muted', '—'));
-  tr.append(hb);
-  const view = el('td'); view.append(viewCell(st, m)); tr.append(view);
-  const join = el('td');
-  if (m.last_join_unix) { join.append(el('span', null, m.last_join_from || 'unknown source')); join.append(el('span', 'subline', fmtTime(m.last_join_unix) + ' · login gen ' + m.login_gen)); }
-  else join.append(el('span', 'muted', 'never'));
-  if (m.replaced_unix) {
-    const rep = el('span', 'subline warn', 'replaced from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix));
-    rep.title = 'A newer join under this name took over and the earlier instance was told to stop. If that was not you, regenerate the token.';
-    join.append(rep);
-  }
-  tr.append(join);
+  const stc = m.disabled ? 'st-dis' : issues.length ? 'st-bad' : m.online ? 'st-on' : 'st-off';
+  const card = el('article', 'mcard ' + stc); card.setAttribute('data-key', m.name);
+  const open = () => (m.role === 'relay' ? showRelay(st, m) : showMember(st, m));
+  const head = el('div', 'mhead'); head.tabIndex = 0; head.title = 'Show details';
+  head.onclick = open; head.onkeydown = e => { if (e.key === 'Enter') open(); };
+  const av = el('div', 'avatar ' + m.role); av.append(icon(m.role === 'relay' ? 'server' : 'laptop', 19));
+  const who = el('div', 'who'); const nm = el('div', 'mname'); nm.append(el('span', null, m.name));
+  if (m.node_id) nm.append(el('span', 'nid', '#' + m.node_id));
+  who.append(nm, el('div', 'maddr', addrOf(m) || (m.node_id ? 'no tunnel address' : 'has not joined yet')));
+  head.append(av, who, pill(m));
+  card.append(head);
 
-  const act = el('td'); const acts = el('div', 'actions');
-  const tok = el('button', null, 'Token'); tok.onclick = () => showToken(net, m.name, false); acts.append(tok);
-  const edit = el('button', null, 'Edit'); edit.onclick = () => memberForm(st, m); acts.append(edit);
-  if (m.node_id) {
-    const toggle = el('button', null, m.disabled ? 'Enable' : 'Disable');
-    toggle.onclick = async () => { toggle.disabled = true;
-      try { const r = await api(memberPath(net, m.name) + `/${m.disabled ? 'enable' : 'disable'}`, { method: 'POST' }); msg(`${r.disabled ? 'Disabled' : 'Enabled'} ${m.name}`); }
-      catch (e) { msg(e.message, true); toggle.disabled = false; } };
-    acts.append(toggle);
+  const facts = el('dl', 'mfacts');
+  const fact = (k, v, cls, title) => {
+    const w = el('div', cls && cls.includes('wide') ? 'wide' : null); w.append(el('dt', null, k));
+    const dd = el('dd', cls ? cls.replace('wide', '').trim() || null : null); if (v instanceof Node) dd.append(v); else dd.textContent = v;
+    if (title) dd.title = title; w.append(dd); facts.append(w);
+  };
+  if (m.role === 'relay') {
+    const kids = st.members.filter(c => c.role !== 'relay' && c.online && c.attached_relay === m.name).length;
+    fact('Clients', kids + ' attached', kids ? '' : 'muted');
+    const r = m.advertised_reachable;
+    fact('Address check', r === 'reachable' ? 'dialable' : r === 'unreachable' ? 'not dialable' : m.node_id ? 'not probed' : '—', r === 'unreachable' ? 'bad' : r === 'reachable' ? '' : 'muted');
+  } else fact('Relay', m.attached_relay || (m.online ? 'none' : '—'), m.attached_relay ? '' : 'muted');
+  fact('Heartbeat', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago' : '—', m.last_heartbeat_unix ? '' : 'muted', m.last_heartbeat_unix ? fmtTime(m.last_heartbeat_unix) : '');
+  if (m.role !== 'relay') fact('View', viewCell(st, m));
+  const routes = m.registered_cidrs || [];
+  if (m.role === 'relay') {
+    const rc = el('div', 'cidrs');
+    if (m.internet_gateway) { const er = m.exit_ready; const b = el('span', 'pill ' + (er && er.ip_forward && er.masquerade ? 'on' : 'dis'), 'internet exit'); rc.append(b); }
+    for (const c of routes) if (!(m.internet_gateway && /^(0\.0\.0\.0\/0|::\/0)$/.test(c))) rc.append(el('code', null, c));
+    if (!rc.childNodes.length) rc.append(el('span', 'muted', 'none'));
+    fact('Routes', rc, 'wide');
+    fact('View', viewCell(st, m));
   }
-  const del = el('button', 'danger', 'Delete');
+  card.append(facts);
+  if (issues.length) {
+    const box = el('div', 'issues');
+    for (const i of issues) { const d = el('div'); d.append(icon('alert', 14), el('span', null, i)); box.append(d); }
+    card.append(box);
+  }
+  card.append(el('div', 'mjoin', m.last_join_unix ? `Joined from ${m.last_join_from || 'unknown'} · ${fmtTime(m.last_join_unix)} · login gen ${m.login_gen}` : 'Never joined — put its token on the machine.'));
+
+  const foot = el('div', 'mfoot');
+  const tok = el('button', 'sm'); tok.append(icon('key', 14), document.createTextNode('Token')); tok.onclick = () => showToken(net, m.name, false);
+  const edit = el('button', 'sm'); edit.append(icon('edit', 14), document.createTextNode('Edit')); edit.onclick = () => memberForm(st, m);
+  foot.append(tok, edit);
+  if (m.node_id) {
+    const toggle = el('button', 'sm'); toggle.append(icon('power', 14), document.createTextNode(m.disabled ? 'Enable' : 'Disable'));
+    // The live button is the event's, not `toggle` (a frame's copy).
+    toggle.onclick = async ev => { const b = ev.currentTarget; b.disabled = true;
+      try { const r = await api(memberPath(net, m.name) + `/${m.disabled ? 'enable' : 'disable'}`, { method: 'POST' }); msg(`${r.disabled ? 'Disabled' : 'Enabled'} ${m.name}`); }
+      catch (e) { msg(e.message, true); b.disabled = false; } };
+    foot.append(toggle);
+  }
+  foot.append(el('span', 'spacer'));
+  const del = el('button', 'sm icon danger'); del.append(icon('trash', 15)); del.title = 'Delete ' + m.name; del.setAttribute('aria-label', 'Delete ' + m.name);
   del.onclick = () => confirmModal({
     title: 'Delete ' + m.name + '?', sub: net,
     lead: 'This forgets the member completely: its token stops working, its address is released, and any routes it owns are withdrawn. Use Disable to keep it out but keep its record.',
     details: [ m.online ? 'It is ONLINE now: its sessions are closed; it keeps retrying with backoff until it is enabled again or deleted' : 'It is offline',
-      'Address ' + (addrOf(m) || 'none') + ' is released', (m.registered_cidrs || []).length ? 'Routes ' + m.registered_cidrs.join(', ') + ' fail over to the next registrant' : 'It owns no routes' ],
+      'Address ' + (addrOf(m) || 'none') + ' is released', routes.length ? 'Routes ' + routes.join(', ') + ' fail over to the next registrant' : 'It owns no routes' ],
     danger: 'Delete member',
     onConfirm: async () => { await api(memberPath(net, m.name), { method: 'DELETE' }); msg(`Deleted ${m.name}`); },
   });
-  acts.append(del);
-  act.append(acts); tr.append(act);
-  return tr;
+  foot.append(del);
+  card.append(foot);
+  return card;
 }
 
 /* ---------- member form (add / edit) ---------- */
 async function memberForm(st, existing) {
   const net = st.network_id;
-  const body = openModal(existing ? 'Edit ' + existing.name : 'Add member', net);
+  const body = openModal(existing ? 'Edit ' + existing.name : 'Add member', existing ? `${net} · ${existing.role}` : net);
   let cur = {};
   if (existing) {
     body.append(el('div', 'empty', 'Loading…'));
     try { cur = await api(memberPath(net, existing.name)); } catch (e) { body.replaceChildren(el('div', 'empty', e.message)); return; }
     body.replaceChildren();
   }
-  const role = existing ? existing.role : 'client';
+  let roleVal = existing ? existing.role : 'client';
   const f = el('form');
-  const name = inp(existing ? existing.name : '', { placeholder: 'e.g. laptop-1, home, cloud-3', pattern: '[A-Za-z0-9._-]{1,64}', required: '' });
-  if (existing) name.disabled = true;
-  const roleSel = el('select'); ['client','relay'].forEach(r => { const o = el('option', null, r); o.value = r; if (r === role) o.selected = true; roleSel.append(o); });
-  if (existing) roleSel.disabled = true;
-  const g = el('div', 'grid2');
-  g.append(field('Name', name, existing ? 'Names are permanent; the name is what other members see.' : 'Letters, digits, . _ -'));
-  g.append(field('Role', roleSel, 'A relay carries traffic and may route a LAN; a client only talks.'));
-  f.append(g);
+  const name = inp(existing ? existing.name : '', { placeholder: 'e.g. laptop-1, home, cloud-3', pattern: '[A-Za-z0-9._-]{1,64}', required: '', autocomplete: 'off' });
+  const choices = [];
+  if (!existing) {
+    const choice = el('div', 'choice');
+    for (const [v, ic, title, desc] of [
+      ['client', 'laptop', 'Client', 'A machine that joins the network: a laptop, a server, a phone.'],
+      ['relay', 'server', 'Relay', 'Carries traffic for clients. Can route a LAN or be an internet exit.']]) {
+      const b = el('button'); b.type = 'button';
+      const av = el('div', 'avatar' + (v === 'relay' ? ' relay' : '')); av.append(icon(ic, 18));
+      const tx = el('div'); tx.append(el('b', null, title), el('span', 'd', desc)); b.append(av, tx);
+      b.onclick = () => { roleVal = v; sync(); };
+      choices.push([v, b]); choice.append(b);
+    }
+    f.append(choice);
+    f.append(field('Name', name, 'Letters, digits, . _ -  ·  permanent; it is what other members see.'));
+  }
 
   const relayAddr = inp(cur.relay_addr ?? 'auto:4444', { placeholder: 'host:port or auto:port' });
   const cidrs = el('textarea'); cidrs.value = (cur.local_cidrs || []).join('\n'); cidrs.placeholder = '192.168.1.0/24\none per line';
   const exitGw = el('input'); exitGw.type = 'checkbox'; exitGw.checked = cur.internet_gateway === true;
-  const ip4 = inp(cur.preferred_ip4 ?? '', { placeholder: 'auto' });
-  const ip6 = inp(cur.preferred_ip6 ?? '', { placeholder: 'auto' });
-  const wantIp = el('select'); [['', 'yes (default)'], ['true', 'yes'], ['false', 'no — headless']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; wantIp.append(o); });
+  const ip4 = inp(cur.preferred_ip4 ?? '', { placeholder: 'automatic' });
+  const ip6 = inp(cur.preferred_ip6 ?? '', { placeholder: 'automatic' });
+  const wantIp = el('select'); [['', 'Yes (default)'], ['true', 'Yes'], ['false', 'No — headless']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; wantIp.append(o); });
   wantIp.value = cur.want_vpn_ip === null || cur.want_vpn_ip === undefined ? '' : String(cur.want_vpn_ip);
   const cap = inp(cur.max_session_mbps ?? '', { type: 'number', min: '0', placeholder: 'network default' });
-  const pref = el('select'); const pnone = el('option', null, '(lowest latency)'); pnone.value = ''; pref.append(pnone);
+  const pref = el('select'); const pnone = el('option', null, 'Lowest latency (automatic)'); pnone.value = ''; pref.append(pnone);
   st.members.filter(m => m.role === 'relay').forEach(r => { const o = el('option', null, r.name); o.value = r.name; if (cur.preferred_relay === r.name) o.selected = true; pref.append(o); });
 
-  const relayBox = el('div'), clientBox = el('div');
+  const section = title => { const s = el('div', 'fsec'); s.append(el('h4', null, title)); return s; };
+  const relayBox = section('Relay');
   relayBox.append(field('Relay address', relayAddr, 'What the fleet and clients dial. auto:PORT = the address this relay joins from, on PORT.'));
   relayBox.append(field('Routed LANs', cidrs, 'Prefixes behind this relay, made reachable to every member. Two relays declaring the same prefix are a failover pair.'));
-  relayBox.append(field('Enable Internet Gateway', exitGw, 'All-traffic clients can egress to the internet through this relay (client --route-all / --via). The host must have IP forwarding and a masquerade rule; the relay reports whether they are present.'));
-  const g3 = el('div', 'grid2'); g3.append(field('Per-client cap (Mbps)', cap, 'Bandwidth cap for each attached client; blank = network default, 0 = none.')); relayBox.append(g3);
-  clientBox.append(field('Preferred relay', pref, 'Attached when reachable; falls back to the lowest latency relay otherwise, and returns on its own.'));
+  const sw = el('label', 'switch'); sw.append(exitGw, el('span', null, 'Internet exit'));
+  const swf = el('div', 'field'); swf.append(sw, el('div', 'help', 'Clients using --route-all can reach the internet through this relay. The host needs IP forwarding and a masquerade rule; the relay reports whether they are present.'));
+  relayBox.append(swf);
+  relayBox.append(field('Per-client cap (Mbps)', cap, 'Bandwidth cap for each attached client. Blank = network default, 0 = none.'));
+  const clientBox = section('Connection');
+  clientBox.append(field('Preferred relay', pref, 'Attached when reachable; otherwise the lowest-latency relay, moving back on its own when the preferred one returns.'));
+  const addr = el('details', 'more');
+  const custom = cur.preferred_ip4 || cur.preferred_ip6 || (cur.want_vpn_ip !== null && cur.want_vpn_ip !== undefined);
+  addr.open = !!custom;
+  const sum = el('summary'); sum.append(document.createTextNode('Tunnel address'), el('span', 'muted', custom ? '· customised' : '· automatic'));
+  addr.append(sum);
   const g2 = el('div', 'grid2');
-  g2.append(field('IPv4 address', ip4, 'Blank = a soft reservation allocated from the network IPv4 CIDR. A static address is never reassigned.'));
-  g2.append(field('IPv6 address', ip6, 'Blank = a soft reservation allocated from the optional IPv6 CIDR. A static address is never reassigned.'));
-  g2.append(field('Tunnel address', wantIp, 'Headless members carry no address (a pure forwarding relay).'));
-  f.append(relayBox, clientBox, g2);
-  const sync = () => { const r = roleSel.value === 'relay'; relayBox.hidden = !r; clientBox.hidden = r; };
-  roleSel.onchange = sync; sync();
+  g2.append(field('IPv4 address', ip4, 'Blank = allocated from the network’s IPv4 CIDR. A static address is never reassigned.'));
+  g2.append(field('IPv6 address', ip6, 'Blank = allocated from the network’s IPv6 CIDR, if it has one.'));
+  addr.append(g2, field('Give it an address', wantIp, 'Headless members carry no address (a pure forwarding relay).'));
+  f.append(relayBox, clientBox, addr);
+  const sync = () => {
+    const r = roleVal === 'relay'; relayBox.hidden = !r; clientBox.hidden = r;
+    for (const [v, b] of choices) b.className = v === roleVal ? 'sel' : '';
+  };
+  sync();
 
   const bar = el('div', 'bar'); const save = el('button', 'primary', existing ? 'Save & apply' : 'Create & get token'); const cancel = el('button', null, 'Cancel'); cancel.type = 'button';
   const err = el('span', 'msg err'); bar.append(save, cancel, err); f.append(bar);
@@ -680,7 +1020,7 @@ async function memberForm(st, existing) {
   // where the operator can see it (inline in the form, or via a toast when
   // the form has been replaced by the confirm dialog).
   const submit = async (localCidrs) => {
-    const isRelay = roleSel.value === 'relay';
+    const isRelay = roleVal === 'relay';
     // Give immediate feedback from the live status snapshot. The API
     // performs the authoritative check too (including offline soft
     // reservations and races after this form was opened).
@@ -708,11 +1048,13 @@ async function memberForm(st, existing) {
       internet_gateway: isRelay ? exitGw.checked : null,
     };
     if (existing) { await api(memberPath(net, existing.name), { method: 'PUT', body: spec }); msg('Saved ' + existing.name + '; it is re-joining'); closeModal(); }
-    else { const r = await api(netPath(net) + '/members', { method: 'POST', body: { name: name.value.trim(), role: roleSel.value, ...spec } }); paintToken(openModal(r.name, net + ' · new ' + r.role), r, true); }
+    else { const r = await api(netPath(net) + '/members', { method: 'POST', body: { name: name.value.trim(), role: roleVal, ...spec } }); paintToken(openModal(r.name, net + ' · new ' + r.role), r, true); }
   };
+  // A field the browser rejects may sit in the folded address section.
+  f.addEventListener('invalid', e => { const d = e.target.closest('details'); if (d) d.open = true; }, true);
   f.onsubmit = async e => {
     e.preventDefault(); save.disabled = true; err.textContent = '';
-    const isRelay = roleSel.value === 'relay';
+    const isRelay = roleVal === 'relay';
     const raw = isRelay ? lines(cidrs.value) : [];
     // A routed LAN entered with host bits (172.26.6.59/20) is a network
     // (172.26.0.0/20) with a typo'd address. Show what will be saved and
@@ -733,7 +1075,7 @@ async function memberForm(st, existing) {
     try { await submit(raw); } catch (ex) { err.textContent = ex.message; save.disabled = false; }
   };
   body.append(f);
-  (existing ? relayAddr : name).focus();
+  (existing ? (roleVal === 'relay' ? relayAddr : pref) : name).focus();
 }
 
 /* ---------- token ---------- */
@@ -769,56 +1111,96 @@ function paintToken(body, r, fresh) {
 
 /* ---------- settings ---------- */
 function settingsPane(st) {
-  const pane = el('div');
+  // The form is the operator's while this tab is open: fetched once, never
+  // rebuilt by live frames (data-keep), reloaded after a save.
+  const keep = 'settings:' + st.network_id;
+  const pane = el('div'); pane.setAttribute('data-keep', keep);
+  if (document.querySelector(`#view [data-keep="${CSS.escape(keep)}"]`)) return pane;
   const box = el('div'); box.append(el('div', 'empty', 'Loading…')); pane.append(box);
-  api(netPath(st.network_id) + '/config').then(cfg => {
+  const load = () => api(netPath(st.network_id) + '/config').then(cfg => {
     box.replaceChildren();
-    const f = el('form');
+    const s = cfg.settings || {};
+    const f = el('form', 'settings'); f.noValidate = false;
+    const nav = el('nav', 'snav'); const panels = el('div');
+    const sections = [];
+    const section = (key, ic, title, lead, cls) => {
+      const p = el('section', 'card spanel'); p.append(el('h3', null, title)); if (lead) p.append(el('p', 'note', lead));
+      const g = el('div', 'grid2'); p.append(g); panels.append(p);
+      const b = el('button', cls || ''); b.type = 'button'; b.append(icon(ic, 15), document.createTextNode(title));
+      b.onclick = () => show(key); nav.append(b); sections.push({ key, p, b }); return g;
+    };
+    const REJOIN = 're-join';
+    const num = (g, k, label, help, attrs = {}, tag) => { const i = inp(s[k], { type: 'number', ...attrs }); g.append(field(label, i, help, tag)); return i; };
+    const pick = (g, label, help, options, current, tag) => {
+      const sel = el('select'); for (const [v, l] of options) { const o = el('option', null, l); o.value = v; if (current === v) o.selected = true; sel.append(o); }
+      g.append(field(label, sel, help, tag)); return sel;
+    };
+
+    const ga = section('addressing', 'hash', 'Addressing', 'The tunnel address space. Members are allocated addresses from these ranges, and each range is also the covering route into the tunnel.');
     const cidr4 = inp(cfg.ipv4_cidr || '', { required: '', placeholder: '10.99.0.0/16' });
     const cidr6 = inp(cfg.ipv6_cidr || '', { placeholder: 'fd99::/64' });
-    const addressGrid = el('div', 'grid2');
-    addressGrid.append(
-      field('IPv4 CIDR', cidr4, 'Required. This is both the node allocation range and the covering tunnel route.'),
-      field('IPv6 CIDR', cidr6, 'Optional. This is both the node allocation range and the covering tunnel route.')
-    );
-    f.append(el('h2', null, 'Tunnel addresses'), addressGrid);
-    const s = cfg.settings || {};
-    const g = el('div', 'grid2');
-    const num = (k, label, help, attrs = {}) => { const i = inp(s[k], { type: 'number', ...attrs }); g.append(field(label, i, help)); return i; };
-    const ttl = num('credential_ttl_mins', 'Credential lifetime (min)', 'Members renew at two thirds.', { min: 1 });
-    const hb = num('heartbeat_secs', 'Heartbeat (s)', 'Convergence after a lost push is bounded by this.', { min: 1 });
-    const off = num('offline_after', 'Offline after (heartbeats)', 'Missed heartbeats before a member is offline.', { min: 1 });
-    const hold = num('hold_down_secs', 'Hold-down (s)', 'Damping when two relays front the same LAN. 0 = off.', { min: 0 });
-    const mtu = num('mtu', 'MTU', '1280–9000.', { min: 1280, max: 9000 });
-    const lanes = num('lanes', 'Lanes', 'Parallel stream lanes per session (1–15).', { min: 1, max: 15 });
-    const capd = num('max_session_mbps', 'Default per-client cap (Mbps)', '0 = none; relays may override per member.', { min: 0 });
-    const transport = el('select'); ['stream','datagram'].forEach(v => { const o = el('option', null, v); o.value = v; if (s.transport === v) o.selected = true; transport.append(o); });
-    g.append(field('Transport', transport, 'stream works through anything; datagram has lower latency.'));
-    const reach = el('select'); ['warn','deny','off'].forEach(v => { const o = el('option', null, v); o.value = v; if (s.relay_reachability === v) o.selected = true; reach.append(o); });
-    g.append(field('Relay reachability check', reach, 'After a relay joins, the coordinator dials its address: warn, refuse the join, or skip.'));
-    const loop = el('select'); [['false','no'],['true','yes (single-machine demos only)']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; if (String(!!s.allow_loopback_relays) === v) o.selected = true; loop.append(o); });
-    g.append(field('Allow loopback relay addresses', loop, ''));
-    f.append(el('h2', null, 'Settings'), g);
-    const bar = el('div', 'bar'); const save = el('button', 'primary', 'Save'); const err = el('span', 'msg err'); bar.append(save, err); f.append(bar);
-    f.append(el('p', 'note', 'Changing MTU, transport, lanes, heartbeat, credential lifetime or the default cap makes every member re-join and apply it.'));
+    ga.append(field('IPv4 CIDR', cidr4, 'Required.'), field('IPv6 CIDR', cidr6, 'Optional. Leave blank for an IPv4-only network.'));
+
+    const gt = section('transport', 'swap', 'Transport', 'How sessions carry packets. Changes here make every member re-join to apply them.');
+    const transport = pick(gt, 'Transport', 'stream works through anything; datagram has lower latency.', [['stream', 'stream'], ['datagram', 'datagram']], s.transport, REJOIN);
+    const lanes = num(gt, 'lanes', 'Lanes', 'Parallel stream lanes per session (1–15).', { min: 1, max: 15 }, REJOIN);
+    const mtu = num(gt, 'mtu', 'MTU', 'Tunnel MTU, 1280–9000.', { min: 1280, max: 9000 }, REJOIN);
+
+    const gm = section('timing', 'clock', 'Timing', 'How quickly the network notices change, and how long credentials live.');
+    const hb = num(gm, 'heartbeat_secs', 'Heartbeat (s)', 'Convergence after a lost push is bounded by this.', { min: 1 }, REJOIN);
+    const off = num(gm, 'offline_after', 'Offline after (heartbeats)', 'Missed heartbeats before a member is shown offline.', { min: 1 });
+    const ttl = num(gm, 'credential_ttl_mins', 'Credential lifetime (min)', 'Members renew at two thirds of this.', { min: 1 }, REJOIN);
+    const hold = num(gm, 'hold_down_secs', 'Hold-down (s)', 'Damping when two relays front the same LAN. 0 = off.', { min: 0 });
+
+    const gp = section('policy', 'shield', 'Limits & policy', 'Bandwidth defaults and which relays may join.');
+    const capd = num(gp, 'max_session_mbps', 'Default per-client cap (Mbps)', '0 = none. Relays may override it per member.', { min: 0 }, REJOIN);
+    const reach = pick(gp, 'Relay reachability check', 'After a relay joins, the coordinator dials its address: warn, refuse the join, or skip.', [['warn', 'warn'], ['deny', 'deny'], ['off', 'off']], s.relay_reachability);
+    const loop = pick(gp, 'Allow loopback relay addresses', 'Only for single-machine demos.', [['false', 'no'], ['true', 'yes']], String(!!s.allow_loopback_relays));
+
+    section('danger', 'alert', 'Danger zone', null, 'dz');
+    const dzp = sections[sections.length - 1].p; dzp.querySelector('.grid2').remove();
+    const dz = el('div', 'danger-zone'); dz.append(el('h3', null, 'Delete this network'));
+    dz.append(el('p', null, 'Every member is thrown off and forgotten; tokens stop working. Export first if you may want it back.'));
+    const del = el('button', 'danger'); del.type = 'button'; del.append(icon('trash', 15), document.createTextNode('Delete ' + st.network_id));
+    del.onclick = () => { const now = frame.status[st.network_id] || st; confirmModal({ title: 'Delete network ' + st.network_id + '?', sub: `${now.members.length} members`,
+      lead: 'This cannot be undone from the UI.', details: [`${now.members.filter(m => m.online).length} members are online right now`, 'All tokens for this network stop working'],
+      danger: 'Delete network', onConfirm: async () => { await api(netPath(st.network_id), { method: 'DELETE' }); go('#/'); } }); };
+    dz.append(del); dzp.append(dz);
+
+    const savebar = el('div', 'savebar'); const state = el('span', 'state', 'All changes saved');
+    const discard = el('button', 'ghost', 'Discard'); discard.type = 'button'; discard.hidden = true; discard.onclick = () => load();
+    const save = el('button', 'primary', 'Save changes'); const err = el('span', 'msg err');
+    savebar.append(state, err, el('span', 'spacer'), discard, save); panels.append(savebar);
+    const dirty = on => { savebar.classList.toggle('dirty', on); state.textContent = on ? 'Unsaved changes' : 'All changes saved'; discard.hidden = !on; };
+    f.oninput = f.onchange = () => dirty(true);
+
+    const show = key => {
+      settingsSection = key;
+      for (const x of sections) { x.p.hidden = x.key !== key; x.b.classList.toggle('active', x.key === key); }
+      savebar.hidden = key === 'danger';
+    };
+    // An invalid field may be in a section that is not showing. One check
+    // fires `invalid` for every bad field in order; show the first one's.
+    let revealed = false;
+    f.addEventListener('invalid', e => {
+      if (revealed) return; revealed = true; setTimeout(() => { revealed = false; }, 0);
+      const x = sections.find(x => x.p.contains(e.target)); if (x) show(x.key);
+    }, true);
+    f.append(nav, panels);
+    show(sections.some(x => x.key === settingsSection) ? settingsSection : 'addressing');
+
     f.onsubmit = async e => {
       e.preventDefault(); save.disabled = true; err.textContent = '';
       const spec = { network_id: st.network_id, ipv4_cidr: cidr4.value.trim(), ipv6_cidr: optStr(cidr6.value.trim()), settings: {
         credential_ttl_mins: Number(ttl.value), heartbeat_secs: Number(hb.value), offline_after: Number(off.value), hold_down_secs: Number(hold.value),
         mtu: Number(mtu.value), lanes: Number(lanes.value), max_session_mbps: Number(capd.value), transport: transport.value,
         relay_reachability: reach.value, allow_loopback_relays: loop.value === 'true' } };
-      try { await api(netPath(st.network_id), { method: 'PUT', body: spec }); msg('Saved'); } catch (ex) { err.textContent = ex.message; }
+      try { await api(netPath(st.network_id), { method: 'PUT', body: spec }); msg('Settings saved'); load(); } catch (ex) { err.textContent = ex.message; }
       save.disabled = false;
     };
     box.append(f);
-    const dz = el('div', 'danger-zone'); dz.append(el('h3', null, 'Delete this network'));
-    dz.append(el('p', 'note', 'Every member is thrown off and forgotten; tokens stop working. Export first if you may want it back.'));
-    const del = el('button', 'danger', 'Delete ' + st.network_id);
-    del.onclick = () => confirmModal({ title: 'Delete network ' + st.network_id + '?', sub: `${st.members.length} members`,
-      lead: 'This cannot be undone from the UI.', details: [`${st.members.filter(m => m.online).length} members are online right now`, 'All tokens for this network stop working'],
-      danger: 'Delete network', onConfirm: async () => { await api(netPath(st.network_id), { method: 'DELETE' }); go('#/'); } });
-    dz.append(del); box.append(dz);
   }).catch(e => box.replaceChildren(el('div', 'empty', e.message)));
+  load();
   return pane;
 }
 
@@ -961,7 +1343,7 @@ function topologyPane(st) {
       const a = outward - spread/2 + (online.length === 1 ? 0 : spread * i / (online.length - 1));
       const rad = 84 + (i % 2) * 28; const cxx = p.x + rad * Math.cos(a), cyy = p.y + rad * Math.sin(a);
       svg.append(svgEl('line', { x1: p.x, y1: p.y, x2: cxx, y2: cyy, stroke: 'currentColor', 'stroke-opacity': .22, 'stroke-width': 1 }));
-      const g = svgEl('g', { class: 'node' });
+      const g = svgEl('g', { class: 'node', 'data-key': 'c:' + c.name });
       g.append(svgEl('circle', { cx: cxx, cy: cyy, r: 9, fill: 'var(--accent2)', 'fill-opacity': .85 }));
       const lbl = svgEl('text', { x: cxx, y: cyy + 22, class: 'clabel' }); lbl.textContent = c.name.length > 14 ? c.name.slice(0, 13) + '…' : c.name; g.append(lbl);
       const t = svgEl('title'); t.textContent = `${c.name} (#${c.node_id})\n${addrOf(c) || 'no address'}`; g.append(t);
@@ -970,7 +1352,7 @@ function topologyPane(st) {
   });
   relays.forEach(r => {
     const p = pos.get(r.name); const kids = (byRelay.get(r.name) || []).filter(k => k.online).length;
-    const g = svgEl('g', { class: 'node' });
+    const g = svgEl('g', { class: 'node', 'data-key': 'r:' + r.name });
     g.append(svgEl('circle', { cx: p.x, cy: p.y, r: 30, fill: r.online ? 'var(--accent)' : 'var(--off)', 'fill-opacity': r.online ? .16 : .1 }));
     g.append(svgEl('circle', { class: 'ring', cx: p.x, cy: p.y, r: 30, fill: 'none', stroke: r.online ? 'var(--accent)' : 'var(--off)', 'stroke-width': 2, 'stroke-dasharray': r.online ? '' : '4 4' }));
     const count = svgEl('text', { x: p.x, y: p.y + 5, class: 'nlabel' }); count.textContent = kids; g.append(count);
@@ -1000,7 +1382,7 @@ function topologyPane(st) {
 /* ---------- modal ---------- */
 function openModal(title, sub) { $('#modal-title').textContent = title; $('#modal-sub').textContent = sub || '';
   const body = $('#modal-body'); body.replaceChildren(); $('#overlay').hidden = false; return body; }
-function closeModal() { $('#overlay').hidden = true; if (staleWhileBusy) { staleWhileBusy = false; render(); } }
+function closeModal() { $('#overlay').hidden = true; }
 $('#modal-close').onclick = closeModal;
 $('#overlay').onclick = e => { if (e.target === $('#overlay')) closeModal(); };
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });

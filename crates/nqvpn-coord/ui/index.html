@@ -263,6 +263,8 @@ main{padding:24px 32px 90px;width:100%;max-width:1480px}
 .issues div{display:flex;gap:7px;align-items:flex-start}
 .issues .ic{margin-top:2px}
 .mjoin{padding:0 16px 12px;font-size:12px;color:var(--faint)}
+.mnote{margin:0 16px 10px;align-self:flex-start;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:550;
+       color:var(--muted);background:var(--sunk);border:1px solid var(--line2);border-radius:999px;padding:2px 10px 2px 8px}
 .mfoot{display:flex;gap:6px;align-items:center;padding:10px 12px;border-top:1px solid var(--line2);background:var(--sunk);margin-top:auto}
 .mfoot .spacer{flex:1}
 .mfoot button{box-shadow:none}
@@ -504,13 +506,17 @@ const fmtTime = unix => unix ? new Date(unix * 1000).toLocaleString() : '—';
 // effect. Show it as a time (with the raw number on hover).
 function fmtGen(gen) {
   if (!gen || gen < 1e12) return 'gen ' + gen; // pre-clock / test value
-  const d = new Date(gen);
-  // Time alone for a snapshot from today; the date too when it's older,
-  // so an old snapshot never reads as a bare, ambiguous time-of-day.
-  const label = d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
-  const s = el('span', null, 'as of ' + label);
-  s.title = d.toLocaleString() + '  ·  generation ' + gen;
+  const s = el('span', null, 'as of ' + genTime(gen));
+  s.title = new Date(gen).toLocaleString() + '  ·  generation ' + gen;
   return s;
+}
+/** A generation as the time it took effect, as text. Time alone for one
+ *  from today; the date too when it's older, so an old view never reads
+ *  as a bare, ambiguous time-of-day. */
+function genTime(gen) {
+  if (!gen || gen < 1e12) return 'gen ' + gen;
+  const d = new Date(gen);
+  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
 }
 const addrOf = m => [m.ip4, m.ip6].filter(Boolean).join('  ');
 
@@ -522,11 +528,12 @@ function pill(m) {
 }
 function viewState(st, m) {
   if (m.reported_gen === undefined || m.reported_gen === null) return { cls: 'muted', label: 'no report', title: 'This member has not reported which generation it applied yet.' };
-  const g = m.reported_gen, cur = st.gen;
-  if (g === cur && m.digest_ok) return { cls: 'pill on', label: 'OK · gen ' + g, title: 'Applied the current generation and its digest matches.' };
-  if (g < cur) return { cls: 'pill warnpill', label: `behind · ${g} / ${cur}`, title: `Applied generation ${g}; the network is at ${cur}. It should catch up on its next heartbeat.` };
-  if (g > cur) return { cls: 'pill badpill', label: `mismatch · ${g} > ${cur}`, title: `Reports generation ${g}, newer than the coordinator's ${cur}. Usually a coordinator restart; the next push fixes it.` };
-  return { cls: 'pill badpill', label: 'mismatch · gen ' + g, title: 'Generation matches but the digest does not: the member holds a different table than this coordinator sent.' };
+  const g = m.reported_gen, cur = st.gen, t = genTime(g), now = genTime(cur);
+  const raw = ` (generation ${g}; network ${cur})`;
+  if (g === cur && m.digest_ok) return { cls: 'pill on', label: 'OK · ' + t, title: `Holds the current view, from ${t}, and its digest matches.` + raw };
+  if (g < cur) return { cls: 'pill warnpill', label: `behind · ${t}`, title: `Holds the view from ${t}; the network's is from ${now}. It should catch up on its next heartbeat.` + raw };
+  if (g > cur) return { cls: 'pill badpill', label: `ahead · ${t}`, title: `Reports a view from ${t}, newer than the coordinator's (${now}). Usually a coordinator restart; the next push fixes it.` + raw };
+  return { cls: 'pill badpill', label: 'mismatch · ' + t, title: `Holds a view from ${t} like the coordinator, but its digest differs: the member has a different table than this coordinator sent.` + raw };
 }
 function viewCell(st, m) { const v = viewState(st, m); const s = el('span', v.cls, v.label); s.title = v.title; return s; }
 function table(headers, rows) {
@@ -803,6 +810,18 @@ function networkPage(st, tab) {
 }
 
 /* ---------- members ---------- */
+/** The last time this member's token secret was regenerated, or another
+ *  machine took over its name — information, not a fault. */
+function replacedNote(m) {
+  if (!m.replaced_unix) return '';
+  if (m.replaced_from === 'secret rotated') return 'Token secret last replaced ' + fmtTime(m.replaced_unix);
+  return `Taken over from ${m.replaced_from || 'another machine'} · ${fmtTime(m.replaced_unix)}`;
+}
+function replacedTitle(m) {
+  return m.replaced_from === 'secret rotated'
+    ? 'The token was regenerated here; the old one stopped working at that moment.'
+    : 'A join under this name from another machine took over, and the earlier instance was told to stop. If that was not you, regenerate the token.';
+}
 /** What is wrong with a member that the operator can act on, in words. */
 function memberIssues(st, m) {
   const out = [];
@@ -813,7 +832,6 @@ function memberIssues(st, m) {
     else if (!er.ip_forward || !er.masquerade) out.push('Internet exit is not ready: ' + [er.ip_forward ? null : 'IP forwarding is off', er.masquerade ? null : 'no masquerade rule'].filter(Boolean).join(', ') + '. Clients cannot egress through it.');
   }
   if (m.online && m.reported_gen !== undefined && m.reported_gen !== null && viewState(st, m).cls.includes('badpill')) out.push(viewState(st, m).title);
-  if (m.replaced_unix) out.push('Replaced from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix) + '. If that was not you, regenerate the token.');
   return out;
 }
 
@@ -917,6 +935,8 @@ function memberCard(st, m, issues) {
     for (const i of issues) { const d = el('div'); d.append(icon('alert', 14), el('span', null, i)); box.append(d); }
     card.append(box);
   }
+  const rep = replacedNote(m);
+  if (rep) { const tag = el('div', 'mnote'); tag.append(icon('key', 13), el('span', null, rep)); tag.title = replacedTitle(m); card.append(tag); }
   card.append(el('div', 'mjoin', m.last_join_unix ? `Joined from ${m.last_join_from || 'unknown'} · ${fmtTime(m.last_join_unix)} · login gen ${m.login_gen}` : 'Never joined — put its token on the machine.'));
 
   const foot = el('div', 'mfoot');
@@ -1398,10 +1418,10 @@ function kv(pairs) { const d = el('dl', 'kv'); for (const [k, v] of pairs) { if 
 function commonRows(st, m) {
   const v = viewState(st, m);
   return [ ['Node id', m.node_id ? '#' + m.node_id : 'not joined yet'], ['Address', addrOf(m) || '—'], ['Routed CIDRs', (m.registered_cidrs || []).join(' ') || '—'],
-    ['Disabled', m.disabled ? 'yes' : 'no'], ['View', v.label + (m.reported_gen === undefined ? '' : ` (network gen ${st.gen}, digest ${m.digest_ok ? 'ok' : 'MISMATCH'})`)],
+    ['Disabled', m.disabled ? 'yes' : 'no'], ['View', v.label + (m.reported_gen === undefined ? '' : ` (network view from ${genTime(st.gen)}, digest ${m.digest_ok ? 'ok' : 'MISMATCH'})`)],
     ['Heartbeat', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago · ' + fmtTime(m.last_heartbeat_unix) : '—'],
     ['Last join', m.last_join_unix ? fmtTime(m.last_join_unix) + ' from ' + (m.last_join_from || 'unknown') : 'never'], ['Login gen', m.login_gen],
-    ['Replaced', m.replaced_unix ? 'from ' + (m.replaced_from || 'unknown') + ' at ' + fmtTime(m.replaced_unix) : undefined] ];
+    ['Replaced', replacedNote(m) || undefined] ];
 }
 function showRelay(st, r) {
   const body = openModal(r.name, `relay · ${r.online ? 'online' : 'offline'}`);

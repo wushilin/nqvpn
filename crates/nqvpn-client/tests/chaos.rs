@@ -60,6 +60,8 @@ fn secret_of(name: &str) -> String {
 struct Coord {
     state: Arc<AppState>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    endpoint: quinn::Endpoint,
+    api_port: u16,
 }
 
 impl Coord {
@@ -97,6 +99,7 @@ impl Coord {
         let identity = TlsIdentity::generate("coord").unwrap();
         let mut tasks = Vec::new();
         let ep = nqvpn_coord::control::bind(format!("127.0.0.1:{quic_port}").parse().unwrap(), &identity).unwrap();
+        let endpoint = ep.clone();
         let s = state.clone();
         tasks.push(tokio::spawn(async move {
             let _ = nqvpn_coord::control::serve(s, ep).await;
@@ -111,11 +114,14 @@ impl Coord {
             let server = axum_server::from_tcp_rustls(listener, tls).expect("test coordinator listener");
             let _ = server.serve(app.into_make_service_with_connect_info::<SocketAddr>()).await;
         }));
-        Coord { state, tasks }
+        Coord { state, tasks, endpoint, api_port }
     }
 
-    /// Stop everything: sessions drop, ports free.
-    fn stop(self) {
+    /// Stop everything: sessions drop, ports free. Like a process exit,
+    /// this returns only once both ports can be bound again: aborting the
+    /// tasks is not enough, since quinn keeps the UDP socket open until
+    /// its connections have drained.
+    async fn stop(self) {
         for t in self.tasks {
             t.abort();
         }
@@ -125,6 +131,18 @@ impl Coord {
                 s.conn.close(0u32.into(), b"coordinator stopping");
             }
         }
+        let quic = self.endpoint.local_addr().unwrap();
+        self.endpoint.close(0u32.into(), b"coordinator stopping");
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.endpoint.wait_idle()).await;
+        drop(self.endpoint);
+        let api = SocketAddr::from(([127, 0, 0, 1], self.api_port));
+        for _ in 0..200 {
+            if std::net::UdpSocket::bind(quic).is_ok() && std::net::TcpListener::bind(api).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("coordinator ports {quic} / {api} still busy 5s after stopping");
     }
 
     fn net(&self) -> Arc<Mutex<NetState>> {
@@ -493,14 +511,13 @@ impl World {
     }
 
     async fn restart_coordinator(&mut self) {
-        self.stop_coordinator();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.stop_coordinator().await;
         self.start_coordinator().await;
     }
 
-    fn stop_coordinator(&mut self) {
+    async fn stop_coordinator(&mut self) {
         if let Some(c) = self.coord.take() {
-            c.stop();
+            c.stop().await;
         }
     }
 
@@ -1128,7 +1145,7 @@ async fn route_all_withholds_the_catch_all_when_no_exit_owns_the_default() -> Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn members_connect_eventually_when_the_coordinator_comes_up_late() -> Result<()> {
     let (mut w, rp) = World::new(&[1], &[10, 20]).await;
-    w.stop_coordinator();
+    w.stop_coordinator().await;
 
     // Both start against a dead coordinator and keep trying.
     let r1 = tokio::spawn({

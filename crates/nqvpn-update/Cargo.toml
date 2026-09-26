@@ -1,0 +1,25 @@
+[package]
+name = "nqvpn-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# `--self-update` / `--check-update` for every binary: find the latest
+# GitHub release, download this platform's archive, verify it, and swap
+# the running binary on disk. Blocking std I/O over rustls, like the
+# member join client, so the static binaries carry no HTTP stack.
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2.workspace = true
+hex.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

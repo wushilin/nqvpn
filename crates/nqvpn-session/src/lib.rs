@@ -498,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn dial_accept_and_probe_liveness() {
-        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rngs::OsRng)));
+        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))));
         let (srv, srv_id) = server();
         let addr = srv.local_addr().unwrap();
         let ca2 = ca.clone();
@@ -529,7 +529,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_ends_at_credential_expiry_unless_refreshed() {
-        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rngs::OsRng)));
+        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))));
         let (srv, srv_id) = server();
         let addr = srv.local_addr().unwrap();
         let ca2 = ca.clone();
@@ -559,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_dialer_gives_up_when_probes_go_unanswered() {
-        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rngs::OsRng)));
+        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))));
         let (srv, srv_id) = server();
         let addr = srv.local_addr().unwrap();
         let ca2 = ca.clone();

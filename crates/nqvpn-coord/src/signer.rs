@@ -35,7 +35,7 @@ impl Keyring {
             serde_json::from_str(&std::fs::read_to_string(path)?)
                 .with_context(|| format!("parsing {}", path.display()))?
         } else {
-            let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+            let sk = SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng));
             let stored = StoredKeyring {
                 keys: vec![StoredKey {
                     kid: format!("k{now}"),

@@ -242,7 +242,8 @@ pub fn client_config(
 
 /// The certificates in a PEM blob, as DER.
 pub fn certs_from_pem(pem: &[u8]) -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut &pem[..]).filter_map(|c| c.ok()).collect()
+    use rustls_pki_types::pem::PemObject;
+    CertificateDer::pem_slice_iter(pem).filter_map(|c| c.ok()).collect()
 }
 
 /// SHA-256 fingerprints ("sha256:<hex>") of the certificates in a PEM blob.

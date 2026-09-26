@@ -3,7 +3,7 @@
 //! and a static bearer token for scripts. Either satisfies the admin
 //! API; the UI only ever uses the session.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,10 +27,10 @@ pub struct Sessions {
 
 /// Hash a password for `coordinator.toml`.
 pub fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    // argon2 draws a fresh salt from the OS random source.
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|h| h.to_string())
+        .hash_password(password.as_bytes())
+        .map(|h: PasswordHash| h.to_string())
         .map_err(|e| e.to_string())
 }
 
@@ -99,6 +99,15 @@ mod tests {
         assert!(verify_password("hunter2", &h));
         assert!(!verify_password("hunter3", &h));
         assert!(!verify_password("hunter2", "not-a-hash"));
+    }
+
+    #[test]
+    fn a_hash_already_in_a_config_still_verifies() {
+        // Made by an earlier release (argon2 0.5); operators' configs hold
+        // hashes like it, so a crate upgrade must keep accepting them.
+        let h = "$argon2id$v=19$m=19456,t=2,p=1$1n2uHbqkM/v0Cf/PEo/3Uw$Hf92HhU5ct/lfWH7lwHpFaq81ksotjP1vAeWK/vhl8I";
+        assert!(verify_password("golden-password", h));
+        assert!(!verify_password("golden-passwore", h));
     }
 
     #[test]

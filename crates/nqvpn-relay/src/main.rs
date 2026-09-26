@@ -24,10 +24,15 @@ struct Cli {
     /// Print a status line every N seconds (0 = off).
     #[arg(long, default_value_t = 0)]
     status_secs: u64,
+    #[command(flatten)]
+    update: nqvpn_update::UpdateArgs,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(done) = nqvpn_update::run_if_requested(&cli.update, "nqvpn-relay", env!("CARGO_PKG_VERSION")) {
+        return done;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();

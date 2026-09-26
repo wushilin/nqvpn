@@ -1,0 +1,156 @@
+# Build every release platform and publish a GitHub release.
+#
+#   git tag vX.Y.Z && git push origin vX.Y.Z   -> test, build, publish
+#   Actions tab -> release -> Run workflow      -> test and build only (dry run)
+#
+# Archives are nqvpn-<version>-<os>-<arch>.tar.gz (+ .sha256), each holding
+# nqvpn-coord, nqvpn-relay and nqvpn-client; --self-update fetches exactly
+# these names. Linux builds are static musl; macOS and FreeBSD link their
+# system libc (musl does not exist there).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # The same path as a local release: cargo-zigbuild, fully static musl.
+      - run: ./build_all.sh --setup amd64 arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: dist/*.tar.gz*
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: |
+          v=${{ needs.version.outputs.version }}
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:amd64; do
+            target=${pair%%:*} arch=${pair##*:}
+            cargo build --release --locked --target "$target" -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            .github/scripts/package.sh "$v" macos "$arch" "target/$target/release"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: dist/*.tar.gz*
+
+  # FreeBSD has no musl and no cross toolchain worth trusting, so it builds
+  # natively in a VM. amd64 is hardware-accelerated; aarch64 is emulated
+  # and slow, so it is attached to the release after it is published.
+  freebsd-amd64:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            echo 'FreeBSD: { url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg install -y rust
+          run: |
+            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            .github/scripts/package.sh ${{ needs.version.outputs.version }} freebsd amd64 target/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-amd64
+          path: dist/*.tar.gz*
+
+  release:
+    needs: [version, test, linux, macos, freebsd-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - name: publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${{ needs.version.outputs.version }}
+          notes=.github/releases/v$v.md
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          gh release create "v$v" --title "nqvpn $v" "$@" dist/*.tar.gz dist/*.tar.gz.sha256
+
+  freebsd-arm64:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          arch: aarch64
+          usesh: true
+          prepare: |
+            mkdir -p /usr/local/etc/pkg/repos
+            echo 'FreeBSD: { url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
+            pkg install -y rust
+          run: |
+            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            .github/scripts/package.sh ${{ needs.version.outputs.version }} freebsd arm64 target/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-arm64
+          path: dist/*.tar.gz*
+      - name: attach to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v${{ needs.version.outputs.version }}" dist/*.tar.gz dist/*.tar.gz.sha256

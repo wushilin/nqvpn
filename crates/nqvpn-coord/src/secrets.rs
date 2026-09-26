@@ -6,9 +6,9 @@
 
 /// A secret with enough entropy that guessing is not a threat model.
 pub fn generate_secret() -> String {
-    use rand::RngCore;
+    use rand::TryRng;
     let mut raw = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut raw);
+    rand::rngs::SysRng.try_fill_bytes(&mut raw).expect("the OS random source failed");
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     URL_SAFE_NO_PAD.encode(raw)

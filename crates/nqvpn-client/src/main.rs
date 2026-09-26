@@ -51,10 +51,15 @@ struct Cli {
     /// choice; which relay carries the traffic is picked normally.
     #[arg(long, visible_alias = "via")]
     route_all_via: Option<String>,
+    #[command(flatten)]
+    update: nqvpn_update::UpdateArgs,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(done) = nqvpn_update::run_if_requested(&cli.update, "nqvpn-client", env!("CARGO_PKG_VERSION")) {
+        return done;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();

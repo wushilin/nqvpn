@@ -8,10 +8,11 @@ members = [
     "crates/nqvpn-endpoint",
     "crates/nqvpn-session",
     "crates/nqvpn-sync",
+    "crates/nqvpn-update",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -21,20 +22,21 @@ nqvpn-proto = { path = "crates/nqvpn-proto" }
 nqvpn-endpoint = { path = "crates/nqvpn-endpoint" }
 nqvpn-session = { path = "crates/nqvpn-session" }
 nqvpn-sync = { path = "crates/nqvpn-sync" }
+nqvpn-update = { path = "crates/nqvpn-update" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 bincode = "1.3"
 thiserror = "2"
 anyhow = "1"
 ipnet = { version = "2", features = ["serde"] }
 prefix-trie = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
-base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
-argon2 = "0.5"
+base64 = "0.23"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.10"
+argon2 = "0.6"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 quinn = "0.11"
@@ -43,19 +45,20 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = "1"
 rcgen = "0.14"
 time = { version = "0.3", default-features = false, features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 snow = "0.10"
 tun-rs = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 hex = "0.4"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 webpki-roots = "1"
-rustls-pemfile = "2"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 getifaddrs = "0.6"
 route_manager = "0.2"
 futures-util = "0.3"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+flate2 = "1"
+tar = "0.4"

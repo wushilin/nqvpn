@@ -224,6 +224,7 @@ nqvpn-client --token "nqv1.…" --route-all-via cloud-exit   # prefer this one
 | `nqvpn-relay` | one `RelayNet` per network (multi-tenant), the one-page forwarding rule, mesh dialers, hop guard, trace notes |
 | `nqvpn-client` | ~500 lines of wiring |
 | `nqvpn-coord` | networks and members in SQLite, join by token, leases, directory with generations and a delta ring, HTTPS API, embedded live admin UI |
+| `nqvpn-update` | `--self-update` / `--check-update` for every binary, from GitHub releases |
 
 Dependencies point strictly downward (`proto ← session ← sync/endpoint ←
 relay/client`; `coord ← proto`), so each crate is reviewable on its own.
@@ -342,9 +343,39 @@ It uses `cargo zigbuild` when available, `cross` if that is on PATH, and
 otherwise native musl toolchains on a Linux host (fetching a musl.cc
 cross toolchain for the other architecture).
 
+## Releases and updating
+
+Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
+the full test suite, then builds for every platform, published as
+`nqvpn-<version>-<os>-<arch>.tar.gz` (+ `.sha256`), each holding all three
+binaries:
+
+| OS | amd64 | arm64 | Notes |
+|---|---|---|---|
+| Linux | ✓ | ✓ | static musl, runs on any distro |
+| macOS | ✓ | ✓ | |
+| FreeBSD | ✓ | ✓ | coordinator and relay; the client has no TUN backend there yet (`--dry-run` only). arm64 is attached to the release after it is published |
+
+Running the workflow by hand (Actions → release → Run workflow) builds
+everything without publishing.
+
+Every binary can update itself in place:
+
+```sh
+nqvpn-relay --check-update   # is there a newer release? changes nothing
+nqvpn-relay --self-update    # download, verify, swap; keeps nqvpn-relay.old
+```
+
+`--self-update` fetches this platform's archive from the latest GitHub
+release, checks its SHA-256, runs the new binary once (`--version`) to
+prove it executes on this host, and renames it over the current one. The
+running process is untouched — restart the service to pick it up — and
+the previous binary stays beside it as `<name>.old` for rollback. It needs
+write access to the binary's directory (typically `sudo`).
+
 ## Status
 
 Linux and macOS clients and relays, including full-tunnel exit nodes
-(`--route-all`). Windows is not implemented, and DNS is never touched: a
+(`--route-all`); FreeBSD coordinators and forwarding relays. Windows is not implemented, and DNS is never touched: a
 full-tunnel client keeps its own resolvers, which are pinned to the real
 gateway rather than pushed or captured. Apache-2.0.

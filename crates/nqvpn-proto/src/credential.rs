@@ -192,7 +192,8 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
     fn claims(exp: u64) -> Claims {
         Claims {
@@ -218,7 +219,7 @@ mod tests {
 
     #[test]
     fn renewal_lands_at_two_thirds_of_the_lifetime() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let mut c = claims(1000);
         c.iat = 100;
         c.exp = 1000;
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn sign_verify_roundtrip() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         let c = verify(&token, &keys, &expected(), 500).unwrap();
@@ -241,7 +242,7 @@ mod tests {
 
     #[test]
     fn expired_rejected_with_leeway() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         assert!(verify(&token, &keys, &expected(), 1000 + LEEWAY_SECS - 1).is_ok(), "inside leeway");
@@ -253,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_token_from_the_future_is_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let mut c = claims(10_000);
         c.iat = 5000;
@@ -267,8 +268,8 @@ mod tests {
 
     #[test]
     fn wrong_key_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let other = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let other = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), other.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         assert!(matches!(verify(&token, &keys, &expected(), 500), Err(CredError::BadSignature)));
@@ -276,7 +277,7 @@ mod tests {
 
     #[test]
     fn unknown_kid_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("other".to_string(), sk.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         assert!(matches!(verify(&token, &keys, &expected(), 500), Err(CredError::UnknownKid(_))));
@@ -284,7 +285,7 @@ mod tests {
 
     #[test]
     fn network_binding_enforced() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         let wrong = Expected { iss: "coord", network_id: "acme", network_uuid: "u-2" };
@@ -293,7 +294,7 @@ mod tests {
 
     #[test]
     fn tampered_payload_rejected() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let token = sign(&claims(1000), "k1", &sk);
         let mut parts: Vec<&str> = token.split('.').collect();
@@ -308,7 +309,7 @@ mod tests {
     #[test]
     fn a_token_without_login_gen_still_parses() {
         // Older coordinators never wrote the field; it defaults to 0.
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
         let keys = vec![("k1".to_string(), sk.verifying_key())];
         let mut v = serde_json::to_value(claims(1000)).unwrap();
         v.as_object_mut().unwrap().remove("login_gen");

@@ -105,8 +105,11 @@ impl Coord {
         let app = nqvpn_coord::api::router(state.clone());
         let tls = axum_server::tls_rustls::RustlsConfig::from_der(vec![identity.cert_der.clone()], identity.private_key().secret_der().to_vec()).await.unwrap();
         let listener = std::net::TcpListener::bind(format!("127.0.0.1:{api_port}")).unwrap();
+        // Handed to tokio as-is (axum-server 0.8), which refuses a blocking socket.
+        listener.set_nonblocking(true).unwrap();
         tasks.push(tokio::spawn(async move {
-            let _ = axum_server::from_tcp_rustls(listener, tls).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await;
+            let server = axum_server::from_tcp_rustls(listener, tls).expect("test coordinator listener");
+            let _ = server.serve(app.into_make_service_with_connect_info::<SocketAddr>()).await;
         }));
         Coord { state, tasks }
     }

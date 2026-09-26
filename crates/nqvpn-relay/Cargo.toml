@@ -11,6 +11,7 @@ license.workspace = true
 
 [dependencies]
 nqvpn-proto.workspace = true
+nqvpn-update.workspace = true
 nqvpn-session.workspace = true
 nqvpn-sync.workspace = true
 nqvpn-endpoint.workspace = true

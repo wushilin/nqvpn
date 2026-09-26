@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use nqvpn_coord::api;
 use nqvpn_coord::config::{load_coord_config, read_bearer_token};
 use nqvpn_coord::db::Db;
@@ -14,7 +14,9 @@ use std::sync::Arc;
 #[command(name = "nqvpn-coord", version, about = "NetQ VPN coordinator")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    update: nqvpn_update::UpdateArgs,
 }
 
 #[derive(Subcommand)]
@@ -36,14 +38,22 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls is built with both ring and aws-lc-rs available (via
-    // axum-server); pick ring process-wide so every TLS config agrees.
+    // ring is the only rustls provider built in; axum-server's TLS config
+    // takes the process default, so it must be installed first.
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    match cli.cmd {
+    if let Some(done) = nqvpn_update::run_if_requested(&cli.update, "nqvpn-coord", env!("CARGO_PKG_VERSION")) {
+        return done;
+    }
+    let Some(cmd) = cli.cmd else {
+        Cli::command()
+            .error(clap::error::ErrorKind::MissingSubcommand, "a subcommand is required (run, hash-password), or --self-update / --check-update")
+            .exit()
+    };
+    match cmd {
         Cmd::Run { config } => run(config).await,
         Cmd::HashPassword { password } => {
             let pw = match password {
@@ -145,12 +155,16 @@ async fn run(config_path: PathBuf) -> Result<()> {
 fn load_pem_identity(cert: &str, key: &str) -> Result<TlsIdentity> {
     let cert_pem = std::fs::read(cert).with_context(|| format!("reading {cert}"))?;
     let key_pem = std::fs::read(key).with_context(|| format!("reading {key}"))?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    use rustls::pki_types::pem::{self, PemObject};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<_, _>>()
         .with_context(|| format!("parsing {cert}"))?;
     let leaf = certs.first().context("no certificate in [tls].cert")?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .with_context(|| format!("parsing {key}"))?
-        .context("no private key in [tls].key")?;
+    let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
+        Ok(k) => k,
+        Err(pem::Error::NoItemsFound) => anyhow::bail!("no private key in [tls].key"),
+        Err(e) => return Err(e).with_context(|| format!("parsing {key}")),
+    };
     TlsIdentity::from_der(leaf.to_vec(), key.secret_der().to_vec()).map_err(|e| anyhow::anyhow!("{e}"))
 }

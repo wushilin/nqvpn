@@ -194,7 +194,8 @@ mod tests {
         let id = TlsIdentity::generate("x").unwrap();
         assert!(id.cert_pem().starts_with("-----BEGIN CERTIFICATE-----\n"));
         assert!(id.key_pem().contains("-----END PRIVATE KEY-----"));
-        let parsed = rustls_pemfile::certs(&mut id.cert_pem().as_bytes())
+        use rustls_pki_types::pem::PemObject;
+        let parsed = CertificateDer::pem_slice_iter(id.cert_pem().as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(parsed.len(), 1);

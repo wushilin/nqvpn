@@ -30,7 +30,7 @@ pub struct Ca {
 
 impl Ca {
     fn new() -> Ca {
-        Ca { sk: SigningKey::generate(&mut rand::rngs::OsRng) }
+        Ca { sk: SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)) }
     }
     fn key_infos(&self) -> Vec<KeyInfo> {
         vec![KeyInfo { kid: "k1".into(), key: B64.encode(self.sk.verifying_key().to_bytes()), state: "active".into() }]

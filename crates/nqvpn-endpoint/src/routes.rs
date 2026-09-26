@@ -683,6 +683,7 @@ impl RouteProgrammer for RecordingProgrammer {
 /// shelling out and no CLI parsing. The crate is synchronous, so this is
 /// just a `RouteManager` behind a lock. Every route is bound to our TUN
 /// by interface, which is also how `list_via_dev` selects what is ours.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct NetRouteProgrammer {
     /// Empty until `set_device`: a programmer is opened before the TUN
     /// exists so a dead predecessor's pins can be removed before the join
@@ -694,6 +695,7 @@ pub struct NetRouteProgrammer {
     pinned: Mutex<PinJournal>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NetRouteProgrammer {
     /// Open the table for `device`, with no pin journal (the pins live and
     /// die with the process — fine for a relay, which pins nothing).
@@ -786,11 +788,13 @@ impl NetRouteProgrammer {
 }
 
 /// A `/32` or `/128` host route for `ip` (no interface/gateway set yet).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn host_route(ip: IpAddr) -> route_manager::Route {
     let bits = if ip.is_ipv6() { 128 } else { 32 };
     route_manager::Route::new(ip, bits)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RouteProgrammer for NetRouteProgrammer {
     fn add_via_tun(&self, net: IpNet) -> Result<()> {
         let r = self.route(net.trunc());
@@ -825,6 +829,7 @@ impl RouteProgrammer for NetRouteProgrammer {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl HostRouteTable for NetRouteProgrammer {
     fn default_gateway(&self, v6: bool) -> Option<IpAddr> {
         self.current_default_gateway(v6)
@@ -851,6 +856,7 @@ impl HostRouteTable for NetRouteProgrammer {
 /// Clean teardown: every pin is now unwanted, so the same reconcile that
 /// added them removes them and empties the journal (which deletes the
 /// file). A process that never gets here leaves the journal for `open`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for NetRouteProgrammer {
     fn drop(&mut self) {
         let mut pinned = self.pinned.lock().unwrap();
@@ -860,6 +866,36 @@ impl Drop for NetRouteProgrammer {
         let n = pinned.len();
         reconcile_pins(self, &[], &mut pinned);
         tracing::info!(target: "nqvpn::os_routes", pins = n, "removed our underlay pins on shutdown");
+    }
+}
+
+/// Where there is no TUN backend there is no route backend either, and
+/// nothing to program: opening one fails, so this type is never
+/// constructed and its methods are provably unreachable. Callers stay the
+/// same on every platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub enum NetRouteProgrammer {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl NetRouteProgrammer {
+    pub fn new(_device: String) -> Result<Self> {
+        anyhow::bail!("this platform has no route backend yet")
+    }
+    pub fn open(_journal: PinJournal) -> Result<Self> {
+        anyhow::bail!("this platform has no route backend yet; use --dry-run")
+    }
+    pub fn set_device(&self, _device: &str) {
+        match *self {}
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl RouteProgrammer for NetRouteProgrammer {
+    fn add_via_tun(&self, _net: IpNet) -> Result<()> {
+        match *self {}
+    }
+    fn remove(&self, _net: IpNet) -> Result<()> {
+        match *self {}
     }
 }
 

@@ -14,11 +14,18 @@ nqvpn-proto.workspace = true
 anyhow.workspace = true
 ipnet.workspace = true
 libc.workspace = true
-route_manager.workspace = true
 tokio.workspace = true
-tun-rs.workspace = true
 tracing.workspace = true
 getifaddrs.workspace = true
+
+# The OS backends — the TUN device (tun_real) and route programming
+# (NetRouteProgrammer) — exist on Linux and macOS only, so their crates
+# are only built there. Elsewhere they are not merely unused: route_manager,
+# which tun-rs also pulls in on every BSD, does not compile for FreeBSD
+# arm64.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tun-rs.workspace = true
+route_manager.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -258,6 +258,8 @@ main{padding:24px 32px 90px;width:100%;max-width:1480px}
 .mfacts dd.bad{color:var(--bad)}
 .cidrs{display:flex;flex-wrap:wrap;gap:5px;white-space:normal}
 .cidrs code{background:var(--sunk);border:1px solid var(--line2);border-radius:6px;padding:1px 7px;font-size:12px}
+.routes{display:flex;flex-direction:column;gap:6px}
+.pill.cidr{background:var(--accentbg);color:var(--accent);font:600 12px/1.5 var(--mono)}
 .issues{margin:0 16px 12px;padding:8px 11px;border-radius:10px;background:var(--badbg);color:var(--bad);font-size:12.5px;line-height:1.45;display:flex;flex-direction:column;gap:3px}
 .issues.warn{background:var(--warnbg);color:var(--warn)}
 .issues div{display:flex;gap:7px;align-items:flex-start}
@@ -501,22 +503,27 @@ function fmtAge(unix) { if (!unix) return '—'; const s = Math.max(0, nowUnix()
   if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
   if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
   return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h'; }
-const fmtTime = unix => unix ? new Date(unix * 1000).toLocaleString() : '—';
+/** The one timestamp format: local date and time with the UTC offset,
+ *  e.g. 2026-09-26 14:05:07+08 (minutes only when the offset has them). */
+function fmtStamp(ms) {
+  const d = new Date(ms), p = n => String(n).padStart(2, '0');
+  const off = -d.getTimezoneOffset(), a = Math.abs(off);
+  const tz = (off < 0 ? '-' : '+') + p(Math.floor(a / 60)) + (a % 60 ? ':' + p(a % 60) : '');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${tz}`;
+}
+const fmtTime = unix => unix ? fmtStamp(unix * 1000) : '—';
 // A generation number is epoch milliseconds — the time the snapshot took
-// effect. Show it as a time (with the raw number on hover).
+// effect. Show it as a timestamp (with the raw number on hover).
 function fmtGen(gen) {
   if (!gen || gen < 1e12) return 'gen ' + gen; // pre-clock / test value
   const s = el('span', null, 'as of ' + genTime(gen));
-  s.title = new Date(gen).toLocaleString() + '  ·  generation ' + gen;
+  s.title = 'generation ' + gen;
   return s;
 }
-/** A generation as the time it took effect, as text. Time alone for one
- *  from today; the date too when it's older, so an old view never reads
- *  as a bare, ambiguous time-of-day. */
+/** A generation as the time it took effect, as text. */
 function genTime(gen) {
   if (!gen || gen < 1e12) return 'gen ' + gen;
-  const d = new Date(gen);
-  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString();
+  return fmtStamp(gen);
 }
 const addrOf = m => [m.ip4, m.ip6].filter(Boolean).join('  ');
 
@@ -527,13 +534,13 @@ function pill(m) {
   return m.online ? el('span', 'pill on', 'online') : el('span', 'pill offl', 'offline');
 }
 function viewState(st, m) {
-  if (m.reported_gen === undefined || m.reported_gen === null) return { cls: 'muted', label: 'no report', title: 'This member has not reported which generation it applied yet.' };
+  if (m.reported_gen === undefined || m.reported_gen === null) return { cls: 'muted', label: 'no report', title: 'This member has not reported which config version it applied yet.' };
   const g = m.reported_gen, cur = st.gen, t = genTime(g), now = genTime(cur);
   const raw = ` (generation ${g}; network ${cur})`;
-  if (g === cur && m.digest_ok) return { cls: 'pill on', label: 'OK · ' + t, title: `Holds the current view, from ${t}, and its digest matches.` + raw };
-  if (g < cur) return { cls: 'pill warnpill', label: `behind · ${t}`, title: `Holds the view from ${t}; the network's is from ${now}. It should catch up on its next heartbeat.` + raw };
-  if (g > cur) return { cls: 'pill badpill', label: `ahead · ${t}`, title: `Reports a view from ${t}, newer than the coordinator's (${now}). Usually a coordinator restart; the next push fixes it.` + raw };
-  return { cls: 'pill badpill', label: 'mismatch · ' + t, title: `Holds a view from ${t} like the coordinator, but its digest differs: the member has a different table than this coordinator sent.` + raw };
+  if (g === cur && m.digest_ok) return { cls: 'pill on', label: 'OK · ' + t, title: `Holds the current config version, from ${t}, and its digest matches.` + raw };
+  if (g < cur) return { cls: 'pill warnpill', label: `behind · ${t}`, title: `Holds the config version from ${t}; the network's is from ${now}. It should catch up on its next heartbeat.` + raw };
+  if (g > cur) return { cls: 'pill badpill', label: `ahead · ${t}`, title: `Reports a config version from ${t}, newer than the coordinator's (${now}). Usually a coordinator restart; the next push fixes it.` + raw };
+  return { cls: 'pill badpill', label: 'mismatch · ' + t, title: `Holds the config version from ${t} like the coordinator, but its digest differs: the member has a different table than this coordinator sent.` + raw };
 }
 function viewCell(st, m) { const v = viewState(st, m); const s = el('span', v.cls, v.label); s.title = v.title; return s; }
 function table(headers, rows) {
@@ -705,23 +712,28 @@ let renderedRoute = null;
  * `data-keep` marks operator-owned subtrees (a form being edited) that
  * frames must leave alone. Live form state (typed values, selections) is a
  * property, not an attribute, so patching never clobbers it. */
+const restyled = new WeakSet();
 const HANDLERS = ['onclick', 'onchange', 'oninput', 'onsubmit', 'onkeydown'];
 function patch(live, next) {
   if (live.nodeType !== 1) {
     if (live.nodeValue !== next.nodeValue) {
       live.nodeValue = next.nodeValue;
       const p = live.parentElement;
-      if (p && p.classList.contains('pill')) { p.classList.remove('flash'); void p.offsetWidth; p.classList.add('flash'); }
+      if (p && p.classList.contains('pill') && !restyled.has(p)) { p.classList.remove('flash'); void p.offsetWidth; p.classList.add('flash'); }
     }
     return;
   }
   const keep = next.getAttribute('data-keep');
   if (keep !== null && live.getAttribute('data-keep') === keep) return;
+  // A badge whose state class changed (behind → OK) swaps at once: the new
+  // colour is the signal, and flashing it over the old one looks broken.
+  if (live.classList.contains('pill') && live.className.replace(/\bflash\b/, '').trim() !== next.className.trim()) { live.classList.remove('flash'); restyled.add(live); }
   for (const a of [...live.attributes]) if (!next.hasAttribute(a.name)) live.removeAttribute(a.name);
   for (const a of next.attributes) if (live.getAttribute(a.name) !== a.value) live.setAttribute(a.name, a.value);
   // Handlers close over the frame they were built from; take the new ones.
   for (const h of HANDLERS) if (live[h] !== next[h]) live[h] = next[h];
   patchChildren(live, next);
+  restyled.delete(live);
 }
 function patchChildren(live, next) {
   const keyed = new Map();
@@ -810,17 +822,14 @@ function networkPage(st, tab) {
 }
 
 /* ---------- members ---------- */
-/** The last time this member's token secret was regenerated, or another
- *  machine took over its name — information, not a fault. */
+/** When another machine took over this member's name — information, not
+ *  a fault. A regenerated token secret is not shown. */
 function replacedNote(m) {
-  if (!m.replaced_unix) return '';
-  if (m.replaced_from === 'secret rotated') return 'Token secret last replaced ' + fmtTime(m.replaced_unix);
+  if (!m.replaced_unix || m.replaced_from === 'secret rotated') return '';
   return `Taken over from ${m.replaced_from || 'another machine'} · ${fmtTime(m.replaced_unix)}`;
 }
 function replacedTitle(m) {
-  return m.replaced_from === 'secret rotated'
-    ? 'The token was regenerated here; the old one stopped working at that moment.'
-    : 'A join under this name from another machine took over, and the earlier instance was told to stop. If that was not you, regenerate the token.';
+  return 'A join under this name from another machine took over, and the earlier instance was told to stop. If that was not you, regenerate the token.';
 }
 /** What is wrong with a member that the operator can act on, in words. */
 function memberIssues(st, m) {
@@ -916,18 +925,24 @@ function memberCard(st, m, issues) {
     const kids = st.members.filter(c => c.role !== 'relay' && c.online && c.attached_relay === m.name).length;
     fact('Clients', kids + ' attached', kids ? '' : 'muted');
     const r = m.advertised_reachable;
-    fact('Address check', r === 'reachable' ? 'dialable' : r === 'unreachable' ? 'not dialable' : m.node_id ? 'not probed' : '—', r === 'unreachable' ? 'bad' : r === 'reachable' ? '' : 'muted');
+    fact('Address check', r === 'reachable' ? el('span', 'pill on', 'dialable')
+      : r === 'unreachable' ? el('span', 'pill badpill', 'not dialable')
+      : m.node_id ? el('span', 'pill warnpill', 'not probed') : '—', m.node_id || r ? '' : 'muted');
   } else fact('Relay', m.attached_relay || (m.online ? 'none' : '—'), m.attached_relay ? '' : 'muted');
   fact('Heartbeat', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago' : '—', m.last_heartbeat_unix ? '' : 'muted', m.last_heartbeat_unix ? fmtTime(m.last_heartbeat_unix) : '');
-  if (m.role !== 'relay') fact('View', viewCell(st, m));
+  if (m.role !== 'relay') fact('Config Version', viewCell(st, m), 'wide');
   const routes = m.registered_cidrs || [];
   if (m.role === 'relay') {
-    const rc = el('div', 'cidrs');
-    if (m.internet_gateway) { const er = m.exit_ready; const b = el('span', 'pill ' + (er && er.ip_forward && er.masquerade ? 'on' : 'dis'), 'internet exit'); rc.append(b); }
-    for (const c of routes) if (!(m.internet_gateway && /^(0\.0\.0\.0\/0|::\/0)$/.test(c))) rc.append(el('code', null, c));
+    const rc = el('div', 'routes');
+    if (m.internet_gateway) { const er = m.exit_ready; const b = el('span', 'pill ' + (er && er.ip_forward && er.masquerade ? 'on' : 'dis'), 'internet exit'); const row = el('div', 'cidrs'); row.append(b); rc.append(row); }
+    const lans = routes.filter(c => !(m.internet_gateway && /^(0\.0\.0\.0\/0|::\/0)$/.test(c)));
+    for (const fam of [lans.filter(c => !c.includes(':')), lans.filter(c => c.includes(':'))]) {
+      if (!fam.length) continue;
+      const row = el('div', 'cidrs'); for (const c of fam) row.append(el('span', 'pill cidr', c)); rc.append(row);
+    }
     if (!rc.childNodes.length) rc.append(el('span', 'muted', 'none'));
     fact('Routes', rc, 'wide');
-    fact('View', viewCell(st, m));
+    fact('Config Version', viewCell(st, m), 'wide');
   }
   card.append(facts);
   if (issues.length) {
@@ -1418,7 +1433,7 @@ function kv(pairs) { const d = el('dl', 'kv'); for (const [k, v] of pairs) { if 
 function commonRows(st, m) {
   const v = viewState(st, m);
   return [ ['Node id', m.node_id ? '#' + m.node_id : 'not joined yet'], ['Address', addrOf(m) || '—'], ['Routed CIDRs', (m.registered_cidrs || []).join(' ') || '—'],
-    ['Disabled', m.disabled ? 'yes' : 'no'], ['View', v.label + (m.reported_gen === undefined ? '' : ` (network view from ${genTime(st.gen)}, digest ${m.digest_ok ? 'ok' : 'MISMATCH'})`)],
+    ['Disabled', m.disabled ? 'yes' : 'no'], ['Config Version', v.label + (m.reported_gen === undefined ? '' : ` (network's is from ${genTime(st.gen)}, digest ${m.digest_ok ? 'ok' : 'MISMATCH'})`)],
     ['Heartbeat', m.last_heartbeat_unix ? fmtAge(m.last_heartbeat_unix) + ' ago · ' + fmtTime(m.last_heartbeat_unix) : '—'],
     ['Last join', m.last_join_unix ? fmtTime(m.last_join_unix) + ' from ' + (m.last_join_from || 'unknown') : 'never'], ['Login gen', m.login_gen],
     ['Replaced', replacedNote(m) || undefined] ];

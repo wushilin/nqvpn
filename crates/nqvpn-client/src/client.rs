@@ -45,7 +45,7 @@ impl<P: nqvpn_endpoint::routes::RouteProgrammer + 'static> RouteSink for nqvpn_e
         if nqvpn_endpoint::routes::RouteSet::reconcile_via_kernel(self, wanted, mine)? {
             Ok(())
         } else {
-            nqvpn_endpoint::routes::RouteSet::reconcile(self, wanted)
+            nqvpn_endpoint::routes::RouteSet::reconcile(self, wanted, mine)
         }
     }
     fn reassert(&self) -> Result<()> {

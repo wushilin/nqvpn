@@ -438,11 +438,34 @@ pub struct RouteSet<P: RouteProgrammer> {
     /// The last (wanted, mine) applied, so `reassert` can re-run the
     /// kernel reconcile without the caller repeating them.
     last: Mutex<(Vec<IpNet>, Vec<IpNet>)>,
+    /// Our own addresses when the routes on the device were programmed.
+    /// `None` until the first reconcile.
+    bound_to: Mutex<Option<BTreeSet<IpNet>>>,
 }
 
 impl<P: RouteProgrammer> RouteSet<P> {
     pub fn new(programmer: P) -> Self {
-        RouteSet { programmer, installed: Mutex::new(BTreeSet::new()), last: Mutex::new((Vec::new(), Vec::new())) }
+        RouteSet {
+            programmer,
+            installed: Mutex::new(BTreeSet::new()),
+            last: Mutex::new((Vec::new(), Vec::new())),
+            bound_to: Mutex::new(None),
+        }
+    }
+
+    /// Did our own addresses change since the routes were programmed?
+    /// A route on the device is bound to them: macOS and the BSDs record
+    /// the interface address a route is added under and source traffic
+    /// from it for as long as the route lives, even after that address
+    /// is gone, so locally originated packets leave with the old address
+    /// and every peer drops them as spoofed. Linux picks the source at
+    /// send time, but re-programming there is harmless and keeps one
+    /// rule for every platform: a change of address re-binds every route.
+    fn readdressed(&self, mine: &BTreeSet<IpNet>) -> bool {
+        let mut bound = self.bound_to.lock().unwrap();
+        let changed = bound.as_ref().is_some_and(|b| b != mine);
+        *bound = Some(mine.clone());
+        changed
     }
 
     /// Pin the underlay transport hosts to the real gateway (route-all).
@@ -473,10 +496,20 @@ impl<P: RouteProgrammer> RouteSet<P> {
         };
         let wanted: BTreeSet<IpNet> = wanted.iter().map(|n| n.trunc()).collect();
         let mine: BTreeSet<IpNet> = mine.iter().map(|n| n.trunc()).collect();
-        let ours: BTreeSet<IpNet> =
+        let mut ours: BTreeSet<IpNet> =
             present.into_iter().map(|n| n.trunc()).filter(|n| !mine.contains(n)).collect();
 
         let (mut added, mut removed, mut failed) = (0u32, 0u32, 0u32);
+        if self.readdressed(&mine) && !ours.is_empty() {
+            // Everything on the device goes and what is wanted comes back,
+            // bound to the addresses we hold now.
+            tracing::info!(target: "nqvpn::os_routes", routes = ours.len(), "our addresses changed; re-binding every route on the device");
+            for net in std::mem::take(&mut ours) {
+                if let Err(e) = self.programmer.remove(net) {
+                    tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route remove failed: {e:#}");
+                }
+            }
+        }
         for net in ours.difference(&wanted) {
             match self.programmer.remove(*net) {
                 Ok(()) => {
@@ -533,9 +566,21 @@ impl<P: RouteProgrammer> RouteSet<P> {
     /// what is extra. A removal that fails because the route is already
     /// gone is not an error; an add that fails is, and leaves the set
     /// consistent (the route is not recorded as installed).
-    pub fn reconcile(&self, wanted: &[IpNet]) -> Result<()> {
+    ///
+    /// `mine` are our own addresses: when they change, every installed
+    /// route is re-bound (see `readdressed`).
+    pub fn reconcile(&self, wanted: &[IpNet], mine: &[IpNet]) -> Result<()> {
         let wanted: BTreeSet<IpNet> = wanted.iter().map(|n| n.trunc()).collect();
+        let mine: BTreeSet<IpNet> = mine.iter().map(|n| n.trunc()).collect();
         let mut installed = self.installed.lock().unwrap();
+        if self.readdressed(&mine) && !installed.is_empty() {
+            tracing::info!(target: "nqvpn::os_routes", routes = installed.len(), "our addresses changed; re-binding every route on the device");
+            for net in std::mem::take(&mut *installed) {
+                if let Err(e) = self.programmer.remove(net) {
+                    tracing::warn!(target: "nqvpn::os_routes", prefix = %net, "os route remove failed: {e:#}");
+                }
+            }
+        }
         let extra: Vec<IpNet> = installed.difference(&wanted).copied().collect();
         let (mut added, mut removed, mut failed) = (0u32, 0u32, 0u32);
         for net in extra {
@@ -896,6 +941,13 @@ impl RouteProgrammer for NetRouteProgrammer {
     }
     fn remove(&self, _net: IpNet) -> Result<()> {
         match *self {}
+    }
+}
+
+impl RouteSet<RecordingProgrammer> {
+    /// Every add/remove issued so far, in order (for harnesses).
+    pub fn recorded_calls(&self) -> Vec<String> {
+        self.programmer.calls.lock().unwrap().clone()
     }
 }
 
@@ -1432,12 +1484,12 @@ mod tests {
     #[test]
     fn reconcile_issues_only_the_difference() {
         let set = RouteSet::new(RecordingProgrammer::default());
-        set.reconcile(&[net("10.0.1.0/24"), net("10.0.2.0/24")]).unwrap();
+        set.reconcile(&[net("10.0.1.0/24"), net("10.0.2.0/24")], &[]).unwrap();
         assert_eq!(set.installed().len(), 2);
         set.programmer.calls.lock().unwrap().clear();
-        set.reconcile(&[net("10.0.1.0/24"), net("10.0.2.0/24")]).unwrap();
+        set.reconcile(&[net("10.0.1.0/24"), net("10.0.2.0/24")], &[]).unwrap();
         assert!(set.programmer.calls.lock().unwrap().is_empty(), "no change, no calls");
-        set.reconcile(&[net("10.0.2.0/24"), net("10.0.3.0/24")]).unwrap();
+        set.reconcile(&[net("10.0.2.0/24"), net("10.0.3.0/24")], &[]).unwrap();
         let calls = set.programmer.calls.lock().unwrap().clone();
         assert_eq!(calls, vec!["remove 10.0.1.0/24", "add 10.0.3.0/24"]);
     }
@@ -1454,17 +1506,51 @@ mod tests {
             }
         }
         let set = RouteSet::new(Flaky);
-        set.reconcile(&[net("10.0.1.0/24")]).unwrap();
-        assert!(set.reconcile(&[net("10.0.0.0/8"), net("10.0.5.0/24")]).is_err());
+        set.reconcile(&[net("10.0.1.0/24")], &[]).unwrap();
+        assert!(set.reconcile(&[net("10.0.0.0/8"), net("10.0.5.0/24")], &[]).is_err());
         let mut got = set.installed();
         got.sort_by_key(|n| n.to_string());
         assert_eq!(got, vec![net("10.0.5.0/24")], "the failed add is retried next time; the failed remove is forgotten");
     }
 
+    /// Rule: when our own address changes, every route on the device is
+    /// re-programmed, so none stays bound to the old source address
+    /// (macOS/BSD keep a route's interface address for its lifetime).
+    #[test]
+    fn a_new_address_rebinds_every_route_on_the_device() {
+        let (old, new) = (net("10.99.1.1/32"), net("10.99.1.27/32"));
+        let wanted = [net("10.99.0.0/16"), net("192.168.9.0/24")];
+        // Kernel readback path.
+        let set = RouteSet::new(RecordingProgrammer::with_kernel(&[old]));
+        set.reconcile_via_kernel(&wanted, &[old]).unwrap();
+        set.reconcile_via_kernel(&wanted, &[old]).unwrap();
+        assert_eq!(set.programmer_calls().len(), 2, "same address: nothing re-programmed");
+        set.programmer_kernel_remove(old);
+        set.programmer.kernel.lock().unwrap().as_mut().unwrap().insert(new);
+        set.reconcile_via_kernel(&wanted, &[new]).unwrap();
+        assert_eq!(
+            set.programmer_calls()[2..],
+            ["remove 10.99.0.0/16", "remove 192.168.9.0/24", "add 10.99.0.0/16", "add 192.168.9.0/24"],
+            "removed and re-added under the new address"
+        );
+        assert!(set.programmer_kernel().contains(&new), "our own address is never touched");
+        // Cache path.
+        let set = RouteSet::new(RecordingProgrammer::default());
+        set.reconcile(&wanted, &[old]).unwrap();
+        set.reconcile(&wanted, &[old]).unwrap();
+        assert_eq!(set.programmer_calls().len(), 2);
+        set.reconcile(&wanted, &[new]).unwrap();
+        assert_eq!(
+            set.programmer_calls()[2..],
+            ["remove 10.99.0.0/16", "remove 192.168.9.0/24", "add 10.99.0.0/16", "add 192.168.9.0/24"]
+        );
+        assert_eq!(set.installed().len(), 2);
+    }
+
     #[test]
     fn reassert_reprograms_everything_owned() {
         let set = RouteSet::new(RecordingProgrammer::default());
-        set.reconcile(&[net("10.99.1.1/32"), net("10.99.1.2/32")]).unwrap();
+        set.reconcile(&[net("10.99.1.1/32"), net("10.99.1.2/32")], &[]).unwrap();
         set.programmer.calls.lock().unwrap().clear();
         set.reassert().unwrap();
         assert_eq!(set.programmer.calls.lock().unwrap().clone(), vec!["add 10.99.1.1/32", "add 10.99.1.2/32"]);

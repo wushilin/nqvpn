@@ -1199,9 +1199,20 @@ async fn editing_a_member_at_the_coordinator_reconfigures_it_live() -> Result<()
     // coordinator tells a to re-join and apply it, while every endpoint
     // keeps only the single covering network route in its OS table.
     let new_ip: Ipv4Addr = "10.99.0.7".parse().unwrap();
+    let calls_before = a.routes.recorded_calls().len();
     w.coord().configure("c10", |s| s.preferred_ip4 = Some(new_ip));
     wait_until("a carries its new address", Duration::from_secs(15), || a.ip4() == new_ip).await?;
     assert_eq!(a.tun.addresses(), vec![ipnet::IpNet::from(ipnet::Ipv4Net::new(new_ip, 32).unwrap())]);
+    // Every route a holds is re-bound to the new address: on macOS a
+    // route kept from before would still source traffic from the old
+    // one, which every peer drops as spoofed.
+    wait_until("a re-binds its routes", Duration::from_secs(15), || {
+        let after = a.routes.recorded_calls()[calls_before..].to_vec();
+        let rm = after.iter().position(|c| c == "remove 10.99.0.0/16");
+        let add = after.iter().rposition(|c| c == "add 10.99.0.0/16");
+        matches!((rm, add), (Some(r), Some(ad)) if r < ad)
+    })
+    .await?;
     assert!(b.routes.installed().iter().any(|n| n.to_string() == "10.99.0.0/16"));
     assert!(!b.routes.installed().iter().any(|n| n.to_string() == "10.99.0.7/32"), "the covering CIDR replaces per-member OS routes");
     all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;

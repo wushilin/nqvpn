@@ -39,7 +39,7 @@ impl<P: RouteProgrammer + 'static> RouteSink for RouteSet<P> {
         if RouteSet::reconcile_via_kernel(self, wanted, mine)? {
             Ok(())
         } else {
-            RouteSet::reconcile(self, wanted)
+            RouteSet::reconcile(self, wanted, mine)
         }
     }
     fn reassert(&self) -> anyhow::Result<()> {

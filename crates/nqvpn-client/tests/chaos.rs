@@ -1126,6 +1126,29 @@ async fn route_all_withholds_the_catch_all_until_the_named_exit_reports_ready() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_without_route_all_ignores_an_internet_exit() -> Result<()> {
+    // r1 is a ready internet exit; b did not ask for route-all. The
+    // published default is a marker for route-all clients, not a route:
+    // b must not seal internet traffic to the exit nor put any default
+    // (or catch-all half) in its OS table.
+    let (w, rp) = World::new(&[1], &[10, 11]).await;
+    w.coord().configure("r1", |s| s.internet_gateway = Some(true));
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start_route_all(&w.url(), 10, None).await;
+    let b = ClientHandle::start(&w.url(), 11).await;
+    wait_until("the route-all client is on the exit", Duration::from_secs(20), || {
+        a.exit_for("8.8.8.8") == Some(r1.node_id) && b.attached_to().is_some()
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(b.exit_for("8.8.8.8"), None, "no route-all: internet traffic is not the tunnel's");
+    for cidr in ["0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1", "::/0"] {
+        assert!(!b.os_has(cidr), "no route-all: {cidr} must not be in the OS table");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn route_all_withholds_the_catch_all_when_no_exit_owns_the_default() -> Result<()> {
     // --via names a node that fronts no default (r1 is a plain forwarder):
     // route-all must leave the real default route in place rather than

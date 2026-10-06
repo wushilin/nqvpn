@@ -376,7 +376,11 @@ pub fn wanted_routes(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet]) -> Vec
         // so packets select the right peer, but every member address is
         // now inside a reserved network CIDR. The host routing table needs
         // only that covering CIDR, not one route per member.
-        for prefix in m.prefixes.iter().map(|p| p.trunc()) {
+        //
+        // A member's default is the internet-exit marker, never a route:
+        // route-all installs its own catch-all halves when it chooses an
+        // exit, and nobody else wants the internet in the tunnel.
+        for prefix in m.prefixes.iter().filter(|p| !crate::peers::is_exit_marker(p)).map(|p| p.trunc()) {
             if !covers.iter().any(|cover| cover.contains(&prefix)) {
                 set.insert(prefix);
             }
@@ -1113,6 +1117,20 @@ mod tests {
         };
         s.normalize();
         s
+    }
+
+    #[test]
+    fn a_published_default_is_an_exit_marker_never_an_os_route() {
+        // gw is an internet exit. A client that did not ask for route-all
+        // must not be handed the internet as a tunnel route — it would
+        // either capture the underlay or be refused with a warning on
+        // every reconcile. Route-all adds its own catch-all halves.
+        let mut s = view();
+        let gw = s.members.iter_mut().find(|m| m.node_id == 3).unwrap();
+        gw.prefixes.extend([net("0.0.0.0/0"), net("::/0")]);
+        let w = wanted_routes(&s, 1, &[net("10.99.1.1/32")]);
+        assert!(w.iter().all(|p| p.prefix_len() != 0), "no default in the wanted set, got {w:?}");
+        assert!(w.contains(&net("192.168.7.0/24")), "the exit's real LAN is still routed");
     }
 
     #[test]

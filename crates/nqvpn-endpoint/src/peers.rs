@@ -19,6 +19,12 @@ use nqvpn_proto::types::NodeId;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
+/// Is this published prefix the internet-exit designation (`0.0.0.0/0` or
+/// `::/0`) rather than space a member owns?
+pub fn is_exit_marker(net: &IpNet) -> bool {
+    net.prefix_len() == 0
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum IngressVerdict {
     Accept,
@@ -57,7 +63,12 @@ impl PeerTable {
 
     pub fn upsert(&mut self, p: PeerInfo) {
         if p.node_id != self.my_node_id {
-            for net in &p.prefixes {
+            // A published default is a marker ("this node is an internet
+            // exit"), not a route: only a route-all client acts on it, by
+            // choosing one exit with `set_default_exit`. Everyone else must
+            // neither seal internet-bound traffic to an exit nor accept
+            // internet-sourced packets from one.
+            for net in p.prefixes.iter().filter(|n| !is_exit_marker(n)) {
                 self.lpm.insert(*net, p.node_id);
             }
         }
@@ -368,6 +379,22 @@ mod tests {
         assert_eq!(t.owner_of("10.99.1.2".parse().unwrap()), Some(2));
         assert_eq!(t.owner_of("192.168.7.20".parse().unwrap()), Some(3));
         assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn a_published_default_routes_nothing_until_an_exit_is_chosen() {
+        // Node 3 is an internet exit. Without route-all choosing it, the
+        // marker neither routes internet traffic to it nor lets it source
+        // internet packets at us.
+        let mut t = table();
+        t.upsert(peer(3, &["10.99.1.3/32", "192.168.7.0/24", "0.0.0.0/0"], ""));
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), None, "the marker is not a route");
+        let reply = v4([8, 8, 8, 8], [10, 99, 1, 1]);
+        assert_eq!(t.check_ingress(3, &reply), IngressVerdict::Drop("inner_src_not_owned"));
+        // Choosing it (route-all) is what makes it the default.
+        t.set_default_exit("0.0.0.0/0".parse().unwrap(), 3);
+        assert_eq!(t.owner_of("8.8.8.8".parse().unwrap()), Some(3));
+        assert_eq!(t.check_ingress(3, &reply), IngressVerdict::Accept);
     }
 
     #[test]

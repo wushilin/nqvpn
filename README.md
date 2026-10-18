@@ -390,7 +390,7 @@ cross toolchain for the other architecture).
 
 Pushing a `vX.Y.Z` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml):
 the full test suite, then builds for every platform, published as
-`nqvpn-<version>-<os>-<arch>.tar.gz` (+ `.sha256`, + signed `.sig`), each holding all three
+`nqvpn-<version>-<os>-<arch>.tar.gz` (+ `.sha256`), each holding all three
 binaries:
 
 | OS | amd64 | arm64 | Notes |
@@ -409,46 +409,12 @@ nqvpn-relay --check-update   # is there a newer release? changes nothing
 nqvpn-relay --self-update    # download, verify, swap; keeps nqvpn-relay.old
 ```
 
-`--self-update` fetches this platform's signed manifest
-(`<archive>.sig`) from the latest GitHub release and verifies its Ed25519
-signature against the release keys compiled into the binary before
-writing or running anything. The manifest binds a fixed context string,
-the version, the archive name (so the OS and arch) and the archive's
-SHA-256; it must match this release's version and this platform exactly,
-and be newer than the running binary. Only then is the archive downloaded
-and checked against the signed hash. The new binary is run once
-(`--version`) to prove it executes on this host, and renamed over the
-current one. The running process is untouched — restart the service to
-pick it up — and the previous binary stays beside it as `<name>.old` for
-rollback. It needs write access to the binary's directory (typically
-`sudo`). The `.sha256` files are for manual checks only.
-
-### Release signing key
-
-A build with no key in
-[`crates/nqvpn-update/release-keys.txt`](crates/nqvpn-update/release-keys.txt)
-refuses to self-update. To set one up (once, on a trusted machine):
-
-```sh
-cargo run -p nqvpn-update --bin nqvpn-release-sign -- keygen --out ~/nqvpn-release.key
-```
-
-It writes the secret key (0600) and prints it plus the public key. Add
-the public key line to `release-keys.txt` and commit it; add the secret
-as the repository secret `NQVPN_RELEASE_KEY` (Settings → Secrets and
-variables → Actions). The release workflow signs every archive with it
-and fails a tag build when it is missing. A local release signs too
-when `NQVPN_RELEASE_KEY_FILE` (or `NQVPN_RELEASE_KEY`) is set:
-
-```sh
-NQVPN_RELEASE_KEY_FILE=~/nqvpn-release.key ./build_all.sh
-nqvpn-release-sign sign --version 0.6.1 --key-file ~/nqvpn-release.key dist/*.tar.gz
-```
-
-To rotate, add the new public key alongside the old one, ship a release
-signed with the old key, then switch the secret and remove the old line.
-Binaries built before a key was configured cannot verify signed releases
-either: update those once by hand.
+`--self-update` fetches this platform's archive from the latest GitHub
+release, checks its SHA-256, runs the new binary once (`--version`) to
+prove it executes on this host, and renames it over the current one. The
+running process is untouched — restart the service to pick it up — and
+the previous binary stays beside it as `<name>.old` for rollback. It needs
+write access to the binary's directory (typically `sudo`).
 
 ## Status
 

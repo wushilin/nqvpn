@@ -19,9 +19,3 @@ elif command -v shasum >/dev/null; then sum=$(shasum -a 256 "dist/$name" | cut -
 else sum=$(sha256 -q "dist/$name"); fi
 printf '%s  %s\n' "$sum" "$name" > "dist/$name.sha256"
 echo "dist/$name  $sum"
-# The `.sig` --self-update requires. Made here only when a release key is
-# in the environment (a local release); CI signs in its publish job, so
-# the secret never reaches the build runners or VMs.
-if [ -n "${NQVPN_RELEASE_KEY:-}${NQVPN_RELEASE_KEY_FILE:-}" ]; then
-  cargo run -q --release --locked -p nqvpn-update --bin nqvpn-release-sign -- sign --version "$v" "dist/$name"
-fi

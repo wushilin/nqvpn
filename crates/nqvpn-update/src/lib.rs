@@ -2,31 +2,19 @@
 //!
 //! `--check-update` asks GitHub for the latest release and says whether it
 //! is newer than this binary. `--self-update` then downloads this
-//! platform's signed manifest (`nqvpn-<version>-<os>-<arch>.tar.gz.sig`)
-//! and checks its Ed25519 signature against the release keys compiled into
-//! this binary (`release-keys.txt`) before anything else: the manifest must
-//! name exactly this release's version and this platform's archive, and
-//! only then is the archive downloaded and checked against the signed
-//! SHA-256. From there it takes out the one binary it replaces, runs it
-//! once (`--version`) to prove it executes here, and renames it over the
-//! current executable. The rename is atomic and leaves the running process
-//! on the old inode, exactly like a manual `mv` deploy: the new code runs
-//! from the next restart. The previous binary is kept beside it as
-//! `<name>.old`.
-//!
-//! The release's `.sha256` files are for people; they come from the same
-//! place as the archive, so they prove nothing about who built it and are
-//! not consulted. With no release key compiled in, `--self-update` refuses
-//! to install anything.
+//! platform's archive (`nqvpn-<version>-<os>-<arch>.tar.gz`), checks it
+//! against the release's `.sha256`, takes out the one binary it replaces,
+//! runs it once (`--version`) to prove it executes here, and renames it
+//! over the current executable. The rename is atomic and leaves the
+//! running process on the old inode, exactly like a manual `mv` deploy:
+//! the new code runs from the next restart. The previous binary is kept
+//! beside it as `<name>.old`.
 //!
 //! HTTPS is blocking std I/O over rustls against the public CA roots — the
 //! same shape as the member join client — so the static binaries carry no
 //! HTTP stack for a once-in-a-while download.
 
 use anyhow::{bail, ensure, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::{Read, Write};
@@ -40,12 +28,6 @@ pub const REPO: &str = "wushilin/nqvpn";
 const MAX_API_BYTES: usize = 1 << 20;
 const MAX_ASSET_BYTES: usize = 128 << 20;
 const MAX_REDIRECTS: usize = 5;
-
-/// The first line of every release manifest: what the signature is for, so
-/// a release key's signature over anything else can never pass as one.
-pub const RELEASE_CONTEXT: &str = "nqvpn-release-v1";
-/// The trusted release public keys, one per line (see the file).
-const RELEASE_KEYS: &str = include_str!("../release-keys.txt");
 
 /// The update flags, shared by every binary (`#[command(flatten)]`).
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -91,9 +73,6 @@ fn run(args: &UpdateArgs, bin: &str, current: &str) -> Result<()> {
         println!("{bin} {current} is up to date (latest release {latest}); nothing to do");
         return Ok(());
     }
-    // Before any download: an update that cannot be authenticated is
-    // refused, never installed on the strength of a checksum alone.
-    let keys = trusted_keys()?;
     let exe = std::env::current_exe()
         .context("locating this executable")?
         .canonicalize()
@@ -102,20 +81,13 @@ fn run(args: &UpdateArgs, bin: &str, current: &str) -> Result<()> {
     let archive = release.asset(&archive_name).with_context(|| {
         format!("release {} has no build for {os}-{arch} (expected {archive_name})", release.tag_name)
     })?;
-    let signature = release
-        .asset(&format!("{archive_name}.sig"))
-        .with_context(|| format!("release {} has no {archive_name}.sig: it is not signed", release.tag_name))?;
-    let sig = get(&signature.browser_download_url, &ua, "application/octet-stream", MAX_API_BYTES)?;
-    let manifest = verify_manifest(&String::from_utf8_lossy(&sig), &keys)?;
-    manifest.check(&latest, &archive_name)?;
-    ensure!(
-        compare_versions(&manifest.version, current)? == Ordering::Greater,
-        "signed release {} is not newer than {current}",
-        manifest.version
-    );
-    println!("{bin} {current} -> {latest}: downloading {archive_name} (signature verified)");
+    let checksum = release
+        .asset(&format!("{archive_name}.sha256"))
+        .with_context(|| format!("release {} has no {archive_name}.sha256", release.tag_name))?;
+    println!("{bin} {current} -> {latest}: downloading {archive_name}");
     let bytes = get(&archive.browser_download_url, &ua, "application/octet-stream", MAX_ASSET_BYTES)?;
-    manifest.check_archive(&bytes)?;
+    let sums = get(&checksum.browser_download_url, &ua, "application/octet-stream", MAX_API_BYTES)?;
+    verify_sha256(&bytes, &String::from_utf8_lossy(&sums))?;
     let binary = extract(&bytes, bin)?;
     let old = replace_binary(&exe, &binary, &latest)?;
     println!("installed {latest} at {} (previous binary kept as {})", exe.display(), old.display());
@@ -191,126 +163,13 @@ pub fn compare_versions(a: &str, b: &str) -> Result<Ordering> {
 
 // ------------------------------------------------------------- verification
 
-/// What a release signature vouches for: one archive of one version. The
-/// `.sig` file is the signed text followed by the signature line:
-///
-/// ```text
-/// nqvpn-release-v1
-/// version 0.6.1
-/// file nqvpn-0.6.1-linux-amd64.tar.gz
-/// sha256 <64 lowercase hex>
-/// signature <base64 Ed25519 signature over the four lines above>
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
-    pub version: String,
-    pub file: String,
-    pub sha256: String,
-}
-
-impl Manifest {
-    /// The manifest for `archive` (its bytes) named `file`.
-    pub fn new(version: &str, file: &str, archive: &[u8]) -> Self {
-        Manifest { version: version.into(), file: file.into(), sha256: hex::encode(Sha256::digest(archive)) }
-    }
-
-    /// The exact bytes that are signed, newline-terminated.
-    pub fn signed_text(&self) -> String {
-        format!("{RELEASE_CONTEXT}\nversion {}\nfile {}\nsha256 {}\n", self.version, self.file, self.sha256)
-    }
-
-    /// The `.sig` file contents for this manifest, signed with `key`.
-    pub fn sign(&self, key: &SigningKey) -> String {
-        let text = self.signed_text();
-        let sig = key.sign(text.as_bytes());
-        format!("{text}signature {}\n", B64.encode(sig.to_bytes()))
-    }
-
-    /// The manifest is for exactly this version and this archive name —
-    /// a validly signed manifest for another release or platform (an old
-    /// one replayed, a mix-and-match of assets) is refused.
-    pub fn check(&self, version: &str, file: &str) -> Result<()> {
-        ensure!(self.version == version, "signed manifest is for version {}, the release is {version}", self.version);
-        ensure!(self.file == file, "signed manifest is for {}, expected {file}", self.file);
-        Ok(())
-    }
-
-    /// The downloaded archive is the one that was signed.
-    pub fn check_archive(&self, archive: &[u8]) -> Result<()> {
-        let actual = hex::encode(Sha256::digest(archive));
-        ensure!(actual == self.sha256, "checksum mismatch: downloaded {actual}, signed manifest says {}", self.sha256);
-        Ok(())
-    }
-}
-
-/// The release keys compiled into this binary; an error when there are
-/// none, so self-update fails closed.
-pub fn trusted_keys() -> Result<Vec<VerifyingKey>> {
-    parse_keys(RELEASE_KEYS)
-}
-
-/// One Ed25519 public key per line, base64 or hex; `#` comments and blank
-/// lines ignored. A malformed line is an error, not skipped.
-pub fn parse_keys(text: &str) -> Result<Vec<VerifyingKey>> {
-    let mut keys = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        keys.push(parse_public_key(line).with_context(|| format!("release-keys.txt line {}", n + 1))?);
-    }
-    ensure!(
-        !keys.is_empty(),
-        "this build has no release signing key, so it cannot verify updates and will not install any. \
-         Configure one: run `nqvpn-release-sign keygen`, add the public key it prints to \
-         crates/nqvpn-update/release-keys.txt, and rebuild (or update by hand from a release you trust)"
-    );
-    Ok(keys)
-}
-
-/// A public key as base64 or 64 hex digits.
-pub fn parse_public_key(s: &str) -> Result<VerifyingKey> {
-    let raw = if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        hex::decode(s).ok()
-    } else {
-        B64.decode(s).ok()
-    };
-    let bytes: [u8; 32] = raw.and_then(|v| v.try_into().ok()).context("not a 32-byte Ed25519 public key")?;
-    VerifyingKey::from_bytes(&bytes).context("not a valid Ed25519 public key")
-}
-
-/// Check a `.sig` file's signature against `keys` (any one suffices) and
-/// return the manifest it signs. Nothing in it is trusted before the
-/// signature verifies.
-pub fn verify_manifest(sig_file: &str, keys: &[VerifyingKey]) -> Result<Manifest> {
-    ensure!(!keys.is_empty(), "no release signing key to verify the update with");
-    let body = sig_file.strip_suffix('\n').unwrap_or(sig_file);
-    let (signed, last) = body.rsplit_once('\n').context("malformed .sig file")?;
-    let signed = format!("{signed}\n");
-    let sig = last.strip_prefix("signature ").context("malformed .sig file: no signature line")?;
-    let sig = B64.decode(sig.trim()).ok().and_then(|b| Signature::from_slice(&b).ok());
-    let sig = sig.context("malformed .sig file: bad signature encoding")?;
-    ensure!(
-        keys.iter().any(|k| k.verify_strict(signed.as_bytes(), &sig).is_ok()),
-        "the release signature does not verify against any trusted release key: refusing to install"
-    );
-    // Signed, so these are the signer's words; still parse them strictly
-    // and insist on the one canonical form.
-    let mut lines = signed.lines();
-    ensure!(lines.next() == Some(RELEASE_CONTEXT), "signed text is not an nqvpn release manifest");
-    let mut field = |name: &str| -> Result<String> {
-        let line = lines.next().unwrap_or("");
-        let v = line.strip_prefix(name).and_then(|r| r.strip_prefix(' '));
-        v.map(str::to_string).with_context(|| format!("signed manifest: expected {name:?}, got {line:?}"))
-    };
-    let m = Manifest { version: field("version")?, file: field("file")?, sha256: field("sha256")? };
-    ensure!(
-        m.sha256.len() == 64 && m.sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        "signed manifest: malformed sha256"
-    );
-    ensure!(m.signed_text() == signed, "signed manifest is not in canonical form");
-    Ok(m)
+/// Check `bytes` against a `shasum -a 256` line ("<hex>  <file>").
+pub fn verify_sha256(bytes: &[u8], sums: &str) -> Result<()> {
+    let expected = sums.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    ensure!(expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()), "malformed .sha256 file");
+    let actual = hex::encode(Sha256::digest(bytes));
+    ensure!(actual == expected, "checksum mismatch: downloaded {actual}, release says {expected}");
+    Ok(())
 }
 
 /// The file named `bin` from a `.tar.gz`, wherever it sits in the archive.
@@ -580,86 +439,13 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort").is_err());
     }
 
-    fn key() -> SigningKey {
-        SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))
-    }
-
-    const FILE: &str = "nqvpn-0.6.1-linux-amd64.tar.gz";
-
-    /// The whole client-side check, in the order `run` does it.
-    fn accept(sig: &str, keys: &[VerifyingKey], version: &str, file: &str, archive: &[u8]) -> Result<Manifest> {
-        let m = verify_manifest(sig, keys)?;
-        m.check(version, file)?;
-        m.check_archive(archive)?;
-        Ok(m)
-    }
-
     #[test]
-    fn a_signed_release_is_accepted() {
-        let sk = key();
-        let sig = Manifest::new("0.6.1", FILE, b"archive").sign(&sk);
-        assert!(sig.starts_with("nqvpn-release-v1\nversion 0.6.1\nfile nqvpn-0.6.1-linux-amd64.tar.gz\nsha256 "));
-        let m = accept(&sig, &[sk.verifying_key()], "0.6.1", FILE, b"archive").unwrap();
-        assert_eq!((m.version.as_str(), m.file.as_str()), ("0.6.1", FILE));
-        // Any one of several trusted keys (rotation) is enough.
-        let keys = [key().verifying_key(), sk.verifying_key()];
-        accept(&sig, &keys, "0.6.1", FILE, b"archive").unwrap();
-    }
-
-    #[test]
-    fn a_tampered_archive_is_rejected() {
-        let sk = key();
-        let sig = Manifest::new("0.6.1", FILE, b"archive").sign(&sk);
-        assert!(accept(&sig, &[sk.verifying_key()], "0.6.1", FILE, b"archivE").is_err());
-    }
-
-    #[test]
-    fn a_manifest_for_another_version_or_file_is_rejected() {
-        let sk = key();
-        let keys = [sk.verifying_key()];
-        // A genuine old release replayed as the new one.
-        let old = Manifest::new("0.6.0", "nqvpn-0.6.0-linux-amd64.tar.gz", b"archive").sign(&sk);
-        assert!(accept(&old, &keys, "0.6.1", FILE, b"archive").is_err());
-        // Another platform's archive in this platform's place.
-        let other = Manifest::new("0.6.1", "nqvpn-0.6.1-linux-arm64.tar.gz", b"archive").sign(&sk);
-        assert!(accept(&other, &keys, "0.6.1", FILE, b"archive").is_err());
-    }
-
-    #[test]
-    fn edited_manifests_and_unknown_keys_are_rejected() {
-        let sk = key();
-        let sig = Manifest::new("0.6.1", FILE, b"archive").sign(&sk);
-        assert!(accept(&sig, &[key().verifying_key()], "0.6.1", FILE, b"archive").is_err());
-        // Any edit to the signed text breaks the signature.
-        let edited = sig.replace("version 0.6.1", "version 0.6.2");
-        assert!(verify_manifest(&edited, &[sk.verifying_key()]).is_err());
-        let forged_hash = sig.replace(&Manifest::new("0.6.1", FILE, b"archive").sha256, &"0".repeat(64));
-        assert!(verify_manifest(&forged_hash, &[sk.verifying_key()]).is_err());
-        // A signature by a trusted key over something that is not a manifest.
-        let text = "something else\n";
-        let foreign = format!("{text}signature {}\n", B64.encode(sk.sign(text.as_bytes()).to_bytes()));
-        assert!(verify_manifest(&foreign, &[sk.verifying_key()]).is_err());
-        assert!(verify_manifest("garbage", &[sk.verifying_key()]).is_err());
-    }
-
-    #[test]
-    fn without_a_release_key_nothing_verifies() {
-        let sk = key();
-        let sig = Manifest::new("0.6.1", FILE, b"archive").sign(&sk);
-        assert!(verify_manifest(&sig, &[]).is_err());
-        // A key file with only comments (as shipped) fails closed, with
-        // directions.
-        let e = parse_keys("# no keys yet\n\n  # really\n").unwrap_err().to_string();
-        assert!(e.contains("release-keys.txt") && e.contains("keygen"), "{e}");
-    }
-
-    #[test]
-    fn release_keys_parse_as_base64_or_hex() {
-        let pk = key().verifying_key();
-        let text = format!("# comment\n{}  # current\n\n{}\n", B64.encode(pk.to_bytes()), hex::encode(pk.to_bytes()));
-        assert_eq!(parse_keys(&text).unwrap(), vec![pk, pk]);
-        assert!(parse_keys("not-a-key\n").is_err());
-        assert!(parse_keys(&B64.encode([1u8; 16])).is_err());
+    fn checksums_must_match() {
+        let data = b"nqvpn";
+        let good = format!("{}  nqvpn-0.5.0-linux-amd64.tar.gz\n", hex::encode(Sha256::digest(data)));
+        verify_sha256(data, &good).unwrap();
+        assert!(verify_sha256(b"tampered", &good).is_err());
+        assert!(verify_sha256(data, "not-a-sum file").is_err());
     }
 
     fn targz(files: &[(&str, &[u8])]) -> Vec<u8> {

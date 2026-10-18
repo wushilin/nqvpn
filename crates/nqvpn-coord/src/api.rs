@@ -3,8 +3,9 @@
 //! bearer token from `coordinator.toml`.
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -17,7 +18,11 @@ use std::sync::Arc;
 use crate::admin::{MemberSpec, NetworkSpec};
 use crate::config::NetworkConfig;
 use crate::error::ApiError;
-use crate::state::{now_unix, AppState};
+use crate::state::{lock_for_sweep, now_unix, rate_key, AppState};
+
+/// A join or login request is a few hundred bytes; nothing bigger is
+/// read.
+const SMALL_BODY_LIMIT: usize = 8 * 1024;
 
 /// The admin UI, compiled into the binary: no separate deployment, no
 /// external assets, works air-gapped. Strictly a client of the API.
@@ -29,8 +34,8 @@ async fn ui() -> Html<&'static str> {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/api/v1/join", post(join))
-        .route("/api/v1/login", post(login))
+        .route("/api/v1/join", post(join).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)))
+        .route("/api/v1/login", post(login).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)))
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/me", get(me))
         .route("/api/v1/ws", get(ws_upgrade))
@@ -51,15 +56,78 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(ui))
         .route("/ui/", get(ui))
         .route("/", get(|| async { axum::response::Redirect::temporary("/ui") }))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), origin_guard))
         .with_state(state)
+}
+
+/// CSRF defense in depth (the session cookie is already SameSite=Strict):
+/// a browser request that carries the session cookie and changes state —
+/// or opens the live feed — must come from this coordinator's own page.
+/// Browsers always send `Origin` on such requests; scripts using the
+/// bearer token send no cookie and are not affected.
+async fn origin_guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Result<Response, ApiError> {
+    let changes_state = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let is_ws = req.uri().path() == "/api/v1/ws";
+    if (changes_state || is_ws) && crate::auth::cookie_token(req.headers()).is_some() {
+        if let Some(origin) = req.headers().get("origin") {
+            let origin = origin.to_str().unwrap_or("null");
+            if !same_origin(&state, origin, req.headers(), req.uri()) {
+                tracing::warn!(%origin, path = %req.uri().path(), "refusing a cross-origin request carrying the admin session cookie");
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    nqvpn_proto::errors::ErrorCode::AdminAuthRequired,
+                    "cross-origin request refused",
+                ));
+            }
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Whether an `Origin` names the host this request was sent to (or the
+/// configured public URL).
+fn same_origin(state: &AppState, origin: &str, headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    fn authority(url: &str) -> Option<String> {
+        let (scheme, rest) = url.split_once("://")?;
+        let host = rest.split('/').next()?.to_ascii_lowercase();
+        let default = match scheme {
+            "https" => ":443",
+            "http" => ":80",
+            _ => return None,
+        };
+        Some(host.strip_suffix(default).map(str::to_string).unwrap_or(host))
+    }
+    fn strip_default(host: &str) -> String {
+        let h = host.to_ascii_lowercase();
+        h.strip_suffix(":443").map(str::to_string).unwrap_or(h)
+    }
+    let Some(origin) = authority(origin) else { return false };
+    let mut candidates: Vec<String> = Vec::new();
+    for h in ["host", "x-forwarded-host"] {
+        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            candidates.push(strip_default(v));
+        }
+    }
+    if let Some(a) = uri.authority() {
+        candidates.push(strip_default(a.as_str()));
+    }
+    if let Some(u) = state.coord.listen.public_url.as_deref().and_then(authority) {
+        candidates.push(u);
+    }
+    candidates.contains(&origin)
 }
 
 /// Admin access: a UI session (cookie, or the session token as a
 /// bearer) or the static bearer token from the config.
-fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim().to_string());
+pub(crate) fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     if let Some(t) = &bearer {
-        if let Some(cfg) = state.admin_token.as_deref() {
+        if let Some(cfg) = state.admin_token.as_deref().filter(|c| !c.is_empty()) {
             if crate::secrets::constant_time_eq(t, cfg) {
                 return Ok(());
             }
@@ -90,16 +158,16 @@ struct LoginReq {
 }
 
 /// UI login: argon2 check (on the blocking pool — it is meant to be
-/// slow), then a session cookie. Failures are throttled per address.
+/// slow), then a session cookie. Attempts are limited per address and
+/// counted before the check; at most `LOGIN_SLOTS` checks run at once
+/// (each takes 19 MiB), and a login that finds none free is refused.
 async fn login(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, ApiError> {
     let ip = peer.ip().to_string();
-    if state.auth.throttled(&ip) {
-        return Err(ApiError::rate_limited());
-    }
+    let key = rate_key(&ip);
     let (user, hash) = match (&state.coord.admin.user, &state.coord.admin.password_hash) {
         (Some(u), Some(h)) => (u.clone(), h.clone()),
         _ => {
@@ -110,15 +178,34 @@ async fn login(
             ))
         }
     };
-    let ok = user == req.user
-        && tokio::task::spawn_blocking(move || crate::auth::verify_password(&req.password, &hash))
-            .await
-            .unwrap_or(false);
-    if !ok {
-        state.auth.note_failure(&ip);
+    // Count first: concurrent guesses all land in the counter before any
+    // of them is checked. A success is refunded below.
+    let allowed = state
+        .login_rate
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .check(key.clone(), crate::auth::MAX_LOGIN_ATTEMPTS_PER_MIN, now_unix());
+    if !allowed {
+        return Err(ApiError::rate_limited());
+    }
+    let Ok(slot) = state.login_slots.clone().try_acquire_owned() else {
+        return Err(ApiError::rate_limited());
+    };
+    // The password is checked whatever the user name, so a wrong name
+    // takes as long as a wrong password.
+    let user_ok = crate::secrets::constant_time_eq(&user, &req.user);
+    let password = req.password;
+    let password_ok = tokio::task::spawn_blocking(move || {
+        let _slot = slot; // held until the hash is done, even if the request is dropped
+        crate::auth::verify_password(&password, &hash)
+    })
+    .await
+    .unwrap_or(false);
+    if !(user_ok && password_ok) {
         tracing::warn!(%ip, user = %req.user, "admin login failed");
         return Err(ApiError::new(axum::http::StatusCode::UNAUTHORIZED, nqvpn_proto::errors::ErrorCode::AdminAuthRequired, "wrong user or password"));
     }
+    state.login_rate.lock().unwrap_or_else(|e| e.into_inner()).refund(&key);
     let ttl = state.coord.admin.session_hours.max(1) * 3600;
     let (token, expires) = state.auth.open(&user, ttl);
     tracing::info!(%ip, %user, "admin logged in");
@@ -157,7 +244,9 @@ async fn coordinator_ca(State(state): State<Arc<AppState>>) -> Result<Json<serde
 
 async fn ws_upgrade(State(state): State<Arc<AppState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Result<Response, ApiError> {
     check_admin(&state, &headers)?;
-    Ok(ws.on_upgrade(move |socket| crate::ws::serve(state, socket)))
+    // The feed re-checks these credentials on every frame: logging out
+    // (or the session expiring) ends it.
+    Ok(ws.on_upgrade(move |socket| crate::ws::serve(state, socket, headers)))
 }
 
 /// One frame of the live feed: every network's summary and status.
@@ -165,7 +254,7 @@ pub fn live_frame(state: &AppState) -> Result<String, ApiError> {
     let mut networks = Vec::new();
     let mut status = serde_json::Map::new();
     for (id, net) in state.nets() {
-        let ns = net.lock().unwrap();
+        let Some(ns) = lock_for_sweep(&id, &net) else { continue };
         networks.push(NetworkSummary {
             network_id: id.clone(),
             members_total: ns.cfg.members().count(),
@@ -213,22 +302,39 @@ async fn join(
 
     // A relay binds its listener before joining, so its advertised
     // address must answer by now. Probed only after authentication, and
-    // only the address the *operator* configured — never one the
-    // request named — so this is not an open port scanner.
+    // only the address the *operator* configured (or, for `auto:`, the
+    // address the join came from) — never one the request named — so
+    // this is not an open port scanner. "warn" probes in the background
+    // and only reports; "deny" probes first and refuses the join (the
+    // relay retries) if nothing answers.
     if resp.role == Role::Relay {
-        let policy = state.net(&resp.network_id).map(|n| n.lock().unwrap().cfg.settings.relay_reachability.clone());
+        let policy = state
+            .net(&resp.network_id)
+            .and_then(|n| n.lock().ok().map(|ns| ns.cfg.settings.relay_reachability.clone()));
         if let (Some(policy), Some(addr)) = (policy, resp.relay_addr.clone()) {
-            if policy != "off" {
-                let (st, netid, node) = (state.clone(), resp.network_id.clone(), resp.node_id);
-                tokio::spawn(async move {
-                    let verdict = crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
-                    if verdict == crate::reach::Reachability::Unreachable {
-                        tracing::warn!(network = %netid, node_id = node, %addr, "advertised relay address is not dialable from the coordinator");
+            let (st, netid, node) = (state.clone(), resp.network_id.clone(), resp.node_id);
+            let probe = async move {
+                let verdict = crate::reach::probe(&addr, std::time::Duration::from_secs(5)).await;
+                if verdict == crate::reach::Reachability::Unreachable {
+                    tracing::warn!(network = %netid, node_id = node, %addr, "advertised relay address is not dialable from the coordinator");
+                }
+                if let Some(net) = st.net(&netid) {
+                    if let Ok(mut ns) = net.lock() {
+                        ns.directory.reachability.insert(node, verdict);
                     }
-                    if let Some(net) = st.net(&netid) {
-                        net.lock().unwrap().directory.reachability.insert(node, verdict);
+                }
+                verdict
+            };
+            match policy.as_str() {
+                "off" => {}
+                "deny" => {
+                    if probe.await == crate::reach::Reachability::Unreachable {
+                        return Err(ApiError::relay_unreachable(resp.relay_addr.as_deref().unwrap_or_default()));
                     }
-                });
+                }
+                _ => {
+                    tokio::spawn(probe);
+                }
             }
         }
     }
@@ -239,7 +345,7 @@ async fn global_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     check_admin(&state, &headers)?;
     let mut networks = Vec::new();
     for (id, net) in state.nets() {
-        let ns = net.lock().unwrap();
+        let Some(ns) = lock_for_sweep(&id, &net) else { continue };
         networks.push(NetworkSummary {
             network_id: id.clone(),
             members_total: ns.cfg.members().count(),
@@ -432,8 +538,8 @@ pub fn status_of(ns: &crate::state::NetState, id: &str) -> NetworkStatus {
                     tx_pkts: l.tx_pkts,
                     rx_bytes: l.rx_bytes,
                     rx_pkts: l.rx_pkts,
-                    tx_bps: sample.rate(l.peer_id, true),
-                    rx_bps: sample.rate(l.peer_id, false),
+                    tx_bps: sample.rate(l, true),
+                    rx_bps: sample.rate(l, false),
                     up: l.up,
                 })
                 .collect(),

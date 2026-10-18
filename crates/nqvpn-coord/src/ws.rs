@@ -2,15 +2,19 @@
 //! the full status of every network whenever a generation is published
 //! or configuration changes, and every two seconds regardless (traffic
 //! counters move without a generation). The page never polls.
+//!
+//! The credentials the feed was opened with are re-checked before every
+//! frame: a logout or an expired session closes it.
 
 use axum::extract::ws::{Message, WebSocket};
+use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::state::AppState;
 
-pub async fn serve(state: Arc<AppState>, socket: WebSocket) {
+pub async fn serve(state: Arc<AppState>, socket: WebSocket, auth: HeaderMap) {
     let (mut tx, mut rx) = socket.split();
     let mut events = state.events.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -34,6 +38,11 @@ pub async fn serve(state: Arc<AppState>, socket: WebSocket) {
                     _ => continue, // pings, or anything the page sends: ignored
                 }
             }
+        }
+        if crate::api::check_admin(&state, &auth).is_err() {
+            tracing::debug!("live feed: admin session ended; closing");
+            let _ = tx.send(Message::Close(None)).await;
+            return;
         }
         let frame = match crate::api::live_frame(&state) {
             Ok(f) => f,

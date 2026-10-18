@@ -75,8 +75,15 @@ async fn main() -> Result<()> {
 async fn run(config_path: PathBuf) -> Result<()> {
     let mut coord = load_coord_config(&config_path)?;
     nqvpn_coord::config::resolve_admin_password(&mut coord.admin)?;
+    // Everything the coordinator writes is private: the database holds
+    // member secrets in the clear, the state dir the signing key.
+    #[cfg(unix)]
+    // SAFETY: umask only swaps the process's file-creation mask.
+    unsafe {
+        libc::umask(0o077);
+    }
     let state_dir = PathBuf::from(&coord.state.dir);
-    std::fs::create_dir_all(&state_dir).with_context(|| format!("creating state dir {}", state_dir.display()))?;
+    create_private_dir(&state_dir)?;
 
     let keyring = Keyring::load_or_create(&state_dir.join("signing.json"), now_unix())?;
     let db_path = state_dir.join("nqvpn.db");
@@ -149,6 +156,31 @@ async fn run(config_path: PathBuf) -> Result<()> {
     axum_server::bind_rustls(api_addr, tls)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
+    Ok(())
+}
+
+/// Create the state dir 0700, or tighten an existing one that others can
+/// read or enter.
+fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("creating state dir {}", dir.display()))?;
+        }
+        let mode = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(dir = %dir.display(), mode = format!("{:o}", mode & 0o777), "state dir is accessible to other users; restricting it to 0700");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", dir.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).with_context(|| format!("creating state dir {}", dir.display()))?;
     Ok(())
 }
 

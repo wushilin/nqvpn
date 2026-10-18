@@ -46,7 +46,18 @@ impl Db {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        Self::init(conn)
+        let db = Self::init(conn)?;
+        // Member secrets are in here in the clear. The process umask
+        // (0077, set at startup) already makes new files private; this
+        // also tightens a database created before that, and covers the
+        // WAL and shared-memory files beside it.
+        restrict_to_owner(path)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            restrict_to_owner(Path::new(&p))?;
+        }
+        Ok(db)
     }
 
     /// For tests: everything in memory, same code paths.
@@ -117,21 +128,31 @@ impl Db {
 
     /// Config and registry in one transaction (network creation).
     pub fn save_network_and_registry(&self, cfg: &NetworkConfig, reg: &Registry) -> Result<()> {
-        let cfg_json = serde_json::to_string(cfg)?;
-        let reg_json = serde_json::to_string(reg)?;
+        self.save_networks(&[(cfg, reg)])
+    }
+
+    /// Several networks' config and registry in one transaction: all or
+    /// nothing (an import).
+    pub fn save_networks(&self, nets: &[(&NetworkConfig, &Registry)]) -> Result<()> {
+        let mut rows = Vec::with_capacity(nets.len());
+        for (cfg, reg) in nets {
+            rows.push((cfg.network_id.clone(), serde_json::to_string(cfg)?, serde_json::to_string(reg)?));
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let now = crate::state::now_unix() as i64;
-        tx.execute(
-            "INSERT INTO networks(network_id, config, updated_unix) VALUES (?1, ?2, ?3)
-             ON CONFLICT(network_id) DO UPDATE SET config = excluded.config, updated_unix = excluded.updated_unix",
-            params![cfg.network_id, cfg_json, now],
-        )?;
-        tx.execute(
-            "INSERT INTO registries(network_id, data, updated_unix) VALUES (?1, ?2, ?3)
-             ON CONFLICT(network_id) DO UPDATE SET data = excluded.data, updated_unix = excluded.updated_unix",
-            params![cfg.network_id, reg_json, now],
-        )?;
+        for (id, cfg_json, reg_json) in &rows {
+            tx.execute(
+                "INSERT INTO networks(network_id, config, updated_unix) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(network_id) DO UPDATE SET config = excluded.config, updated_unix = excluded.updated_unix",
+                params![id, cfg_json, now],
+            )?;
+            tx.execute(
+                "INSERT INTO registries(network_id, data, updated_unix) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(network_id) DO UPDATE SET data = excluded.data, updated_unix = excluded.updated_unix",
+                params![id, reg_json, now],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -154,9 +175,44 @@ impl Db {
     }
 }
 
+/// chmod 0600 if the file exists and is readable by anyone else.
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(m) if m.permissions().mode() & 0o077 != 0 => {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("restricting {}", path.display()))?;
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_database_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nqvpn.db");
+        Db::open(&path).unwrap().save_network(&cfg("a")).unwrap();
+        // Reopen: the files that now exist (db, -wal, -shm) are tightened.
+        let _db = Db::open(&path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let p = dir.path().join(format!("nqvpn.db{suffix}"));
+            if let Ok(m) = std::fs::metadata(&p) {
+                assert_eq!(m.permissions().mode() & 0o077, 0, "{} is private", p.display());
+            }
+        }
+    }
 
     fn cfg(id: &str) -> NetworkConfig {
         serde_json::from_str(&format!(

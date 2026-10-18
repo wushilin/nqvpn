@@ -19,6 +19,7 @@
 #   ./build_all.sh --setup         # (re)install cargo-zigbuild + zig locally, then build
 #   ./build_all.sh amd64           # one target
 #   ./build_all.sh arm64
+#   NQVPN_RELEASE_KEY_FILE=~/nqvpn-release.key ./build_all.sh   # also sign (.sig)
 #
 # Written for bash 3.2 (the version macOS ships) — no associative arrays.
 # Re-exec under bash if started with `sh build_all.sh` (POSIX sh lacks
@@ -59,7 +60,7 @@ for a in "$@"; do
   case "$a" in
     --setup) SETUP=1 ;;
     amd64|arm64) WANT="$WANT $a" ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) die "unknown argument: $a (use amd64, arm64, --setup)" ;;
   esac
 done
@@ -195,6 +196,17 @@ for arch in $WANT; do
   build_one "$arch"
   collect "$arch"
 done
+
+# --self-update installs only archives with a valid `.sig`. Sign when a
+# release key is in the environment; CI does it in its publish job.
+if [ -n "${NQVPN_RELEASE_KEY:-}${NQVPN_RELEASE_KEY_FILE:-}" ]; then
+  say "Signing"
+  sigs=""
+  for arch in $WANT; do sigs="$sigs dist/nqvpn-$VERSION-linux-$arch.tar.gz"; done
+  cargo run -q --release -p nqvpn-update --bin nqvpn-release-sign -- sign --version "$VERSION" $sigs
+else
+  echo "  (unsigned: set NQVPN_RELEASE_KEY_FILE or NQVPN_RELEASE_KEY to write the .sig files --self-update needs)"
+fi
 
 say "Done — artifacts in dist/"
 ls -1 dist/*.tar.gz

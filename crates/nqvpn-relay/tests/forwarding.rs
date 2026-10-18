@@ -66,11 +66,17 @@ struct Relay {
     addr: SocketAddr,
     identity: TlsIdentity,
     node_id: NodeId,
+    /// The login generation in this relay's own credential.
+    login_gen: u64,
 }
 
 fn spawn_relay(ca: &Ca, node_id: NodeId, max_mbps: u32) -> Relay {
+    spawn_relay_gen(ca, node_id, max_mbps, 0)
+}
+
+fn spawn_relay_gen(ca: &Ca, node_id: NodeId, max_mbps: u32, login_gen: u64) -> Relay {
     let identity = TlsIdentity::generate(&format!("r{node_id}")).unwrap();
-    let cred = ca.credential(node_id, Role::Relay, &identity.fingerprint());
+    let cred = ca.credential_gen(node_id, Role::Relay, &identity.fingerprint(), login_gen);
     let net = RelayNet::new(NETWORK.into(), UUID.into(), node_id, identity.clone(), cred, Mode::Datagram, 1, max_mbps, 5);
     net.set_signing_keys(&ca.key_infos());
     let endpoint = quinn::Endpoint::server(server_config(&identity, 5).unwrap(), "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -78,7 +84,7 @@ fn spawn_relay(ca: &Ca, node_id: NodeId, max_mbps: u32) -> Relay {
     let mut nets = HashMap::new();
     nets.insert(NETWORK.to_string(), net.clone());
     tokio::spawn(Arc::new(Fleet { nets }).accept_loop(endpoint));
-    Relay { net, addr, identity, node_id }
+    Relay { net, addr, identity, node_id, login_gen }
 }
 
 fn peer(node_id: NodeId, login_gen: u64) -> PeerInfo {
@@ -87,21 +93,28 @@ fn peer(node_id: NodeId, login_gen: u64) -> PeerInfo {
 
 /// Feed a relay the coordinator's view: members, attachments, fleet.
 fn feed(r: &Relay, members: &[(NodeId, u64)], attachments: &[(NodeId, NodeId)], relays: &[&Relay]) {
+    let fleet: Vec<(&Relay, u64)> = relays.iter().map(|x| (*x, x.login_gen)).collect();
+    feed_view(r, members, attachments, &fleet, 1350);
+}
+
+/// `feed`, with the login generation the view publishes for each relay
+/// and the network MTU spelled out.
+fn feed_view(r: &Relay, members: &[(NodeId, u64)], attachments: &[(NodeId, NodeId)], relays: &[(&Relay, u64)], mtu: u16) {
     let mut s = Snapshot {
         gen: 1,
         members: members.iter().map(|(n, g)| peer(*n, *g)).collect(),
         attachments: attachments.iter().map(|(n, r)| AttachmentEntry { node_id: *n, relay_id: *r }).collect(),
         relays: relays
             .iter()
-            .map(|x| RelayEndpoint { relay_id: x.node_id, name: format!("r{}", x.node_id), addr: x.addr.to_string(), cert_fp: x.identity.fingerprint() })
+            .map(|(x, _)| RelayEndpoint { relay_id: x.node_id, name: format!("r{}", x.node_id), addr: x.addr.to_string(), cert_fp: x.identity.fingerprint() })
             .collect(),
-        mtu: NetworkMtu { mtu: 1350, limited_by: "config".into() },
+        mtu: NetworkMtu { mtu, limited_by: "config".into() },
         keys: vec![],
         reserved_prefixes: vec![],
     };
     // Relays are members too (so the eviction rule knows them).
-    for x in relays {
-        s.members.push(PeerInfo { role: Role::Relay, ..peer(x.node_id, 0) });
+    for (x, login_gen) in relays {
+        s.members.push(PeerInfo { role: Role::Relay, ..peer(x.node_id, *login_gen) });
     }
     s.normalize();
     r.net.view.replace(s.clone());
@@ -155,12 +168,25 @@ impl StubMember {
 
 /// Wire two relays together exactly as the mesh dialer does: `a` dials `b`.
 async fn link(a: &Relay, b: &Relay, ca: &Ca) -> Result<()> {
-    let cred = ca.credential(a.node_id, Role::Relay, &a.identity.fingerprint());
+    link_session(a, b, ca).await.map(|_| ())
+}
+
+/// `link`, handing back the dialed session.
+async fn link_session(a: &Relay, b: &Relay, ca: &Ca) -> Result<Arc<Session>> {
+    let cred = ca.credential_gen(a.node_id, Role::Relay, &a.identity.fingerprint(), a.login_gen);
     let claims = nqvpn_sync::join::own_claims(&cred).unwrap();
     let session = nqvpn_session::dial(&b.addr.to_string(), &a.identity, Some(b.identity.fingerprint()), &cred, 5, Mode::Datagram, 1, b.node_id, Role::Relay, claims).await?;
-    tokio::spawn(a.net.clone().run_mesh(session, true));
+    tokio::spawn(a.net.clone().run_mesh(session.clone(), true));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(())
+    Ok(session)
+}
+
+async fn wait_for(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !cond() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn attached(r: &Relay, node: NodeId) -> bool {
@@ -451,5 +477,159 @@ async fn chaos_modes_actually_misbehave() -> Result<()> {
     r1.net.set_chaos(None);
     a.send_data(10, 11, b"again");
     assert_eq!(&b.recv().await?[nqvpn_proto::frame::ROUTED_HEADER_LEN..], b"again");
+    Ok(())
+}
+
+/// A mesh session we dialed carries *our* credential: its login
+/// generation says nothing about the peer. Relays whose login
+/// generations differ (one was reinstalled, say) keep their link.
+#[tokio::test]
+async fn relays_with_different_login_gens_keep_their_mesh_link() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay_gen(&ca, 1, 0, 0);
+    let r2 = spawn_relay_gen(&ca, 2, 0, 5);
+    let session = link_session(&r1, &r2, &ca).await?;
+    feed(&r1, &[], &[], &[&r1, &r2]);
+    feed(&r2, &[], &[], &[&r1, &r2]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    r1.net.reconcile(&r1.net.view.get());
+    r2.net.reconcile(&r2.net.view.get());
+    assert!(tokio::time::timeout(Duration::from_millis(500), session.conn.closed()).await.is_err(), "healthy link evicted: {:?}", session.close_reason());
+    assert_eq!((r1.net.mesh_peers(), r2.net.mesh_peers()), (vec![2], vec![1]));
+    assert!(r1.net.link.stop_reason().is_none() && r2.net.link.stop_reason().is_none());
+    Ok(())
+}
+
+/// A peer relay saying our login is stale is a hint, not a verdict: any
+/// relay credential holder could say it. Our own view disagrees, so we
+/// keep serving.
+#[tokio::test]
+async fn a_peer_relays_stale_login_claim_alone_does_not_stop_us() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let r2 = spawn_relay(&ca, 2, 0);
+    let session = link_session(&r1, &r2, &ca).await?;
+    feed(&r1, &[], &[], &[&r1, &r2]);
+    // r2 believes r1 was replaced (login_gen 3); r1's own view does not.
+    feed_view(&r2, &[], &[], &[(&r1, 3), (&r2, 0)], 1350);
+    tokio::time::timeout(Duration::from_secs(3), session.conn.closed()).await?;
+    assert_eq!(session.close_reason().map(|(c, _)| c), Some(nqvpn_session::CLOSE_STALE_LOGIN));
+    // Let the redialer hear the same refusal at Hello, too.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(r1.net.link.stop_reason().is_none(), "a peer's word alone stopped us: {:?}", r1.net.link.stop_reason());
+    assert!(!r1.net.is_retired());
+    Ok(())
+}
+
+/// …but when our own view agrees (it lists us with a newer login than
+/// our credential carries), we were replaced: this network stops.
+#[tokio::test]
+async fn a_stale_login_our_own_view_confirms_retires_the_network() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let r2 = spawn_relay(&ca, 2, 0);
+    let _session = link_session(&r1, &r2, &ca).await?;
+    feed_view(&r1, &[], &[], &[(&r1, 3), (&r2, 0)], 1350);
+    feed_view(&r2, &[], &[], &[(&r1, 3), (&r2, 0)], 1350);
+    wait_for("r1 to learn it was replaced", Duration::from_secs(5), || r1.net.is_retired()).await;
+    r1.net.reconcile(&r1.net.view.get());
+    wait_for("r1 to drop its sessions", Duration::from_secs(3), || r1.net.mesh_peers().is_empty()).await;
+    Ok(())
+}
+
+/// Rapid reconnects of one member: whatever order the old sessions'
+/// teardowns land in, the live one stays in the forwarding table.
+#[tokio::test]
+async fn reconnect_churn_leaves_the_live_session_routable() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let id = TlsIdentity::generate("a")?;
+    let cred = ca.credential(10, Role::Client, &id.fingerprint());
+    let b_id = TlsIdentity::generate("b")?;
+    let b = StubMember::connect(&r1, &ca.credential(11, Role::Client, &b_id.fingerprint()), &b_id).await?;
+    let mut members = Vec::new();
+    for _ in 0..20 {
+        members.push(StubMember::connect(&r1, &cred, &id).await?);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let live: Vec<&StubMember> = members.iter().filter(|m| m.session.conn.close_reason().is_none()).collect();
+    assert_eq!(live.len(), 1, "exactly one session survives");
+    assert_eq!(r1.net.local_clients(), vec![10, 11]);
+    assert!(r1.net.status_line().contains("clients=2"), "{}", r1.net.status_line());
+    assert!(b.send_data(11, 10, b"to the survivor"));
+    assert_eq!(&live[0].recv().await?[nqvpn_proto::frame::ROUTED_HEADER_LEN..], b"to the survivor");
+    assert_eq!(r1.net.counters.get(Decision::DropDstUnknown), 0);
+    Ok(())
+}
+
+/// With a view, a credential's role must match the member's, and a relay
+/// gets a mesh slot only if the published fleet lists it.
+#[tokio::test]
+async fn admission_checks_role_and_fleet_membership() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let r2 = spawn_relay(&ca, 2, 0);
+    feed(&r1, &[(10, 0)], &[], &[&r1]);
+    // r2 is a relay member, but not (yet) in the fleet.
+    let mut s = r1.net.view.get();
+    s.members.push(PeerInfo { role: Role::Relay, ..peer(2, 0) });
+    s.normalize();
+    r1.net.view.replace(s.clone());
+    r1.net.reconcile(&s);
+    assert!(
+        StubMember::connect(&r1, &ca.credential(2, Role::Relay, &r2.identity.fingerprint()), &r2.identity).await.is_err(),
+        "a relay outside the fleet was admitted"
+    );
+    // A client presenting a relay credential.
+    let id = TlsIdentity::generate("c10")?;
+    assert!(StubMember::connect(&r1, &ca.credential(10, Role::Relay, &id.fingerprint()), &id).await.is_err(), "a client was admitted as a relay");
+    let c10 = StubMember::connect(&r1, &ca.credential(10, Role::Client, &id.fingerprint()), &id).await;
+    assert!(c10.is_ok(), "the client with its own role: {:?}", c10.err());
+    // Once the fleet lists r2, it is admitted.
+    feed(&r1, &[(10, 0)], &[], &[&r1, &r2]);
+    let r2m = StubMember::connect(&r1, &ca.credential(2, Role::Relay, &r2.identity.fingerprint()), &r2.identity).await;
+    assert!(r2m.is_ok(), "a relay in the fleet: {:?}", r2m.err());
+    Ok(())
+}
+
+/// A frame larger than any member of the network would seal is dropped.
+#[tokio::test]
+async fn oversized_frames_are_dropped() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let a_id = TlsIdentity::generate("a")?;
+    let b_id = TlsIdentity::generate("b")?;
+    let a = StubMember::connect(&r1, &ca.credential(10, Role::Client, &a_id.fingerprint()), &a_id).await?;
+    let b = StubMember::connect(&r1, &ca.credential(11, Role::Client, &b_id.fingerprint()), &b_id).await?;
+    assert!(attached(&r1, 10).await && attached(&r1, 11).await);
+    // A tiny network MTU, so the cap fits in a QUIC datagram.
+    feed_view(&r1, &[(10, 0), (11, 0)], &[], &[(&r1, 0)], 100);
+    assert!(a.send_data(10, 11, &[7u8; 300]));
+    assert_eq!(b.recv().await?.len(), nqvpn_proto::frame::ROUTED_HEADER_LEN + 300);
+    assert!(a.send_data(10, 11, &[7u8; 700]));
+    assert!(b.try_recv(Duration::from_millis(400)).await.is_none());
+    assert_eq!(r1.net.counters.get(Decision::DropMalformed), 1);
+    Ok(())
+}
+
+/// A peer relay may hand our client only notes about its own handling.
+#[tokio::test]
+async fn trace_notes_from_the_mesh_must_come_from_the_relay_that_wrote_them() -> Result<()> {
+    let ca = Ca::new();
+    let r1 = spawn_relay(&ca, 1, 0);
+    let r2 = spawn_relay(&ca, 2, 0);
+    let a_id = TlsIdentity::generate("a")?;
+    let a = StubMember::connect(&r1, &ca.credential(10, Role::Client, &a_id.fingerprint()), &a_id).await?;
+    assert!(attached(&r1, 10).await);
+    feed(&r1, &[(10, 0)], &[(10, 1)], &[&r1, &r2]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r2_as_member = StubMember::connect(&r1, &ca.credential(2, Role::Relay, &r2.identity.fingerprint()), &r2.identity).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let note = |relay_id| TraceNote { origin: 10, trace: 1, hop: 1, relay_id, decision: Decision::DeliverLocal, detail: 0 }.encode();
+    assert!(r2_as_member.session.chan.send(Bytes::from(note(99))));
+    assert!(a.try_recv(Duration::from_millis(400)).await.is_none(), "a note forged for another relay must not pass");
+    assert!(r2_as_member.session.chan.send(Bytes::from(note(2))));
+    let got = a.recv().await?;
+    assert_eq!(TraceNote::parse(&got).map(|n| n.relay_id), Some(2));
     Ok(())
 }

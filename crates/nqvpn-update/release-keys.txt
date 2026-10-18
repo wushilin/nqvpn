@@ -1,0 +1,11 @@
+# Trusted release signing keys for --self-update, compiled into every
+# binary (include_str! in src/lib.rs). One Ed25519 public key per line,
+# base64 (as printed by `nqvpn-release-sign keygen`) or 64 hex digits;
+# `#` starts a comment. A release is accepted when any key listed here
+# signed it, so to rotate: add the new key, ship a release signed with
+# the old one, then sign with the new key and drop the old line.
+#
+# While no key is listed, --self-update refuses to install anything.
+#
+#   cargo run -p nqvpn-update --bin nqvpn-release-sign -- keygen
+#

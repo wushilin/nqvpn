@@ -55,7 +55,11 @@ fn allocate_inner(
     preferred4: Option<Ipv4Addr>,
     preferred6: Option<Ipv6Addr>,
 ) -> Result<Granted, ApiError> {
-    let (member_cfg, _) = cfg.member_by_name(member).expect("caller verified membership");
+    // The caller checked membership under the same lock; still an error,
+    // never a panic, since a panic here would poison the network lock.
+    let (member_cfg, _) = cfg
+        .member_by_name(member)
+        .ok_or_else(|| ApiError::not_found(format!("member {member:?} is not configured")))?;
 
     // Hard reservations are configuration, not liveness. They can never
     // be handed to another member, including when an address happened to
@@ -490,6 +494,8 @@ ipv4_cidr = "10.99.1.0/28"
                 ..Default::default()
             },
             300_000,
+            &|_| true,
+            usize::MAX,
         );
 
         let g = allocate_for_join(&c, &mut reg, &leases, true, "c3", None, None).unwrap();

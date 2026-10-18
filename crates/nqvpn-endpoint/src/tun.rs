@@ -26,6 +26,11 @@ pub trait TunDevice: Send + Sync + 'static {
     fn addresses(&self) -> Vec<ipnet::IpNet> {
         Vec::new()
     }
+    /// Change the device MTU (the network's MTU changed at the
+    /// coordinator). Backends without a kernel device accept silently.
+    fn set_mtu(&self, _mtu: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A TUN handle whose underlying device can be replaced underneath every
@@ -105,6 +110,9 @@ impl TunDevice for SwappableTun {
     }
     fn mtu(&self) -> u16 {
         self.inner.read().unwrap().dev.mtu()
+    }
+    fn set_mtu(&self, mtu: u16) -> anyhow::Result<()> {
+        self.inner.read().unwrap().dev.set_mtu(mtu)
     }
     fn name(&self) -> String {
         // Read live: the kernel picks the name, so a replacement may land

@@ -9,6 +9,10 @@ Restart=always
 RestartSec=2
 NoNewPrivileges=true
 StateDirectory=nqvpn-coord
+StateDirectoryMode=0700
+# The database holds member secrets in the clear: nothing it writes is
+# readable by other users.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

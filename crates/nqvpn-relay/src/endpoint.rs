@@ -11,11 +11,31 @@ use nqvpn_endpoint::tun::TunDevice;
 use nqvpn_proto::control::Snapshot;
 use nqvpn_proto::frame::RoutedHeader;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::net::RelayNet;
 use crate::tables::Origin;
+
+/// How long a resolved relay hostname is trusted.
+const UNDERLAY_TTL: Duration = Duration::from_secs(300);
+/// How soon a failed lookup is tried again (the old answer, if any, is
+/// kept meanwhile).
+const UNDERLAY_RETRY: Duration = Duration::from_secs(30);
+const UNDERLAY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One relay hostname's resolution.
+#[derive(Default)]
+struct Resolved {
+    ips: Vec<IpAddr>,
+    /// Look it up again after this.
+    until: Option<Instant>,
+    /// A lookup is in flight.
+    pending: bool,
+}
+
+type UnderlayCache = Arc<Mutex<HashMap<String, Resolved>>>;
 
 pub struct LocalEndpoint {
     pub engine: Arc<Engine>,
@@ -24,7 +44,8 @@ pub struct LocalEndpoint {
     routes: Arc<dyn RouteSink>,
     mine: Mutex<Vec<ipnet::IpNet>>,
     /// Resolved relay addresses, so their routes are never captured.
-    underlay: Mutex<HashMap<String, Vec<IpAddr>>>,
+    /// Hostnames are looked up off the reconcile path, with a TTL.
+    underlay: UnderlayCache,
     device: String,
 }
 
@@ -51,15 +72,15 @@ impl<P: RouteProgrammer + 'static> RouteSink for RouteSet<P> {
     }
 }
 
-/// Sends our own sealed frames through our own forwarding table.
+/// Sends our own sealed frames through our own forwarding table. Trace
+/// notes for them come straight back to the engine (`RelayNet::trace`).
 pub struct SelfUplink {
     net: Mutex<Option<Arc<RelayNet>>>,
-    loopback: Arc<nqvpn_proto::transport::PacketChannel>,
 }
 
 impl SelfUplink {
-    fn new(loopback: Arc<nqvpn_proto::transport::PacketChannel>) -> Arc<SelfUplink> {
-        Arc::new(SelfUplink { net: Mutex::new(None), loopback })
+    fn new() -> Arc<SelfUplink> {
+        Arc::new(SelfUplink { net: Mutex::new(None) })
     }
 }
 
@@ -70,7 +91,7 @@ impl Uplink for SelfUplink {
             return false;
         }
         // Origin is ourselves: the anti-spoofing rule holds trivially.
-        net.forward(Origin::Client(net.my_node_id), &self.loopback, datagram.into(), lane);
+        net.forward(Origin::Client(net.my_node_id), None, datagram.into(), lane);
         true
     }
 }
@@ -88,7 +109,6 @@ impl LocalEndpoint {
         mtu: u16,
         lanes: u8,
         routes: Arc<dyn RouteSink>,
-        loopback: Arc<nqvpn_proto::transport::PacketChannel>,
     ) -> Arc<LocalEndpoint> {
         let mut table = PeerTable::new(my_node_id);
         table.set_mine(hosts.clone(), nets.clone());
@@ -97,10 +117,10 @@ impl LocalEndpoint {
         Arc::new(LocalEndpoint {
             engine,
             tun,
-            uplink: SelfUplink::new(loopback),
+            uplink: SelfUplink::new(),
             routes,
             mine: Mutex::new(hosts.into_iter().chain(nets).collect()),
-            underlay: Mutex::new(HashMap::new()),
+            underlay: Arc::new(Mutex::new(HashMap::new())),
             device,
         })
     }
@@ -126,14 +146,19 @@ impl LocalEndpoint {
         None
     }
 
-    /// Peers and routes from the view. Trace notes for our own frames
-    /// come back on the loopback channel and are drained here too.
+    /// Peers and routes from the view. Routes wait while a relay
+    /// hostname is being resolved for the first time (bounded by the
+    /// lookup timeout): installing them blind could capture the path to
+    /// that relay. The lookup's completion triggers another reconcile.
     pub fn sync(&self, view: &Snapshot) {
         self.engine.peers.lock().unwrap().replace_all(view.members.clone());
+        let Some(underlay) = self.underlay_addrs(view) else {
+            tracing::debug!("relay addresses still resolving; routes follow");
+            return;
+        };
         let mine = self.mine.lock().unwrap().clone();
         let wanted = wanted_routes(view, self.engine.my_node_id, &mine);
         let local = nqvpn_endpoint::ifaces::local_prefixes(&self.device);
-        let underlay = self.underlay_addrs(view);
         let (keep, excluded) = exclude_local(wanted, &local, &underlay);
         for (net, why) in excluded {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
@@ -143,17 +168,74 @@ impl LocalEndpoint {
         }
     }
 
-    fn underlay_addrs(&self, view: &Snapshot) -> Vec<IpAddr> {
-        use std::net::ToSocketAddrs;
+    /// Every relay's underlay address. Literal addresses are parsed in
+    /// place; hostnames come from a cache filled by background lookups
+    /// (never on this, the reconcile, path), refreshed after
+    /// `UNDERLAY_TTL`, retried after `UNDERLAY_RETRY` on failure. `None`
+    /// while some hostname has no answer yet and its first lookup is in
+    /// flight.
+    fn underlay_addrs(&self, view: &Snapshot) -> Option<Vec<IpAddr>> {
         let mut cache = self.underlay.lock().unwrap();
+        cache.retain(|addr, _| view.relays.iter().any(|r| &r.addr == addr));
         let mut out = Vec::new();
+        let mut complete = true;
+        let now = Instant::now();
         for r in &view.relays {
-            let ips = cache.entry(r.addr.clone()).or_insert_with(|| {
-                r.addr.to_socket_addrs().map(|it| it.map(|s| s.ip()).collect()).unwrap_or_default()
-            });
-            out.extend(ips.iter().copied());
+            if let Ok(sock) = r.addr.parse::<SocketAddr>() {
+                out.push(sock.ip());
+                continue;
+            }
+            let entry = cache.entry(r.addr.clone()).or_default();
+            if !entry.pending && entry.until.is_none_or(|t| now >= t) {
+                if self.spawn_lookup(r.addr.clone()) {
+                    entry.pending = true;
+                } else {
+                    // No runtime (never in the relay): next reconcile.
+                    entry.until = Some(now + UNDERLAY_RETRY);
+                }
+            }
+            if entry.pending && entry.until.is_none() {
+                complete = false;
+            }
+            out.extend(entry.ips.iter().copied());
         }
-        out
+        complete.then_some(out)
+    }
+
+    /// Resolve one relay hostname off the reconcile path, record the
+    /// answer, and wake the reconciler so routes are recomputed. Called
+    /// with the cache locked; false if there is no runtime to run on.
+    fn spawn_lookup(&self, addr: String) -> bool {
+        let (cache, uplink) = (self.underlay.clone(), self.uplink.clone());
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return false };
+        rt.spawn(async move {
+            let answer = match tokio::time::timeout(UNDERLAY_LOOKUP_TIMEOUT, tokio::net::lookup_host(addr.as_str())).await {
+                Ok(Ok(it)) => it.map(|s| s.ip()).collect::<Vec<_>>(),
+                Ok(Err(e)) => {
+                    tracing::warn!(%addr, "resolving relay address: {e}");
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::warn!(%addr, "resolving relay address: timed out");
+                    Vec::new()
+                }
+            };
+            if let Some(e) = cache.lock().unwrap().get_mut(&addr) {
+                e.pending = false;
+                if answer.is_empty() {
+                    // Keep the last good answer, if any, until a retry.
+                    e.until = Some(Instant::now() + UNDERLAY_RETRY);
+                } else {
+                    e.ips = answer;
+                    e.until = Some(Instant::now() + UNDERLAY_TTL);
+                }
+            }
+            let net = uplink.net.lock().unwrap().clone();
+            if let Some(net) = net {
+                net.view.poke();
+            }
+        });
+        true
     }
 
     /// A frame addressed to us: unseal, filter, write to the TUN.
@@ -161,8 +243,7 @@ impl LocalEndpoint {
         self.engine.inbound(datagram, self.uplink.as_ref(), self.tun.as_ref());
     }
 
-    /// Start the TUN reader pump, the rekey sweep, the route watchdog,
-    /// and the loopback drain (trace notes for our own traced frames).
+    /// Start the TUN reader pump, the rekey sweep, and the route watchdog.
     pub fn spawn_pumps(self: &Arc<Self>) {
         let mut reader = self.tun.reader();
         let me = self.clone();
@@ -187,12 +268,6 @@ impl LocalEndpoint {
                 if let Err(e) = me.routes.reassert() {
                     tracing::warn!("route re-assert failed: {e:#}");
                 }
-            }
-        });
-        let me = self.clone();
-        tokio::spawn(async move {
-            while let Some((d, _)) = me.uplink.loopback.recv().await {
-                me.engine.inbound(&d, me.uplink.as_ref(), me.tun.as_ref());
             }
         });
     }

@@ -8,14 +8,15 @@ use ipnet::IpNet;
 use nqvpn_proto::token::Token;
 use nqvpn_proto::types::{NodeId, Role};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::config::{validate_network, MemberCfg, NetworkConfig, SettingsCfg};
+use crate::config::{validate_network, validate_network_with, HostCache, MemberCfg, NetworkConfig, SettingsCfg};
 use crate::error::ApiError;
 use crate::registry::Registry;
 use crate::secrets::generate_secret;
-use crate::state::{now_unix, AppState, NetState};
+use crate::state::{lock_net, now_unix, AppState, NetState};
 
 /// A network as the operator creates or edits it: no members.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,29 +120,51 @@ fn valid_name(name: &str) -> Result<(), ApiError> {
     if ok {
         Ok(())
     } else {
-        Err(ApiError::bad_request("names are 1-64 characters of [A-Za-z0-9._-]"))
+        Err(ApiError::bad_request(format!("{name:?}: names are 1-64 characters of [A-Za-z0-9._-]")))
     }
 }
 
-/// Which members' facts changed between two configurations of the same
-/// network: those get told to re-join.
+/// Which members' facts (or role) changed between two configurations of
+/// the same network: those get told to re-join.
 fn changed_members(old: &NetworkConfig, new: &NetworkConfig) -> Vec<String> {
     let mut out = Vec::new();
-    for (name, m, _) in new.members() {
+    for (name, m, role) in new.members() {
         match old.member_by_name(name) {
-            Some((o, _)) if o.facts_equal(m) => {}
+            Some((o, old_role)) if old_role == role && o.facts_equal(m) => {}
             _ => out.push(name.clone()),
         }
     }
     out
 }
 
+/// A change every member holds — the address space, or settings handed
+/// down at join (MTU, transport, lanes, heartbeat, credential lifetime,
+/// bandwidth) — makes everyone re-join.
+fn everyone_must_rejoin(old: &NetworkConfig, new: &NetworkConfig) -> bool {
+    let (s_old, s_new) = (&old.settings, &new.settings);
+    old.cidrs != new.cidrs
+        || s_old.mtu != s_new.mtu
+        || s_old.transport != s_new.transport
+        || s_old.lanes != s_new.lanes
+        || s_old.heartbeat_secs != s_new.heartbeat_secs
+        || s_old.credential_ttl_mins != s_new.credential_ttl_mins
+        || s_old.max_session_mbps != s_new.max_session_mbps
+}
+
+/// Resolve the relay hostnames a proposed edit of `net` names, without
+/// holding its lock: validation under the lock then needs no DNS.
+fn prefetch_hosts(net: &Mutex<NetState>, edit: impl FnOnce(&mut NetworkConfig)) -> HostCache {
+    let mut proposed = match net.lock() {
+        Ok(ns) => ns.cfg.clone(),
+        Err(_) => return HostCache::default(),
+    };
+    edit(&mut proposed);
+    HostCache::prefetch(&proposed)
+}
+
 impl AppState {
     pub fn create_network(&self, spec: NetworkSpec) -> Result<(), ApiError> {
         valid_name(&spec.network_id)?;
-        if self.net(&spec.network_id).is_some() {
-            return Err(ApiError::bad_request(format!("network {:?} already exists", spec.network_id)));
-        }
         let mut cfg = NetworkConfig {
             network_id: spec.network_id.clone(),
             cidrs: std::iter::once(IpNet::V4(spec.ipv4_cidr))
@@ -152,66 +175,66 @@ impl AppState {
             clients: BTreeMap::new(),
         };
         validate_network(&mut cfg).map_err(invalid)?;
+        // The existence check and the insert are one step with respect to
+        // every other create, delete or import.
+        let _serial = self.admin_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.net(&spec.network_id).is_some() {
+            return Err(ApiError::bad_request(format!("network {:?} already exists", spec.network_id)));
+        }
         let registry = Registry::new();
         self.db
             .save_network_and_registry(&cfg, &registry)
             .map_err(|e| ApiError::internal(format!("saving network: {e:#}")))?;
         let ns = self.add_network(cfg, registry);
         // Not a restart: nothing to collect before publishing.
-        ns.lock().unwrap().started_at = 0;
+        lock_net(&ns)?.started_at = 0;
         tracing::info!(network = %spec.network_id, "network created");
         Ok(())
     }
 
     /// Replace a network's IPv4/IPv6 ranges and settings; members
-    /// are untouched. Settings every member holds (MTU, transport,
-    /// lanes, heartbeat) make everyone re-join.
+    /// are untouched. A change every member holds makes everyone re-join.
     pub fn update_network(&self, id: &str, spec: NetworkSpec) -> Result<(), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let cidrs: Vec<IpNet> = std::iter::once(IpNet::V4(spec.ipv4_cidr)).chain(spec.ipv6_cidr.map(IpNet::V6)).collect();
+        let hosts = prefetch_hosts(&net, |c| {
+            c.cidrs = cidrs.clone();
+            c.settings = spec.settings.clone();
+        });
+        let mut ns = lock_net(&net)?;
         let mut cfg = ns.cfg.clone();
-        cfg.cidrs = std::iter::once(IpNet::V4(spec.ipv4_cidr))
-            .chain(spec.ipv6_cidr.map(IpNet::V6))
-            .collect();
+        cfg.cidrs = cidrs;
         cfg.settings = spec.settings;
-        validate_network(&mut cfg).map_err(invalid)?;
+        validate_network_with(&mut cfg, &hosts).map_err(invalid)?;
         validate_assignments(&cfg, &ns.registry)?;
-        let s_old = &ns.cfg.settings;
-        let s_new = &cfg.settings;
-        let everyone = s_old.mtu != s_new.mtu
-            || s_old.transport != s_new.transport
-            || s_old.lanes != s_new.lanes
-            || s_old.heartbeat_secs != s_new.heartbeat_secs
-            || s_old.credential_ttl_mins != s_new.credential_ttl_mins
-            || s_old.max_session_mbps != s_new.max_session_mbps;
+        let everyone = everyone_must_rejoin(&ns.cfg, &cfg);
         ns.cfg = cfg;
         ns.save_config()?;
         ns.directory.hold_down_secs = ns.cfg.settings.hold_down_secs;
-        let reconnected = if everyone {
-            let nodes: Vec<NodeId> = ns.sessions.keys().copied().collect();
-            let n = nodes.len();
-            for node in nodes {
-                ns.reconfigure(node, "network settings changed");
-            }
-            n
-        } else {
-            0
-        };
+        let reconnected = if everyone { ns.reconfigure_all("network settings changed") } else { 0 };
         self.publish(&mut ns);
         tracing::info!(network = %id, reconnected, "network settings updated");
         Ok(())
     }
 
+    /// Delete a network. Its rows go first, under its lock, and the lock
+    /// marks it deleted: a join or session that resolved it earlier and
+    /// waits on that lock finds it gone, and a concurrent re-create of
+    /// the same id (serialized by `admin_lock`) cannot lose its rows to
+    /// this delete.
     pub fn delete_network(&self, id: &str) -> Result<(), ApiError> {
-        let net = self.remove_network(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
+        let _serial = self.admin_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
         {
-            let mut ns = net.lock().unwrap();
+            let mut ns = lock_net(&net)?;
+            self.db.delete_network(id).map_err(|e| ApiError::internal(format!("deleting network: {e:#}")))?;
+            ns.deleted = true;
             let nodes: Vec<NodeId> = ns.sessions.keys().copied().collect();
             for n in nodes {
                 ns.close_session(n, "network deleted");
             }
         }
-        self.db.delete_network(id).map_err(|e| ApiError::internal(format!("deleting network: {e:#}")))?;
+        self.remove_network(id);
         tracing::info!(network = %id, "network deleted");
         Ok(())
     }
@@ -221,17 +244,18 @@ impl AppState {
     pub fn create_member(&self, id: &str, name: &str, role: Role, spec: &MemberSpec) -> Result<String, ApiError> {
         valid_name(name)?;
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let mut m = MemberCfg::default();
+        spec.apply(&mut m);
+        let hosts = prefetch_hosts(&net, |c| c.insert_member(name, role, m.clone()));
+        let mut ns = lock_net(&net)?;
         if ns.cfg.member_by_name(name).is_some() {
             return Err(ApiError::bad_request(format!("member {name:?} already exists")));
         }
-        let mut m = MemberCfg::default();
-        spec.apply(&mut m);
         let secret = generate_secret();
         m.secret = Some(secret.clone());
         let mut cfg = ns.cfg.clone();
         cfg.insert_member(name, role, m);
-        validate_network(&mut cfg).map_err(invalid)?;
+        validate_network_with(&mut cfg, &hosts).map_err(invalid)?;
         validate_assignments(&cfg, &ns.registry)?;
         ns.cfg = cfg;
         ns.save_config()?;
@@ -244,11 +268,16 @@ impl AppState {
     /// re-join, and comes back with the new ones.
     pub fn update_member(&self, id: &str, name: &str, spec: &MemberSpec) -> Result<(), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let hosts = prefetch_hosts(&net, |c| {
+            if let Some((m, _)) = c.member_by_name_mut(name) {
+                spec.apply(m);
+            }
+        });
+        let mut ns = lock_net(&net)?;
         let mut cfg = ns.cfg.clone();
         let (m, _) = cfg.member_by_name_mut(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         spec.apply(m);
-        validate_network(&mut cfg).map_err(invalid)?;
+        validate_network_with(&mut cfg, &hosts).map_err(invalid)?;
         validate_assignments(&cfg, &ns.registry)?;
         let changed = changed_members(&ns.cfg, &cfg);
         ns.cfg = cfg;
@@ -271,7 +300,7 @@ impl AppState {
     /// every acceptor closes its sessions.
     pub fn rotate_member(&self, id: &str, name: &str) -> Result<String, ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let mut ns = lock_net(&net)?;
         let secret = generate_secret();
         {
             let (m, _) = ns.cfg.member_by_name_mut(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
@@ -295,7 +324,7 @@ impl AppState {
     /// Forget a member: configuration, registry record, address, routes.
     pub fn delete_member(&self, id: &str, name: &str) -> Result<(), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let mut ns = lock_net(&net)?;
         let in_cfg = ns.cfg.remove_member(name);
         let node = ns.registry.id_of(name);
         if !in_cfg && node.is_none() {
@@ -317,7 +346,7 @@ impl AppState {
 
     pub fn set_disabled(&self, id: &str, name: &str, disabled: bool) -> Result<(), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let mut ns = net.lock().unwrap();
+        let mut ns = lock_net(&net)?;
         let node = ns.registry.id_of(name).ok_or_else(|| ApiError::not_found(format!("member {name:?} has never joined")))?;
         let rec = ns.registry.members.get_mut(&node).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         rec.disabled = disabled;
@@ -339,7 +368,7 @@ impl AppState {
     /// The member's token, for the UI to show and the operator to copy.
     pub fn member_token(&self, id: &str, name: &str, endpoint: &str) -> Result<(Token, Role), ApiError> {
         let net = self.net(id).ok_or_else(|| ApiError::not_found(format!("network {id:?}")))?;
-        let ns = net.lock().unwrap();
+        let ns = lock_net(&net)?;
         let (m, role) = ns.cfg.member_by_name(name).ok_or_else(|| ApiError::not_found(format!("member {name:?}")))?;
         let secret = m.secret.clone().ok_or_else(|| ApiError::not_found(format!("member {name:?} has no secret; rotate to mint one")))?;
         // A self-signed coordinator ships its fingerprint in the token so
@@ -355,49 +384,162 @@ impl AppState {
     }
 
     /// All configuration, for backup or for keeping in version control.
+    /// Configuration is only ever replaced whole under the lock, so even
+    /// a network poisoned by a panic still has a consistent one to export.
     pub fn export(&self) -> Vec<NetworkConfig> {
-        self.nets().into_iter().map(|(_, n)| n.lock().unwrap().cfg.clone()).collect()
+        self.nets()
+            .into_iter()
+            .map(|(_, n)| n.lock().unwrap_or_else(|e| e.into_inner()).cfg.clone())
+            .collect()
     }
 
     /// Restore configuration: networks that exist are replaced whole
     /// (members included), others are created. Registries are kept.
+    ///
+    /// All or nothing: every network is validated first — names, the
+    /// network rules, secrets (well-formed and unique across every
+    /// member of every network), durable assignments — then everything
+    /// is committed in one transaction, and only then applied. A failure
+    /// at any step leaves the running configuration as it was.
     pub fn import(&self, mut cfgs: Vec<NetworkConfig>) -> Result<Vec<String>, ApiError> {
+        // ---- validate each network on its own (no locks: DNS happens here) ----
+        let mut ids = HashSet::new();
         for cfg in &mut cfgs {
+            valid_name(&cfg.network_id)?;
+            if !ids.insert(cfg.network_id.clone()) {
+                return Err(ApiError::bad_request(format!("network {:?} appears twice", cfg.network_id)));
+            }
+            for (name, _, _) in cfg.members() {
+                valid_name(name).map_err(|e| ApiError::bad_request(format!("network {}: {}", cfg.network_id, e.message)))?;
+            }
             validate_network(cfg).map_err(invalid)?;
         }
+        cfgs.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+
+        let _serial = self.admin_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // ---- secrets name members across networks: no two may share one ----
+        let mut owner_of: HashMap<String, String> = HashMap::new();
+        let mut claim = |secret: &str, who: String| -> Result<(), ApiError> {
+            match owner_of.insert(secret.trim().to_string(), who.clone()) {
+                Some(prev) => Err(ApiError::bad_request(format!("{who} and {prev} have the same secret; every member's must be unique"))),
+                None => Ok(()),
+            }
+        };
+        for cfg in &cfgs {
+            for (name, m, _) in cfg.members() {
+                if let Some(s) = &m.secret {
+                    claim(s, format!("{}/{name}", cfg.network_id))?;
+                }
+            }
+        }
+        for (id, net) in self.nets() {
+            if ids.contains(&id) {
+                continue; // replaced by the import
+            }
+            let ns = lock_net(&net)?;
+            for (name, m, _) in ns.cfg.members() {
+                if let Some(s) = &m.secret {
+                    claim(s, format!("{id}/{name}"))?;
+                }
+            }
+        }
+
+        // ---- lock every network being replaced, in id order (the only
+        // place more than one network lock is held, always sorted) ----
+        let handles: Vec<Option<Arc<Mutex<NetState>>>> = cfgs.iter().map(|c| self.net(&c.network_id)).collect();
+        let mut guards: Vec<Option<MutexGuard<'_, NetState>>> = Vec::with_capacity(handles.len());
+        for h in &handles {
+            guards.push(match h {
+                Some(n) => Some(lock_net(n)?),
+                None => None,
+            });
+        }
+
+        // ---- the registries as they will be, checked against the configs ----
+        let now = now_unix();
+        let mut registries: Vec<Registry> = Vec::with_capacity(cfgs.len());
+        for (cfg, guard) in cfgs.iter().zip(&guards) {
+            let mut reg = match guard {
+                Some(ns) => ns.registry.clone(),
+                None => self
+                    .db
+                    .load_registry(&cfg.network_id)
+                    .map_err(|e| ApiError::internal(format!("{e:#}")))?
+                    .unwrap_or_else(Registry::new),
+            };
+            validate_assignments(cfg, &reg)?;
+            let old_cfg = guard.as_ref().map(|ns| &ns.cfg);
+            for rec in reg.members.values_mut() {
+                let Some((m, role)) = cfg.member_by_name(&rec.name) else { continue };
+                // A credential carries its role, and one minted under a
+                // secret the import replaced must not outlive it: both
+                // retire the instance holding it.
+                let why = if role != rec.role {
+                    Some("role changed by import")
+                } else if old_cfg
+                    .and_then(|c| c.member_by_name(&rec.name))
+                    .is_some_and(|(o, _)| o.secret.is_some() && o.secret != m.secret)
+                {
+                    Some("secret replaced by import")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    rec.login_gen += 1;
+                    rec.replaced_unix = Some(now);
+                    rec.replaced_from = Some(why.into());
+                }
+            }
+            registries.push(reg);
+        }
+
+        // ---- commit everything at once ----
+        let rows: Vec<(&NetworkConfig, &Registry)> = cfgs.iter().zip(&registries).collect();
+        self.db.save_networks(&rows).map_err(|e| ApiError::internal(format!("saving imported configuration: {e:#}")))?;
+
+        // ---- apply ----
         let mut applied = Vec::new();
-        for cfg in cfgs {
+        let mut created = Vec::new();
+        for ((cfg, reg), guard) in cfgs.into_iter().zip(registries).zip(guards) {
             let id = cfg.network_id.clone();
-            match self.net(&id) {
-                Some(net) => {
-                    let mut ns = net.lock().unwrap();
-                    validate_assignments(&cfg, &ns.registry)?;
+            match guard {
+                Some(mut ns) => {
+                    let mut retire: Vec<(NodeId, &str)> = Vec::new();
+                    for rec in reg.members.values() {
+                        let before = ns.registry.members.get(&rec.node_id).map(|r| r.login_gen);
+                        if before.is_some_and(|g| g < rec.login_gen) {
+                            retire.push((rec.node_id, "credential retired by import"));
+                        } else if cfg.member_by_name(&rec.name).is_none() {
+                            retire.push((rec.node_id, "member removed by import"));
+                        }
+                    }
+                    let everyone = everyone_must_rejoin(&ns.cfg, &cfg);
                     let changed = changed_members(&ns.cfg, &cfg);
                     ns.cfg = cfg;
-                    ns.save_config()?;
+                    ns.registry = reg;
                     ns.directory.hold_down_secs = ns.cfg.settings.hold_down_secs;
-                    for n in changed {
-                        if let Some(node) = ns.registry.id_of(&n) {
-                            ns.reconfigure(node, "configuration imported");
+                    for (node, why) in retire {
+                        ns.close_session(node, why);
+                    }
+                    if everyone {
+                        ns.reconfigure_all("configuration imported");
+                    } else {
+                        for n in changed {
+                            if let Some(node) = ns.registry.id_of(&n) {
+                                ns.reconfigure(node, "configuration imported");
+                            }
                         }
                     }
                     self.publish(&mut ns);
                 }
-                None => {
-                    let registry = self
-                        .db
-                        .load_registry(&id)
-                        .map_err(|e| ApiError::internal(format!("{e:#}")))?
-                        .unwrap_or_else(Registry::new);
-                    validate_assignments(&cfg, &registry)?;
-                    self.db
-                        .save_network_and_registry(&cfg, &registry)
-                        .map_err(|e| ApiError::internal(format!("saving network: {e:#}")))?;
-                    let ns = self.add_network(cfg, registry);
-                    ns.lock().unwrap().started_at = 0;
-                }
+                None => created.push((cfg, reg)),
             }
             applied.push(id);
+        }
+        for (cfg, reg) in created {
+            let ns = self.add_network(cfg, reg);
+            lock_net(&ns)?.started_at = 0;
         }
         tracing::info!(networks = ?applied, "configuration imported");
         Ok(applied)
@@ -417,9 +559,6 @@ impl MemberCfg {
             && self.internet_gateway == other.internet_gateway
     }
 }
-
-#[allow(dead_code)]
-fn _ns_type_check(_: &NetState) {}
 
 #[cfg(test)]
 mod tests {
@@ -453,5 +592,18 @@ mod tests {
         r.member_mut(1, "a", Role::Client, 1).ip4 = Some("10.99.1.7".parse().unwrap());
         c.clients.get_mut("b").unwrap().preferred_ip4 = Some("10.99.1.7".parse().unwrap());
         assert!(validate_assignments(&c, &r).unwrap_err().message.contains("currently assigned"));
+    }
+
+    #[test]
+    fn a_role_change_or_a_cidr_change_is_a_reason_to_rejoin() {
+        let old = cfg();
+        let mut new = cfg();
+        let a = new.clients.remove("a").unwrap();
+        new.relays.insert("a".into(), MemberCfg { relay_addr: Some("1.2.3.4:1".into()), ..a });
+        assert_eq!(changed_members(&old, &new), vec!["a".to_string()]);
+        let mut new = cfg();
+        assert!(!everyone_must_rejoin(&old, &new));
+        new.cidrs[0] = "10.98.0.0/16".parse().unwrap();
+        assert!(everyone_must_rejoin(&old, &new));
     }
 }

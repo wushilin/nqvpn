@@ -10,18 +10,28 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use nqvpn_proto::control::{Hello, HelloAck, Refresh};
-use nqvpn_proto::credential::Claims;
-use nqvpn_proto::envelope::Kind;
+use nqvpn_proto::credential::{Claims, LEEWAY_SECS};
+use nqvpn_proto::envelope::{Envelope, Kind};
 use nqvpn_proto::frame::{Probe, T_PROBE, T_REPLY};
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::quic::{client_config, peer_fingerprint};
-use nqvpn_proto::stream::{parse, read_envelope, write_msg};
+use nqvpn_proto::stream::{parse, read_envelope, read_envelope_max, write_msg, StreamError};
 use nqvpn_proto::transport::{Mode, PacketChannel};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+
+/// Largest `Hello` an acceptor reads. It is the one message a stranger
+/// gets to send before authenticating; a credential is about 1 KB.
+pub const MAX_HELLO: u32 = 16 * 1024;
+/// How long an accepted connection has to open its control stream and
+/// send `Hello`, together.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Envelopes read ahead of `run`. The reader waits when this is full,
+/// which pushes back on the peer through QUIC flow control.
+const CONTROL_QUEUE: usize = 16;
 
 /// Verifies a credential against the acceptor's knowledge of the network
 /// (keys, uuid, disabled members, current login generation) and binds it
@@ -123,7 +133,11 @@ pub struct Session {
     /// The peer's certificate fingerprint as presented.
     pub peer_fp: String,
     control_tx: Mutex<quinn::SendStream>,
-    control_rx: Mutex<quinn::RecvStream>,
+    /// Envelopes from the control stream, read by a task of its own:
+    /// `read_envelope` is not cancel-safe, and `run` waits on several
+    /// things at once. A losing `select!` branch must never be the one
+    /// holding half a message.
+    control_rx: Mutex<mpsc::Receiver<Result<Envelope, StreamError>>>,
     exp: AtomicU64,
     login_gen: AtomicU64,
     /// Round-trip of the last answered probe, microseconds.
@@ -142,6 +156,8 @@ impl Session {
         tx: quinn::SendStream,
         rx: quinn::RecvStream,
     ) -> Arc<Session> {
+        let (env_tx, env_rx) = mpsc::channel(CONTROL_QUEUE);
+        tokio::spawn(control_reader(rx, env_tx));
         Arc::new(Session {
             conn,
             chan,
@@ -152,7 +168,7 @@ impl Session {
             claims,
             peer_fp,
             control_tx: Mutex::new(tx),
-            control_rx: Mutex::new(rx),
+            control_rx: Mutex::new(env_rx),
             rtt_us: AtomicU64::new(0),
         })
     }
@@ -165,6 +181,14 @@ impl Session {
     /// Current credential expiry (unix seconds), as last refreshed.
     pub fn exp(&self) -> u64 {
         self.exp.load(Ordering::Relaxed)
+    }
+
+    /// When `run` ends the session for want of a Refresh: the expiry
+    /// plus the same clock leeway `credential::verify` allows. Ending at
+    /// the bare `exp` would close a session the verifier had just
+    /// admitted with a credential inside that leeway.
+    pub fn ends_at(&self) -> u64 {
+        self.exp().saturating_add(LEEWAY_SECS)
     }
 
     /// Login generation of the credential currently bound to this
@@ -213,7 +237,7 @@ impl Session {
         let mut seq: u64 = 0;
         let started = Instant::now();
         loop {
-            let exp_in = Duration::from_secs(self.exp().saturating_sub(now_unix()));
+            let exp_in = Duration::from_secs(self.ends_at().saturating_sub(now_unix()));
             tokio::select! {
                 pkt = self.chan.recv() => {
                     let Some((d, lane)) = pkt else { return End::Closed };
@@ -233,10 +257,10 @@ impl Session {
                         _ => on_packet(d, lane),
                     }
                 }
-                env = read_envelope(&mut rx) => {
+                env = rx.recv() => {
                     let env = match env {
-                        Ok(e) => e,
-                        Err(_) => return End::Closed,
+                        Some(Ok(e)) => e,
+                        Some(Err(_)) | None => return End::Closed,
                     };
                     if env.kind == Kind::Refresh as u16 {
                         let Some(v) = verifier else { continue };
@@ -284,6 +308,25 @@ impl Session {
     }
 }
 
+/// Pump the control stream into `run`'s queue. Ends on a stream error
+/// (passed along first) or when the session is gone — the latter raced
+/// against the read, since a task parked in a read would otherwise keep
+/// the stream, and through it the connection, alive.
+async fn control_reader(mut rx: quinn::RecvStream, tx: mpsc::Sender<Result<Envelope, StreamError>>) {
+    loop {
+        let env = tokio::select! {
+            env = read_envelope(&mut rx) => env,
+            // Cancelling a read mid-message is fine here: nobody will
+            // read this stream again.
+            _ = tx.closed() => return,
+        };
+        let failed = env.is_err();
+        if tx.send(env).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -326,12 +369,15 @@ impl Acceptor for SingleNetwork {
 /// credential names, answer `HelloAck`.
 pub async fn accept(conn: quinn::Connection, acceptor: &dyn Acceptor) -> Result<Arc<Session>> {
     let fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("peer presented no certificate"))?;
-    let (mut tx, mut rx) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi())
-        .await
-        .context("waiting for the control stream")??;
-    let env = tokio::time::timeout(Duration::from_secs(10), read_envelope(&mut rx))
-        .await
-        .context("waiting for Hello")??;
+    // One deadline over both steps: a peer that opens the stream and then
+    // says nothing must not get a fresh allowance for the second step.
+    let (mut tx, rx, env) = tokio::time::timeout(HELLO_TIMEOUT, async {
+        let (tx, mut rx) = conn.accept_bi().await.context("waiting for the control stream")?;
+        let env = read_envelope_max(&mut rx, MAX_HELLO).await.context("reading Hello")?;
+        Ok::<_, anyhow::Error>((tx, rx, env))
+    })
+    .await
+    .context("waiting for Hello")??;
     if let Err(e) = nqvpn_proto::envelope::check_version(env.major, env.minor) {
         conn.close(3u32.into(), e.to_string().as_bytes());
         anyhow::bail!("{e}");
@@ -409,7 +455,7 @@ pub async fn dial(
         let fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("peer presented no certificate"))?;
         let (mut tx, mut rx) = conn.open_bi().await?;
         write_msg(&mut tx, Kind::Hello, &Hello { credential: credential.to_string(), have_gen: 0 }).await?;
-        let ack = match tokio::time::timeout(Duration::from_secs(10), read_envelope(&mut rx)).await {
+        let ack = match tokio::time::timeout(Duration::from_secs(10), read_envelope_max(&mut rx, MAX_HELLO)).await {
             Ok(Ok(a)) => a,
             Ok(Err(e)) => {
                 // A deliberate refusal carries a code; surface it so the
@@ -541,7 +587,8 @@ mod tests {
             (end, exp0, s.exp())
         });
         let me = TlsIdentity::generate("me").unwrap();
-        // Expires in 2 s (leeway is applied by verify, not by the session clock).
+        // Expires in 2 s; the session would outlive that by the verifier's
+        // leeway, but the Refresh comes first anyway.
         let cred = ca.cred(10, &me.fingerprint(), 2);
         let s = dial(&addr.to_string(), &me, Some(srv_id.fingerprint()), &cred, 1, Mode::Datagram, 1, 1, Role::Relay, claims_for(&cred)).await.unwrap();
         // Refresh with a longer credential before it lapses...
@@ -555,6 +602,89 @@ mod tests {
         let (end, exp0, exp1) = acceptor.await.unwrap();
         assert!(matches!(end, End::Protocol(_)), "{end:?}");
         assert!(exp1 > exp0 + 1000, "the refresh extended the acceptor's expiry");
+    }
+
+    #[tokio::test]
+    async fn a_credential_inside_the_leeway_is_not_closed_on_arrival() {
+        // Verification admits a credential up to LEEWAY_SECS past its
+        // exp; the session clock must give it the same allowance rather
+        // than expiring it the instant it starts.
+        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))));
+        let (srv, srv_id) = server();
+        let addr = srv.local_addr().unwrap();
+        let ca2 = ca.clone();
+        let acceptor = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let s = accept(conn, &SingleNetwork { network_id: "n".into(), verifier: ca2.clone(), mode: Mode::Datagram, lanes: 1 }).await.unwrap();
+            let r = tokio::time::timeout(Duration::from_millis(1500), s.run(&SessionConfig { probe_secs: 0, probe_misses: 3 }, Some(ca2.as_ref()), |_, _| {})).await;
+            (r.is_err(), s.exp(), s.ends_at())
+        });
+        let me = TlsIdentity::generate("me").unwrap();
+        // Already expired 30 s ago — inside the 120 s leeway.
+        let now = now_unix();
+        let cred = sign(
+            &Claims { iat: now - 600, exp: now - 30, ..claims_for(&ca.cred(10, &me.fingerprint(), 1)) },
+            "k1",
+            &ca.0,
+        );
+        let s = dial(&addr.to_string(), &me, Some(srv_id.fingerprint()), &cred, 1, Mode::Datagram, 1, 1, Role::Relay, claims_for(&cred)).await.unwrap();
+        let (still_running, exp, ends_at) = acceptor.await.unwrap();
+        assert!(still_running, "a just-admitted session must not end at once");
+        assert_eq!(ends_at, exp + LEEWAY_SECS);
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_split_across_packets_survives_a_busy_data_path() {
+        // The control stream is read alongside data, probes and the
+        // expiry timer. A Refresh trickling in byte by byte while data
+        // floods must still arrive whole: no select! branch may lose the
+        // part of it already read.
+        let ca = Arc::new(Ca(SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng))));
+        let (srv, srv_id) = server();
+        let addr = srv.local_addr().unwrap();
+        let ca2 = ca.clone();
+        let acceptor = tokio::spawn(async move {
+            let conn = srv.accept().await.unwrap().await.unwrap();
+            let s = accept(conn, &SingleNetwork { network_id: "n".into(), verifier: ca2.clone(), mode: Mode::Datagram, lanes: 1 }).await.unwrap();
+            let exp0 = s.exp();
+            let s2 = s.clone();
+            let run = tokio::spawn(async move { s2.run(&SessionConfig { probe_secs: 0, probe_misses: 3 }, Some(ca2.as_ref()), |_, _| {}).await });
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if s.exp() > exp0 + 1000 {
+                    break;
+                }
+            }
+            let exp1 = s.exp();
+            s.close(CLOSE_SHUTDOWN, "done");
+            (exp0, exp1, run.await.unwrap())
+        });
+        let me = TlsIdentity::generate("me").unwrap();
+        let cred = ca.cred(10, &me.fingerprint(), 3600);
+        let s = dial(&addr.to_string(), &me, Some(srv_id.fingerprint()), &cred, 1, Mode::Datagram, 1, 1, Role::Relay, claims_for(&cred)).await.unwrap();
+        let flood = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                loop {
+                    s.chan.send(Bytes::from_static(b"\x01data"));
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+            })
+        };
+        let longer = ca.cred(10, &me.fingerprint(), 7200);
+        let bytes = nqvpn_proto::envelope::encode_msg(Kind::Refresh, &Refresh { credential: longer }).unwrap();
+        {
+            let mut tx = s.control_tx.lock().await;
+            for b in bytes {
+                tx.write_all(&[b]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        let (exp0, exp1, end) = acceptor.await.unwrap();
+        flood.abort();
+        assert!(exp1 > exp0 + 1000, "the trickled Refresh was applied");
+        assert_eq!(end, End::Closed, "and the session did not die of a desynced stream");
     }
 
     #[tokio::test]

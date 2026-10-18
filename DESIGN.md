@@ -205,13 +205,15 @@ reused, and never written anywhere by a person.
   deleted, disabled, or simply not pushed yet — is refused and retries a
   second later. Once admitted, a session is evicted only by `reconcile`
   when the view drops the node or shows a newer `login_gen`.
-- **HTTPS by default, `trust_any_cert = true` by default.** The
-  coordinator serves a self-signed certificate it generates on first
-  start (the same identity as its QUIC control port) unless `[tls]` names
-  a real one. The default protects the secret against passive listeners
-  but not against someone on the path who answers as the coordinator;
-  set `trust_any_cert = false` (and `ca` for a self-signed coordinator)
-  to verify.
+- **HTTPS always, verified by default.** The coordinator serves a
+  self-signed certificate it generates on first start (the same identity
+  as its QUIC control port) unless `[tls]` names a real one. The token
+  carries a self-signed coordinator's fingerprint, so a member verifies
+  it with nothing else configured; a CA-signed one is verified against
+  the system roots (or `ca`). `trust_any_cert = true` (default `false`)
+  skips verification, and only when there is no pin and no `ca`: a pin
+  or CA is always enforced, on the HTTPS join and the QUIC control plane
+  alike.
 - **Join is a full re-declaration.** Whatever the latest join says
   replaces what was recorded: keys, gateway CIDRs (not re-declared ⇒
   withdrawn now), address requests, relay address. Kept across joins:
@@ -235,8 +237,8 @@ reused, and never written anywhere by a person.
 
 One `Mutex<NetState>` per network is the serialization point: every
 mutation runs under it, and the registry is fsync-committed *before* the
-credential is returned. Rate limit: `join_rate_per_min` (default 30) per
-(node, network, IP). The relay reachability probe runs *after*
+credential is returned. Rate limit: `join_rate_per_min` (default 120) per
+source address (IPv6 keyed by /64). The relay reachability probe runs *after*
 authentication, against the *configured* `relay_addr`, never the
 request's. Response: `{credential, network_uuid,
 coordinator_signing_keys, node_id, name, login_gen, ip4/subnet4,
@@ -349,7 +351,18 @@ many streams arrive.
 Control messages ride a bidirectional stream in a frozen envelope
 `[major u8][minor u8][kind u16][len u32][payload]`; version checked once
 at `Hello` (equality — peers are deployed together); unknown kinds are
-skipped by length; `len` capped at 1 MiB with strict bincode limits.
+skipped by length; `len` capped at 1 MiB (16 MiB for `Snapshot` and
+`Delta`, which grow with the network; 16 KiB for a pre-auth `Hello`),
+on encode and decode alike, with strict bincode limits. A payload buffer
+grows with the bytes that arrive, never with the declared `len`.
+Envelope reads are not cancel-safe, so a task that waits on anything
+besides its control stream reads that stream from a task of its own.
+
+Flow control bounds what any peer — authenticated or not, since TLS
+accepts any client certificate until `Hello` is checked — can make an
+acceptor buffer: one bidirectional stream per connection (the control
+stream), a 4 MiB per-stream window (one lane's bandwidth-delay product)
+and a 16 MiB connection window.
 
 ```
 0x01 Data       [type 1][src_id 4][dst_id 4][flags 1][hop 1][trace 4][ctr 8][AEAD ciphertext]
@@ -381,7 +394,8 @@ member), never below 1280.
 **Sessions (`nqvpn-session`).** One task owns one QUIC connection on
 every hop — client↔relay and relay↔relay — from both ends. `Hello
 {credential}` / `HelloAck`; the control stream carries `Refresh` and
-hop-local probes; the task ends at credential expiry unless refreshed,
+hop-local probes; the task ends at credential expiry (plus the same
+120 s leeway verification allows) unless refreshed,
 when the far end stops answering probes (dialer side probes every 2 s,
 5 misses = dead; the acceptor answers), when the peer closes, or when
 its owner closes it. The acceptor verifies that a `Refresh` is for the
@@ -471,7 +485,8 @@ Applies to clients and gateway relays.
 
 - **Noise IK** per pair (`snow`), prologue-bound to `(network_uuid,
   initiator, responder)`; ChaCha20-Poly1305; explicit 8-byte counter;
-  rekey every 2 min. First packets to a peer wait in a bounded queue
+  rekey at 2 min without loss (the previous keys still decrypt for 10 s;
+  hard drop at 3 min). First packets to a peer wait in a bounded queue
   (64, drop-oldest) during the handshake.
 - **Replay window: 2048 bits, two-phase** — `check` before decryption,
   `commit` only after the tag verified, so a straggler from a previous
@@ -555,7 +570,7 @@ password_hash = "$argon2id$…"  # nqvpn-coord hash-password; or password = "…
 # bearer_token = "..."         # for scripts
 
 [limits]
-join_rate_per_min = 30
+join_rate_per_min = 120
 ```
 
 Networks and members are not in any file: they are created in the UI
@@ -565,7 +580,7 @@ and live in the database. `GET /api/v1/export` is their JSON form.
 ```toml
 listen    = "0.0.0.0:4444"     # one QUIC socket: clients + mesh, every network
 state_dir = "/var/lib/nqvpn-relay"
-# trust_any_cert = true        # default; false + ca = verify
+# trust_any_cert = false       # default; true skips verification only when nothing is pinned
 
 [limits]
 max_session_mbps = 0           # per attached client; 0 = what the coordinator says

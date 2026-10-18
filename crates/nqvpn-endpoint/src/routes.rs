@@ -32,6 +32,7 @@
 
 use anyhow::Result;
 use ipnet::IpNet;
+use crate::peers::RoutePolicy;
 use nqvpn_proto::control::Snapshot;
 use nqvpn_proto::types::NodeId;
 use std::collections::BTreeSet;
@@ -81,10 +82,29 @@ pub fn catch_all_halves(v6: bool) -> [IpNet; 2] {
 /// the tunnel up. An off-LAN resolver (8.8.8.8, say) therefore has to stay
 /// reachable over the real gateway, or route-all deadlocks: DNS into a
 /// tunnel that has no relay, and no relay without DNS.
+///
+/// Only resolvers that a pin can actually keep off the tunnel are
+/// returned. A loopback stub (systemd-resolved's `127.0.0.53`, dnsmasq's
+/// `127.0.0.1`) is never captured by the catch-all — and pinning it via
+/// the gateway would be wrong — so in its place we pin the upstreams the
+/// stub forwards to, from systemd-resolved's own list when it exists. A
+/// link-local resolver (`fe80::1%eth0`, `169.254.x`) lives on the LAN and
+/// its connected route already outranks the catch-all; with its scope
+/// stripped it could not be pinned anyway.
 pub fn system_resolvers() -> Vec<IpAddr> {
-    let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return Vec::new();
-    };
+    let read = |path: &str| std::fs::read_to_string(path).map(|t| parse_resolvers(&t)).unwrap_or_default();
+    let listed = read("/etc/resolv.conf");
+    let mut out: Vec<IpAddr> = listed.iter().copied().filter(|ip| pinnable_resolver(*ip)).collect();
+    if listed.iter().any(|ip| ip.is_loopback()) {
+        out.extend(read("/run/systemd/resolve/resolv.conf").into_iter().filter(|ip| pinnable_resolver(*ip)));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every `nameserver` address in a resolv.conf, scope suffix stripped.
+pub fn parse_resolvers(text: &str) -> Vec<IpAddr> {
     text.lines()
         .map(|l| l.split('#').next().unwrap_or("").trim())
         .filter_map(|l| l.strip_prefix("nameserver"))
@@ -92,14 +112,68 @@ pub fn system_resolvers() -> Vec<IpAddr> {
         .collect()
 }
 
+/// Can a host route via the default gateway keep this resolver reachable
+/// — and does it need one? Not for loopback, link-local or unspecified
+/// addresses.
+pub fn pinnable_resolver(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()),
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80),
+    }
+}
+
+/// A next hop: the gateway address and, where known, the interface it is
+/// reached through. The interface is part of the identity — an IPv6
+/// default gateway is almost always link-local (`fe80::1`), which means
+/// nothing without one (Linux refuses such a route outright), and the
+/// same IPv4 gateway address on a different interface (wired → wifi on
+/// one LAN) is a different route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Gateway {
+    pub addr: IpAddr,
+    pub ifindex: Option<u32>,
+}
+
+impl Gateway {
+    pub fn new(addr: IpAddr, ifindex: Option<u32>) -> Self {
+        Gateway { addr, ifindex }
+    }
+}
+
+impl From<IpAddr> for Gateway {
+    fn from(addr: IpAddr) -> Self {
+        Gateway { addr, ifindex: None }
+    }
+}
+
+/// `addr` or `addr%ifindex` — the journal's spelling.
+impl std::fmt::Display for Gateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.ifindex {
+            Some(i) => write!(f, "{}%{i}", self.addr),
+            None => write!(f, "{}", self.addr),
+        }
+    }
+}
+
+impl std::str::FromStr for Gateway {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s.split_once('%') {
+            Some((a, i)) => Ok(Gateway { addr: a.parse().map_err(|_| ())?, ifindex: Some(i.parse().map_err(|_| ())?) }),
+            None => Ok(Gateway { addr: s.parse().map_err(|_| ())?, ifindex: None }),
+        }
+    }
+}
+
 /// The routing-table operations underlay pinning needs, behind a trait so
 /// the rules in `reconcile_pins` are exercised without touching an OS.
 pub trait HostRouteTable {
-    fn default_gateway(&self, v6: bool) -> Option<IpAddr>;
+    fn default_gateway(&self, v6: bool) -> Option<Gateway>;
     /// `Ok(true)` when this call created the route; `Ok(false)` when an
     /// identical one was already present, and so is not ours to remove.
-    fn add_host_route(&self, ip: IpAddr, gw: IpAddr) -> std::io::Result<bool>;
-    fn del_host_route(&self, ip: IpAddr, gw: IpAddr);
+    fn add_host_route(&self, ip: IpAddr, gw: Gateway) -> std::io::Result<bool>;
+    fn del_host_route(&self, ip: IpAddr, gw: Gateway);
 }
 
 /// The pins we created — `ip -> gateway` — optionally journaled to a file
@@ -118,11 +192,12 @@ pub trait HostRouteTable {
 /// removed on its own only when the add reports the route was already
 /// present (someone else's), so the file lists exactly what we own.
 ///
-/// Format: one `ip gateway` per line; an empty journal is no file at all,
-/// which is what a clean exit leaves behind.
+/// Format: one `ip gateway` per line, the gateway optionally suffixed
+/// `%ifindex` (older journals have none); an empty journal is no file at
+/// all, which is what a clean exit leaves behind.
 pub struct PinJournal {
     path: Option<std::path::PathBuf>,
-    map: std::collections::BTreeMap<IpAddr, IpAddr>,
+    map: std::collections::BTreeMap<IpAddr, Gateway>,
 }
 
 impl PinJournal {
@@ -161,7 +236,7 @@ impl PinJournal {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
-    pub fn get(&self, ip: &IpAddr) -> Option<IpAddr> {
+    pub fn get(&self, ip: &IpAddr) -> Option<Gateway> {
         self.map.get(ip).copied()
     }
     pub fn contains_key(&self, ip: &IpAddr) -> bool {
@@ -172,14 +247,14 @@ impl PinJournal {
     }
 
     /// Journal a pin. Called *before* the route is added.
-    pub fn record(&mut self, ip: IpAddr, gw: IpAddr) {
+    pub fn record(&mut self, ip: IpAddr, gw: Gateway) {
         self.map.insert(ip, gw);
         self.persist();
     }
 
     /// Drop a pin from the journal. Called *after* the route is deleted
     /// (or when it turned out never to be ours).
-    pub fn forget(&mut self, ip: &IpAddr) -> Option<IpAddr> {
+    pub fn forget(&mut self, ip: &IpAddr) -> Option<Gateway> {
         let had = self.map.remove(ip);
         self.persist();
         had
@@ -198,19 +273,43 @@ impl PinJournal {
             }
         } else {
             let body: String = self.map.iter().map(|(ip, gw)| format!("{ip} {gw}\n")).collect();
-            let tmp = path.with_extension("tmp");
-            (|| {
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::write(&tmp, body)?;
-                std::fs::rename(&tmp, path)
-            })()
+            write_file_atomic(path, body.as_bytes())
         };
         if let Err(e) = r {
             tracing::warn!(path = %path.display(), "cannot write the pin journal: {e}");
         }
     }
+}
+
+/// Write `bytes` to `path` atomically, root-safe in a directory others
+/// might write to: a stale temp is unlinked (never followed), the new one
+/// is created exclusively (`O_EXCL` refuses a symlink, and `O_NOFOLLOW`
+/// says so twice) with its mode set at creation, and the file and its
+/// directory are fsynced before and after the rename.
+fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("tmp");
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Bring the underlay pins in line with `want` and the *current* default
@@ -242,7 +341,7 @@ pub fn reconcile_pins(table: &dyn HostRouteTable, want: &[IpAddr], pinned: &mut 
     let mut ok = Vec::new();
     for ip in want {
         let Some(gw) = table.default_gateway(ip.is_ipv6()) else {
-            tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host; withholding its family's catch-all so the tunnel is not cut off");
+            tracing::warn!(%ip, "route-all: no default gateway to pin this underlay host through; it is reported unpinned");
             continue;
         };
         match pinned.get(&ip) {
@@ -333,32 +432,67 @@ pub fn exit_gateway(view: &Snapshot, via: Option<&str>, attached: Option<NodeId>
 
 /// The route-all decision for both families at once: which catch-all
 /// halves to install in the OS table (they point at the TUN), and which
-/// exit each family's otherwise-unrouted traffic is sealed to. A family is
-/// activated only when BOTH its transport is pinned (so the tunnel's own
-/// path to the coordinator/relays is safe) AND a usable exit gateway
-/// exists for it (so traffic is not blackholed) — otherwise that family is
-/// left on the real default route, untouched.
+/// exit each family's otherwise-unrouted traffic is sealed to.
+///
+/// A family needs a usable exit gateway; without one it is left on the
+/// real default route (sealing to no exit would blackhole everything, and
+/// that is the operator's choice of exits, not a failure). With an exit,
+/// the family is activated when its pins hold — and, **failing closed**,
+/// also when they do not, as long as the tunnel survives it:
+///
+///  * every host of the family pinned: activated;
+///  * only resolvers failed to pin: activated anyway. Leaving the family
+///    on the real default route would leak *all* of its traffic (the
+///    classic IPv6 leak) to save one resolver path; DNS to that resolver
+///    now enters the tunnel and goes out the exit instead;
+///  * a transport host (coordinator, relay) failed to pin: activated only
+///    if the *other* family carries a complete, pinned transport. Its
+///    unpinned addresses of this family then break visibly — dialing
+///    falls through to the other family's addresses — instead of this
+///    family's traffic leaking. With no such fallback, activating would
+///    cut the tunnel's own path, so the family is withheld (and the caller
+///    warns loudly).
+///
+/// `transport` are the coordinator/relay addresses; `to_pin` is
+/// everything that needed a pin (transport plus resolvers, minus what a
+/// connected route already carries); `pinned` is what got one.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RouteAllPlan {
     /// Catch-all halves to add to the OS routing table.
     pub nets: Vec<IpNet>,
     /// `(is_v6, exit node)` defaults to assert in the in-VPN routing table.
     pub exits: Vec<(bool, NodeId)>,
+    /// Families activated although some of their hosts could not be
+    /// pinned (fail closed): traffic to those hosts now enters the tunnel.
+    pub failed_closed: Vec<bool>,
 }
 
 pub fn route_all_plan(
     view: &Snapshot,
     via: Option<&str>,
     attached: Option<NodeId>,
+    transport: &[IpAddr],
     to_pin: &[IpAddr],
     pinned: &[IpAddr],
 ) -> RouteAllPlan {
-    let pinned_ok = |v6: bool| to_pin.iter().filter(|ip| ip.is_ipv6() == v6).all(|ip| pinned.contains(ip));
+    let unpinned = |v6: bool| to_pin.iter().filter(move |ip| ip.is_ipv6() == v6 && !pinned.contains(ip));
+    let transport_lost = |v6: bool| unpinned(v6).any(|ip| transport.contains(ip));
+    // A family's transport is complete off-tunnel when it has some, and
+    // every one of them is pinned or carried by a connected route.
+    let transport_whole = |v6: bool| {
+        let mut fam = transport.iter().filter(|ip| ip.is_ipv6() == v6).peekable();
+        fam.peek().is_some() && fam.all(|ip| !to_pin.contains(ip) || pinned.contains(ip))
+    };
     let mut plan = RouteAllPlan::default();
     for v6 in [false, true] {
-        if let (true, Some(node)) = (pinned_ok(v6), exit_gateway(view, via, attached, v6)) {
+        let Some(node) = exit_gateway(view, via, attached, v6) else { continue };
+        let safe = !transport_lost(v6) || transport_whole(!v6);
+        if safe {
             plan.nets.extend(catch_all_halves(v6));
             plan.exits.push((v6, node));
+            if unpinned(v6).next().is_some() {
+                plan.failed_closed.push(v6);
+            }
         }
     }
     plan
@@ -366,7 +500,42 @@ pub fn route_all_plan(
 
 /// Routes the view says this node should have, before local exclusion.
 pub fn wanted_routes(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet]) -> Vec<IpNet> {
-    let mut set: BTreeSet<IpNet> = view.reserved_prefixes.iter().map(|p| p.trunc()).collect();
+    wanted(view, my_node_id, mine, None)
+}
+
+/// `wanted_routes` with a route policy: a reserved or member prefix the
+/// policy refuses is not routed (see [`refused_prefixes`] for what and
+/// why). The member's own /32 under a refused reserved range is then
+/// routed by itself if the policy permits it, so a peer the policy allows
+/// stays reachable when its covering range is refused.
+pub fn wanted_routes_with(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet], policy: &RoutePolicy) -> Vec<IpNet> {
+    wanted(view, my_node_id, mine, Some(policy))
+}
+
+/// Every published prefix — reserved, or a member's — that `policy`
+/// refuses, with the member that published it (`None` for a reserved
+/// prefix) and the reason. Exit markers are never refused here.
+pub fn refused_prefixes(view: &Snapshot, my_node_id: NodeId, policy: &RoutePolicy) -> Vec<(IpNet, Option<NodeId>, &'static str)> {
+    let mut out: Vec<(IpNet, Option<NodeId>, &'static str)> = view
+        .reserved_prefixes
+        .iter()
+        .filter_map(|p| policy.refusal(&p.trunc()).map(|why| (p.trunc(), None, why)))
+        .collect();
+    for m in view.members.iter().filter(|m| m.node_id != my_node_id) {
+        for p in &m.prefixes {
+            if let Some(why) = policy.refusal(&p.trunc()) {
+                out.push((p.trunc(), Some(m.node_id), why));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn wanted(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet], policy: Option<&RoutePolicy>) -> Vec<IpNet> {
+    let permitted = |p: &IpNet| policy.map(|pol| pol.permits(p)).unwrap_or(true);
+    let mut set: BTreeSet<IpNet> = view.reserved_prefixes.iter().map(|p| p.trunc()).filter(|p| permitted(p)).collect();
     let covers: Vec<IpNet> = set.iter().copied().collect();
     for m in &view.members {
         if m.node_id == my_node_id {
@@ -380,7 +549,7 @@ pub fn wanted_routes(view: &Snapshot, my_node_id: NodeId, mine: &[IpNet]) -> Vec
         // A member's default is the internet-exit marker, never a route:
         // route-all installs its own catch-all halves when it chooses an
         // exit, and nobody else wants the internet in the tunnel.
-        for prefix in m.prefixes.iter().filter(|p| !crate::peers::is_exit_marker(p)).map(|p| p.trunc()) {
+        for prefix in m.prefixes.iter().filter(|p| !crate::peers::is_exit_marker(p)).map(|p| p.trunc()).filter(|p| permitted(p)) {
             if !covers.iter().any(|cover| cover.contains(&prefix)) {
                 set.insert(prefix);
             }
@@ -787,15 +956,22 @@ impl NetRouteProgrammer {
         self.device.lock().unwrap().clone()
     }
 
-    /// The current default route's gateway for a family, ignoring any
-    /// default that points at our own TUN. `None` if there is none.
-    fn current_default_gateway(&self, v6: bool) -> Option<IpAddr> {
+    /// The current default route's gateway — and the interface it is
+    /// reached through — for a family, ignoring any default that points
+    /// at our own TUN or lives in a policy-routing table. With several
+    /// defaults (wired and wifi), the one the kernel prefers: lowest
+    /// metric on Linux. `None` if there is none.
+    fn current_default_gateway(&self, v6: bool) -> Option<Gateway> {
         let mytun = self.ifindex();
         let routes = self.mgr.lock().unwrap().list().ok()?;
-        routes
-            .into_iter()
-            .find(|r| r.prefix() == 0 && r.destination().is_ipv6() == v6 && r.gateway().is_some() && !self.ours(r, mytun))
-            .and_then(|r| r.gateway())
+        let candidates = routes.into_iter().filter(|r| {
+            r.prefix() == 0 && r.destination().is_ipv6() == v6 && r.gateway().is_some() && in_main_table(r) && !self.ours(r, mytun)
+        });
+        #[cfg(target_os = "linux")]
+        let best = candidates.min_by_key(|r| r.metric().unwrap_or(0));
+        #[cfg(not(target_os = "linux"))]
+        let best = { let mut c = candidates; c.next() };
+        best.and_then(|r| Some(Gateway::new(r.gateway()?, r.if_index())))
     }
 
     /// Our TUN's kernel interface index, resolved fresh each call so a
@@ -828,19 +1004,81 @@ impl NetRouteProgrammer {
     }
 
     /// Does the kernel hold exactly this host route via exactly this
-    /// gateway? `None` when the table cannot be read.
-    fn has_host_route(&self, ip: IpAddr, gw: IpAddr) -> Option<bool> {
+    /// gateway (and interface, when we know it)? `None` when the table
+    /// cannot be read.
+    fn has_host_route(&self, ip: IpAddr, gw: Gateway) -> Option<bool> {
         let bits = if ip.is_ipv6() { 128 } else { 32 };
         let routes = self.mgr.lock().unwrap().list().ok()?;
-        Some(routes.iter().any(|r| r.destination() == ip && r.prefix() == bits && r.gateway() == Some(gw)))
+        Some(routes.iter().any(|r| {
+            r.destination() == ip
+                && r.prefix() == bits
+                && r.gateway() == Some(gw.addr)
+                && (gw.ifindex.is_none() || r.if_index() == gw.ifindex)
+        }))
     }
 }
 
-/// A `/32` or `/128` host route for `ip` (no interface/gateway set yet).
+/// Is this kernel route in the main table? Linux keeps the kernel's
+/// `local`/`broadcast`/multicast entries for every interface — ours
+/// included — in the `local` table, and policy routing (VPNs, containers)
+/// adds defaults in tables of its own; none of those are routes we own,
+/// nor the default the host actually uses. `route_manager` reports the
+/// table but not the route type, so the type is filtered by prefix
+/// (`kernel_housekeeping`). macOS and the BSDs have one table, and
+/// `route_manager` already drops their local/broadcast entries.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn host_route(ip: IpAddr) -> route_manager::Route {
+fn in_main_table(r: &route_manager::Route) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const RT_TABLE_MAIN: u8 = 254;
+        r.table() == RT_TABLE_MAIN
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = r;
+        true
+    }
+}
+
+/// Routes the kernel itself keeps on any interface — multicast
+/// (`224.0.0.0/4`, `ff00::/8`) and IPv6 link-local (`fe80::/10`) — which
+/// we never install and must never remove as "stale".
+pub fn kernel_housekeeping(net: &IpNet) -> bool {
+    match net {
+        IpNet::V4(n) => n.addr().is_multicast(),
+        IpNet::V6(n) => n.addr().is_multicast() || (n.addr().segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// A `/32` or `/128` host route for `ip` via `gw`, bound to the
+/// gateway's interface when known — without it Linux refuses a
+/// link-local (`fe80::`) gateway, which is what nearly every IPv6
+/// default route has.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn host_route(ip: IpAddr, gw: Gateway) -> route_manager::Route {
     let bits = if ip.is_ipv6() { 128 } else { 32 };
-    route_manager::Route::new(ip, bits)
+    let mut r = route_manager::Route::new(ip, bits).with_gateway(gateway_for_kernel(gw));
+    if let Some(i) = gw.ifindex {
+        r = r.with_if_index(i);
+    }
+    r
+}
+
+/// The gateway address as the routing socket expects it. macOS (KAME)
+/// carries a link-local address's scope inside the address itself, in
+/// bytes 2–3, which is what `route add -inet6 … fe80::1%en0` sends;
+/// `route_manager` strips it on the way back in, so readback compares
+/// against the plain address. Linux takes the interface separately.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn gateway_for_kernel(gw: Gateway) -> IpAddr {
+    #[cfg(target_os = "macos")]
+    if let (IpAddr::V6(a), Some(idx)) = (gw.addr, gw.ifindex) {
+        let s = a.segments();
+        if (s[0] & 0xffc0) == 0xfe80 && idx <= u16::MAX as u32 {
+            return IpAddr::V6(std::net::Ipv6Addr::new(s[0], idx as u16, s[2], s[3], s[4], s[5], s[6], s[7]));
+        }
+    }
+    gw.addr
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -866,8 +1104,9 @@ impl RouteProgrammer for NetRouteProgrammer {
         Some(
             routes
                 .into_iter()
-                .filter(|r| self.ours(r, idx) && r.gateway().is_none())
+                .filter(|r| self.ours(r, idx) && r.gateway().is_none() && in_main_table(r))
                 .filter_map(|r| IpNet::new(r.destination(), r.prefix()).ok().map(|n| n.trunc()))
+                .filter(|n| !kernel_housekeeping(n))
                 .collect(),
         )
     }
@@ -880,17 +1119,17 @@ impl RouteProgrammer for NetRouteProgrammer {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl HostRouteTable for NetRouteProgrammer {
-    fn default_gateway(&self, v6: bool) -> Option<IpAddr> {
+    fn default_gateway(&self, v6: bool) -> Option<Gateway> {
         self.current_default_gateway(v6)
     }
-    fn add_host_route(&self, ip: IpAddr, gw: IpAddr) -> std::io::Result<bool> {
-        match self.mgr.lock().unwrap().add(&host_route(ip).with_gateway(gw)) {
+    fn add_host_route(&self, ip: IpAddr, gw: Gateway) -> std::io::Result<bool> {
+        match self.mgr.lock().unwrap().add(&host_route(ip, gw)) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e),
         }
     }
-    fn del_host_route(&self, ip: IpAddr, gw: IpAddr) {
+    fn del_host_route(&self, ip: IpAddr, gw: Gateway) {
         // Only the exact pair we recorded. A route to the same host via
         // another gateway is someone else's (or the kernel already replaced
         // ours when the network changed) and is left alone; the BSD delete
@@ -898,7 +1137,7 @@ impl HostRouteTable for NetRouteProgrammer {
         if self.has_host_route(ip, gw) == Some(false) {
             return;
         }
-        let _ = self.mgr.lock().unwrap().delete(&host_route(ip).with_gateway(gw));
+        let _ = self.mgr.lock().unwrap().delete(&host_route(ip, gw));
     }
 }
 
@@ -1082,22 +1321,22 @@ mod tests {
         s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.push(net("0.0.0.0/0"));
         let to_pin = [ip("203.0.113.7")];
         // Pinned transport + an exit -> the v4 halves and that exit.
-        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &to_pin);
+        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &to_pin, &to_pin);
         assert_eq!(p.nets, vec![net("0.0.0.0/1"), net("128.0.0.0/1")]);
         assert_eq!(p.exits, vec![(false, 3)]);
         // Transport not pinned -> nothing at all, even with an exit, so
         // route-all never severs the tunnel's own path.
-        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &[]);
+        let p = route_all_plan(&s, Some("gw"), None, &to_pin, &to_pin, &[]);
         assert_eq!(p, RouteAllPlan::default());
         // The preferred node is not a usable exit -> fall back to one that
         // is, rather than leaving the client with no internet at all.
-        let p = route_all_plan(&s, Some("nope"), None, &to_pin, &to_pin);
+        let p = route_all_plan(&s, Some("nope"), None, &to_pin, &to_pin, &to_pin);
         assert_eq!(p.exits, vec![(false, 3)], "--via is a preference, not a pin");
         // Nothing owns a default anywhere -> withheld (no blackhole).
-        let p = route_all_plan(&view(), Some("gw"), None, &to_pin, &to_pin);
+        let p = route_all_plan(&view(), Some("gw"), None, &to_pin, &to_pin, &to_pin);
         assert_eq!(p, RouteAllPlan::default());
         // v4 has an exit, v6 does not: only v4 activates.
-        let p = route_all_plan(&s, None, None, &to_pin, &to_pin);
+        let p = route_all_plan(&s, None, None, &to_pin, &to_pin, &to_pin);
         assert_eq!(p.exits, vec![(false, 3)], "the v6 family is left alone");
     }
 
@@ -1184,20 +1423,20 @@ mod tests {
     }
 
     impl HostRouteTable for FakeTable {
-        fn default_gateway(&self, _v6: bool) -> Option<IpAddr> {
-            *self.gw.lock().unwrap()
+        fn default_gateway(&self, _v6: bool) -> Option<Gateway> {
+            self.gw.lock().unwrap().map(Gateway::from)
         }
-        fn add_host_route(&self, i: IpAddr, gw: IpAddr) -> std::io::Result<bool> {
-            self.journaled_at_add.lock().unwrap().push(self.journal_lists(i, gw));
-            if self.preexisting.lock().unwrap().contains(&(i, gw)) {
+        fn add_host_route(&self, i: IpAddr, gw: Gateway) -> std::io::Result<bool> {
+            self.journaled_at_add.lock().unwrap().push(self.journal_lists(i, gw.addr));
+            if self.preexisting.lock().unwrap().contains(&(i, gw.addr)) {
                 return Ok(false);
             }
-            self.added.lock().unwrap().push((i, gw));
+            self.added.lock().unwrap().push((i, gw.addr));
             Ok(true)
         }
-        fn del_host_route(&self, i: IpAddr, gw: IpAddr) {
-            self.journaled_at_del.lock().unwrap().push(self.journal_lists(i, gw));
-            self.deleted.lock().unwrap().push((i, gw));
+        fn del_host_route(&self, i: IpAddr, gw: Gateway) {
+            self.journaled_at_del.lock().unwrap().push(self.journal_lists(i, gw.addr));
+            self.deleted.lock().unwrap().push((i, gw.addr));
         }
     }
 
@@ -1215,7 +1454,7 @@ mod tests {
         let want = [ip("3.1.237.225"), ip("8.8.8.8")];
         let ok = reconcile_pins(&t, &want, &mut pinned);
         assert_eq!(ok.len(), 2);
-        assert_eq!(pinned.get(&ip("8.8.8.8")), Some(ip("192.168.1.1")));
+        assert_eq!(pinned.get(&ip("8.8.8.8")), Some(ip("192.168.1.1").into()));
 
         // Same want set, new gateway: every pin is re-pointed, not skipped.
         *t.gw.lock().unwrap() = Some(ip("10.0.0.1"));
@@ -1224,7 +1463,7 @@ mod tests {
         for host in want {
             assert!(t.deleted.lock().unwrap().contains(&(host, ip("192.168.1.1"))), "{host} unpinned from the old gateway");
             assert!(t.added.lock().unwrap().contains(&(host, ip("10.0.0.1"))), "{host} re-pinned to the new gateway");
-            assert_eq!(pinned.get(&host), Some(ip("10.0.0.1")));
+            assert_eq!(pinned.get(&host), Some(ip("10.0.0.1").into()));
         }
 
         // Steady state: nothing is touched when the gateway is unchanged.
@@ -1267,7 +1506,7 @@ mod tests {
         let mut pinned = PinJournal::in_memory();
         let ok = reconcile_pins(&t, &[ip("3.1.237.225")], &mut pinned);
         assert!(ok.is_empty() && pinned.is_empty());
-        let plan = route_all_plan(&view(), None, None, &[ip("3.1.237.225")], &ok);
+        let plan = route_all_plan(&view(), None, None, &[ip("3.1.237.225")], &[ip("3.1.237.225")], &ok);
         assert!(plan.nets.is_empty(), "an unpinned transport must never arm a catch-all");
     }
 
@@ -1574,4 +1813,154 @@ mod tests {
         assert_eq!(set.programmer.calls.lock().unwrap().clone(), vec!["add 10.99.1.1/32", "add 10.99.1.2/32"]);
     }
 
+    /// The IPv6 leak this guards: every IPv6 pin failed (a link-local
+    /// gateway with no interface), so route-all withheld the v6 halves and
+    /// all IPv6 left outside the tunnel. A family whose failed pins are
+    /// only resolvers — or whose transport the other family can carry —
+    /// now fails closed instead.
+    #[test]
+    fn route_all_fails_closed_for_a_family_whose_pins_failed_when_the_tunnel_survives_it() {
+        let mut s = view();
+        let gw = s.members.iter_mut().find(|m| m.node_id == 3).unwrap();
+        gw.prefixes.extend([net("0.0.0.0/0"), net("::/0")]);
+        let (relay4, relay6, dns6) = (ip("203.0.113.7"), ip("2001:db8::7"), ip("2001:4860:4860::8888"));
+
+        // Only a v6 resolver failed: v6 is activated anyway, and said so.
+        let to_pin = [relay4, dns6];
+        let p = route_all_plan(&s, None, None, &[relay4], &to_pin, &[relay4]);
+        assert!(p.nets.contains(&net("::/1")) && p.nets.contains(&net("8000::/1")), "v6 fails closed: {p:?}");
+        assert_eq!(p.failed_closed, vec![true]);
+
+        // The v6 relay address failed but v4 carries a whole transport:
+        // v6 is activated; dialing falls through to the v4 address.
+        let to_pin = [relay4, relay6];
+        let p = route_all_plan(&s, None, None, &[relay4, relay6], &to_pin, &[relay4]);
+        assert_eq!(p.exits, vec![(false, 3), (true, 3)]);
+        assert_eq!(p.failed_closed, vec![true]);
+
+        // The only transport is v6 and it failed: activating v6 would cut
+        // the tunnel's own path, so v6 is withheld.
+        let p = route_all_plan(&s, None, None, &[relay6], &[relay6], &[]);
+        assert!(p.exits.iter().all(|(v6, _)| !v6), "no fallback transport: withheld, {p:?}");
+
+        // Both families' transport failed: nothing can be armed safely.
+        let p = route_all_plan(&s, None, None, &[relay4, relay6], &[relay4, relay6], &[]);
+        assert_eq!(p, RouteAllPlan::default());
+
+        // A transport host on the LAN needs no pin and counts as whole.
+        let lan_relay = ip("192.168.1.9");
+        let p = route_all_plan(&s, None, None, &[lan_relay, relay6], &[relay6], &[]);
+        assert_eq!(p.exits, vec![(false, 3), (true, 3)], "v6 falls back onto the LAN-local v4 relay");
+    }
+
+    #[test]
+    fn loopback_and_link_local_resolvers_are_never_pinned() {
+        let conf = "# generated\nnameserver 127.0.0.53\nnameserver 8.8.8.8 # upstream\nnameserver fe80::1%eth0\nnameserver 169.254.169.254\nnameserver ::1\nnameserver 2001:4860:4860::8888\noptions edns0\n";
+        let all = parse_resolvers(conf);
+        assert_eq!(all.len(), 6);
+        let pinnable: Vec<IpAddr> = all.into_iter().filter(|ip| pinnable_resolver(*ip)).collect();
+        assert_eq!(pinnable, vec![ip("8.8.8.8"), ip("2001:4860:4860::8888")]);
+    }
+
+    #[test]
+    fn a_gateway_round_trips_through_the_journal_with_its_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins");
+        let mut j = PinJournal::load(path.clone());
+        let ll = Gateway::new(ip("fe80::1"), Some(3));
+        j.record(ip("2001:db8::7"), ll);
+        j.record(ip("203.0.113.7"), Gateway::new(ip("192.168.1.1"), Some(2)));
+        let mut lines = journal_lines(&path);
+        lines.sort();
+        assert_eq!(lines, vec!["2001:db8::7 fe80::1%3", "203.0.113.7 192.168.1.1%2"]);
+        let back = PinJournal::load(path.clone());
+        assert_eq!(back.get(&ip("2001:db8::7")), Some(ll));
+        // An older journal, gateways without an interface, still loads.
+        std::fs::write(&path, "8.8.8.8 192.168.1.1\n").unwrap();
+        assert_eq!(PinJournal::load(path).get(&ip("8.8.8.8")), Some(ip("192.168.1.1").into()));
+    }
+
+    #[test]
+    fn a_pin_moves_when_the_gateway_is_the_same_address_on_another_interface() {
+        // Wired -> wifi on the same LAN: same gateway address, different
+        // interface. The old pin is bound to the interface that went away.
+        struct IfTable {
+            gw: Mutex<Gateway>,
+            added: Mutex<Vec<(IpAddr, Gateway)>>,
+            deleted: Mutex<Vec<(IpAddr, Gateway)>>,
+        }
+        impl HostRouteTable for IfTable {
+            fn default_gateway(&self, _v6: bool) -> Option<Gateway> {
+                Some(*self.gw.lock().unwrap())
+            }
+            fn add_host_route(&self, i: IpAddr, gw: Gateway) -> std::io::Result<bool> {
+                self.added.lock().unwrap().push((i, gw));
+                Ok(true)
+            }
+            fn del_host_route(&self, i: IpAddr, gw: Gateway) {
+                self.deleted.lock().unwrap().push((i, gw));
+            }
+        }
+        let wired = Gateway::new(ip("192.168.1.1"), Some(2));
+        let wifi = Gateway::new(ip("192.168.1.1"), Some(3));
+        let t = IfTable { gw: Mutex::new(wired), added: Mutex::new(vec![]), deleted: Mutex::new(vec![]) };
+        let mut pinned = PinJournal::in_memory();
+        reconcile_pins(&t, &[ip("8.8.8.8")], &mut pinned);
+        *t.gw.lock().unwrap() = wifi;
+        reconcile_pins(&t, &[ip("8.8.8.8")], &mut pinned);
+        assert_eq!(*t.deleted.lock().unwrap(), vec![(ip("8.8.8.8"), wired)]);
+        assert_eq!(t.added.lock().unwrap().last(), Some(&(ip("8.8.8.8"), wifi)));
+    }
+
+    #[test]
+    fn the_route_policy_shapes_os_routes_and_says_what_it_refused() {
+        let mut s = view();
+        // gw also claims a slice of the internet and an unlisted range.
+        s.members.iter_mut().find(|m| m.node_id == 3).unwrap().prefixes.extend([net("8.0.0.0/7"), net("172.16.0.0/12")]);
+        s.reserved_prefixes.push(net("100.0.0.0/6"));
+        let mine = [net("10.99.1.1/32")];
+
+        // No allowlist: only what is wider than /8 is refused.
+        let open = RoutePolicy::default();
+        let w = wanted_routes_with(&s, 1, &mine, &open);
+        assert!(w.contains(&net("172.16.0.0/12")), "a site gateway's wide range is fine");
+        assert!(!w.contains(&net("8.0.0.0/7")) && !w.contains(&net("100.0.0.0/6")));
+        let refused: Vec<IpNet> = refused_prefixes(&s, 1, &open).into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(refused, vec![net("8.0.0.0/7"), net("100.0.0.0/6")]);
+        // The unfiltered function (used by relays) is unchanged.
+        assert!(wanted_routes(&s, 1, &mine).contains(&net("8.0.0.0/7")));
+
+        // An allowlist: only what lies inside it, reserved or member. A
+        // member host under a refused reserved range is routed by itself.
+        let listed = RoutePolicy::allow_list(vec![net("10.99.1.0/24"), net("192.168.7.0/24")]);
+        let w = wanted_routes_with(&s, 1, &mine, &listed);
+        assert!(!w.contains(&net("10.99.0.0/16")), "the reserved range is wider than the allowlist");
+        assert!(w.contains(&net("10.99.1.2/32")), "but the allowed peer inside it stays reachable");
+        assert!(w.contains(&net("192.168.7.0/24")));
+        assert!(!w.contains(&net("172.16.0.0/12")) && !w.contains(&net("192.168.9.0/24")));
+    }
+
+    #[test]
+    fn kernel_housekeeping_routes_on_the_tun_are_not_ours() {
+        assert!(kernel_housekeeping(&net("ff00::/8")));
+        assert!(kernel_housekeeping(&net("fe80::/64")));
+        assert!(kernel_housekeeping(&net("224.0.0.0/4")));
+        assert!(!kernel_housekeeping(&net("fd00:99::/64")));
+        assert!(!kernel_housekeeping(&net("10.99.0.0/16")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pin_journal_is_never_written_through_a_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let path = dir.path().join("pins");
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+        let mut j = PinJournal::load(path.clone());
+        j.record(ip("8.8.8.8"), ip("192.168.1.1").into());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(journal_lines(&path), vec!["8.8.8.8 192.168.1.1"]);
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_file());
+    }
 }

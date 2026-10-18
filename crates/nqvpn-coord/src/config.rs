@@ -24,7 +24,7 @@ pub struct CoordConfig {
     pub listen: ListenCfg,
     /// A real certificate for the HTTPS API and QUIC control port. Unset
     /// means a self-signed one is generated into the state dir on first
-    /// start — members accept it by default (`trust_any_cert = true`).
+    /// start — members verify it by the fingerprint in their token.
     #[serde(default)]
     pub tls: Option<TlsCfg>,
     pub state: StateCfg,
@@ -112,9 +112,19 @@ impl Default for LimitsCfg {
     }
 }
 
+/// Per source address (an IPv6 source by its /64). Generous because a
+/// settings change makes every connected member re-join at once, and a
+/// site's members often share one NAT address; a member refused here
+/// retries with backoff.
 fn default_join_rate() -> u32 {
-    30
+    120
 }
+
+/// Upper bound for `credential_ttl_mins`: a week.
+pub const MAX_CREDENTIAL_TTL_MINS: u64 = 7 * 24 * 60;
+
+/// The shortest static bearer token accepted.
+pub const MIN_BEARER_TOKEN_LEN: usize = 32;
 
 // ---- per-network ----
 
@@ -418,6 +428,62 @@ pub fn load_coord_config(path: &Path) -> Result<CoordConfig> {
 /// masked off to the network address (`172.26.0.0/20`) here, before any
 /// overlap check runs against it.
 pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
+    validate_network_with(cfg, &HostCache::default())
+}
+
+/// Relay hostnames resolved ahead of time, so validation under a network
+/// lock does not wait on DNS. A name not in the cache is resolved on the
+/// spot (the cache is a prefetch, never a substitute for the check).
+#[derive(Debug, Default)]
+pub struct HostCache(BTreeMap<(String, u16), Vec<IpAddr>>);
+
+impl HostCache {
+    /// Resolve every relay hostname `cfg` names. Call without any lock.
+    pub fn prefetch(cfg: &NetworkConfig) -> HostCache {
+        let mut cache = HostCache::default();
+        for m in cfg.relays.values() {
+            let Some(addr) = m.relay_addr.as_deref() else { continue };
+            if let Some((host, port)) = split_host_port(addr) {
+                if host.parse::<IpAddr>().is_err() {
+                    let ips = resolve_host(host, port);
+                    cache.0.insert((host.to_string(), port), ips);
+                }
+            }
+        }
+        cache
+    }
+
+    fn lookup(&self, host: &str, port: u16) -> Vec<IpAddr> {
+        match self.0.get(&(host.to_string(), port)) {
+            Some(ips) => ips.clone(),
+            None => resolve_host(host, port),
+        }
+    }
+}
+
+fn resolve_host(host: &str, port: u16) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    match (host, port).to_socket_addrs() {
+        Ok(it) => it.map(|s| s.ip()).collect(),
+        // Unresolvable now is not a planning bug (DNS may be down at
+        // boot); dialers will report it.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `host:port` / `[v6]:port`, host without brackets. `None` for
+/// `auto:<port>` and anything malformed.
+fn split_host_port(addr: &str) -> Option<(&str, u16)> {
+    if addr.starts_with("auto:") {
+        return None;
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    Some((host.trim_start_matches('[').trim_end_matches(']'), port))
+}
+
+/// `validate_network` with relay hostnames looked up in `hosts` first.
+pub fn validate_network_with(cfg: &mut NetworkConfig, hosts: &HostCache) -> Result<()> {
     for c in &mut cfg.cidrs {
         *c = c.trunc();
     }
@@ -447,6 +513,13 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
     }
     if s.credential_ttl_mins == 0 || s.heartbeat_secs == 0 || s.offline_after == 0 {
         bail!("network {}: credential_ttl_mins, heartbeat_secs and offline_after must be > 0", cfg.network_id);
+    }
+    if s.credential_ttl_mins > MAX_CREDENTIAL_TTL_MINS {
+        bail!(
+            "network {}: credential_ttl_mins {} is outside 1..={MAX_CREDENTIAL_TTL_MINS} (a week)",
+            cfg.network_id,
+            s.credential_ttl_mins
+        );
     }
     if s.mtu < 1280 || s.mtu > 9000 {
         bail!("network {}: mtu {} is outside 1280..=9000", cfg.network_id, s.mtu);
@@ -483,6 +556,12 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
             if s.trim().is_empty() {
                 bail!("member {name}: secret must not be empty");
             }
+            if !crate::secrets::plausible_secret(s.trim()) {
+                bail!(
+                    "member {name}: a secret is 1-{} characters of [A-Za-z0-9_-] (rotate to generate one)",
+                    crate::secrets::MAX_SECRET_LEN
+                );
+            }
         }
         if !is_relay {
             if m.relay_addr.is_some() || !m.local_cidrs.is_empty() || m.max_session_mbps.is_some() || m.internet_gateway == Some(true) {
@@ -504,7 +583,7 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
                 .relay_addr
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("relay {name}: relay_addr is required"))?;
-            validate_relay_addr(name, addr, cfg)?;
+            validate_relay_addr(name, addr, cfg, hosts)?;
             for c in &m.local_cidrs {
                 // Host bits were masked off above; every c is a network address now.
                 for t in &cfg.cidrs {
@@ -545,6 +624,12 @@ pub fn validate_network(cfg: &mut NetworkConfig) -> Result<()> {
             }
             if !cfg.cidrs.iter().any(|c| c.contains(&IpAddr::V4(ip))) {
                 bail!("member {name}: preferred_ip4 {ip} is outside this network's tunnel CIDRs");
+            }
+            // The network and broadcast addresses of the IPv4 range are
+            // not host addresses (a /31 or /32 has neither).
+            let v4 = cfg.ipv4_cidr();
+            if v4.prefix_len() < 31 && (ip == v4.network() || ip == v4.broadcast()) {
+                bail!("member {name}: preferred_ip4 {ip} is the network or broadcast address of {v4}");
             }
             if let Some(prev) = seen4.insert(ip, name.clone()) {
                 bail!("preferred_ip4 {ip} claimed by both {prev} and {name}");
@@ -588,7 +673,7 @@ fn unroutable(ip: IpAddr) -> bool {
 /// link-local, and anything inside VPN-routed space. Hostnames are
 /// resolved here as well, so a name pointing at tunnel space is caught
 /// at load rather than when every dialer loops into its own TUN.
-fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()> {
+fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig, hosts: &HostCache) -> Result<()> {
     if let Some(port) = addr.strip_prefix("auto:") {
         port.parse::<u16>()
             .map_err(|_| anyhow::anyhow!("relay {name}: relay_addr {addr:?} must be auto:<port>"))?;
@@ -603,35 +688,36 @@ fn validate_relay_addr(name: &str, addr: &str, cfg: &NetworkConfig) -> Result<()
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
-        Err(_) => {
-            use std::net::ToSocketAddrs;
-            match (host, port).to_socket_addrs() {
-                Ok(it) => it.map(|s| s.ip()).collect(),
-                // Unresolvable now is not a planning bug (DNS may be
-                // down at boot); dialers will report it.
-                Err(_) => Vec::new(),
-            }
-        }
+        Err(_) => hosts.lookup(host, port),
     };
     for ip in ips {
-        if cfg.settings.allow_loopback_relays && ip.is_loopback() {
-            continue;
-        }
-        if unroutable(ip) {
-            bail!("relay {name}: relay_addr {addr:?} resolves to an unroutable address {ip}");
-        }
-        if cfg.cidrs.iter().any(|c| c.contains(&ip)) {
-            bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside tunnel space");
-        }
-        let in_lan = cfg
-            .relays
-            .values()
-            .chain(cfg.clients.values())
-            .flat_map(|m| m.local_cidrs.iter())
-            .any(|c| c.contains(&ip));
-        if in_lan {
-            bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside a routed LAN prefix");
-        }
+        check_relay_ip(name, addr, ip, cfg)?;
+    }
+    Ok(())
+}
+
+/// One concrete relay endpoint address against the endpoint rules: also
+/// applied at join time to the source address an `auto:<port>` relay
+/// joins from. An IPv4-mapped IPv6 address is judged as its IPv4 address.
+pub fn check_relay_ip(name: &str, addr: &str, ip: IpAddr, cfg: &NetworkConfig) -> Result<()> {
+    let ip = ip.to_canonical();
+    if cfg.settings.allow_loopback_relays && ip.is_loopback() {
+        return Ok(());
+    }
+    if unroutable(ip) {
+        bail!("relay {name}: relay_addr {addr:?} resolves to an unroutable address {ip}");
+    }
+    if cfg.cidrs.iter().any(|c| c.contains(&ip)) {
+        bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside tunnel space");
+    }
+    let in_lan = cfg
+        .relays
+        .values()
+        .chain(cfg.clients.values())
+        .flat_map(|m| m.local_cidrs.iter())
+        .any(|c| c.contains(&ip));
+    if in_lan {
+        bail!("relay {name}: relay_addr {addr:?} ({ip}) lies inside a routed LAN prefix");
     }
     Ok(())
 }
@@ -663,15 +749,25 @@ pub fn resolve_admin_password(cfg: &mut AdminCfg) -> Result<()> {
     Ok(())
 }
 
+/// The static admin bearer token, if configured. A short one is refused
+/// outright: it is a full admin credential, compared on every request,
+/// and an empty one would otherwise sit one blank header away from
+/// matching.
 pub fn read_bearer_token(cfg: &AdminCfg) -> Result<Option<String>> {
-    if let Some(t) = &cfg.bearer_token {
-        return Ok(Some(t.trim().to_string()));
+    let token = if let Some(t) = &cfg.bearer_token {
+        t.trim().to_string()
+    } else if let Some(f) = &cfg.bearer_token_file {
+        std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?.trim().to_string()
+    } else {
+        return Ok(None);
+    };
+    if token.len() < MIN_BEARER_TOKEN_LEN {
+        bail!(
+            "[admin] bearer token must be at least {MIN_BEARER_TOKEN_LEN} characters (got {}); e.g. `openssl rand -base64 33`",
+            token.len()
+        );
     }
-    if let Some(f) = &cfg.bearer_token_file {
-        let t = std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?;
-        return Ok(Some(t.trim().to_string()));
-    }
-    Ok(None)
+    Ok(Some(token))
 }
 
 #[cfg(test)]
@@ -890,5 +986,55 @@ secret = "s"
         let mut s = base();
         s.push_str("[settings]\nmtu = 100\n");
         assert!(validate_network(&mut parse(&s)).is_err());
+        let mut s = base();
+        s.push_str(&format!("[settings]\ncredential_ttl_mins = {}\n", MAX_CREDENTIAL_TTL_MINS + 1));
+        assert!(validate_network(&mut parse(&s)).is_err(), "no unbounded credential lifetime");
+        let mut s = base();
+        s.push_str(&format!("[settings]\ncredential_ttl_mins = {MAX_CREDENTIAL_TTL_MINS}\n"));
+        validate_network(&mut parse(&s)).unwrap();
+    }
+
+    #[test]
+    fn the_network_and_broadcast_addresses_are_not_member_addresses() {
+        for ip in ["10.99.0.0", "10.99.255.255"] {
+            let mut s = base();
+            s.push_str(&format!("[clients.c2]\npreferred_ip4 = \"{ip}\"\n"));
+            assert!(validate_network(&mut parse(&s)).is_err(), "{ip}");
+        }
+        let mut s = base();
+        s.push_str("[clients.c2]\npreferred_ip4 = \"10.99.255.254\"\n");
+        validate_network(&mut parse(&s)).unwrap();
+    }
+
+    #[test]
+    fn a_secret_must_look_like_one() {
+        let mut s = base();
+        s.push_str("[clients.c2]\nsecret = \"has a space\"\n");
+        assert!(validate_network(&mut parse(&s)).is_err());
+        let mut s = base();
+        s.push_str(&format!("[clients.c2]\nsecret = \"{}\"\n", "x".repeat(crate::secrets::MAX_SECRET_LEN + 1)));
+        assert!(validate_network(&mut parse(&s)).is_err());
+    }
+
+    #[test]
+    fn a_short_or_empty_bearer_token_is_refused_at_load() {
+        for t in ["", "   ", "short-token"] {
+            let a = AdminCfg { bearer_token: Some(t.into()), ..Default::default() };
+            assert!(read_bearer_token(&a).is_err(), "{t:?}");
+        }
+        let long = "x".repeat(MIN_BEARER_TOKEN_LEN);
+        let a = AdminCfg { bearer_token: Some(format!(" {long}\n")), ..Default::default() };
+        assert_eq!(read_bearer_token(&a).unwrap().as_deref(), Some(long.as_str()));
+        assert!(read_bearer_token(&AdminCfg::default()).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_relay_endpoint_ip_is_judged_canonically() {
+        let cfg = parse(&base());
+        let mapped: IpAddr = "::ffff:10.99.0.7".parse().unwrap();
+        assert!(check_relay_ip("r", "auto:1", mapped, &cfg).is_err(), "a mapped tunnel address is a tunnel address");
+        assert!(check_relay_ip("r", "auto:1", "::ffff:127.0.0.1".parse().unwrap(), &cfg).is_err());
+        assert!(check_relay_ip("r", "auto:1", "192.168.1.9".parse().unwrap(), &cfg).is_err(), "inside a routed LAN");
+        check_relay_ip("r", "auto:1", "::ffff:203.0.113.5".parse().unwrap(), &cfg).unwrap();
     }
 }

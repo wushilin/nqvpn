@@ -152,3 +152,62 @@ async fn datagram_mode_has_no_lanes_and_ignores_the_label() {
     assert_eq!(pkt[0], 7);
     assert_eq!(lane, 0, "datagrams always report the default lane");
 }
+
+#[tokio::test]
+async fn an_oversized_packet_is_refused_and_counted_not_truncated() {
+    use nqvpn_proto::transport::MAX_LANE_FRAME;
+    let (server, client) = pair(Mode::Stream, 1).await;
+    assert!(!client.send_on(vec![0u8; MAX_LANE_FRAME + 1].into(), 0), "too big for a lane");
+    assert!(!client.send_on(vec![0u8; 70_000].into(), 0), "too big for the length prefix");
+    assert_eq!(client.too_large(), 2);
+    assert_eq!(client.dropped(), 2);
+    // A full-size frame still goes through, and nothing corrupt preceded it.
+    assert!(client.send_on(vec![9u8; MAX_LANE_FRAME].into(), 0));
+    let (pkt, _) = tokio::time::timeout(Duration::from_secs(5), server.recv())
+        .await
+        .expect("no timeout")
+        .expect("packet");
+    assert_eq!(pkt.len(), MAX_LANE_FRAME);
+}
+
+#[tokio::test]
+async fn a_receiver_skips_an_oversized_frame_and_stays_in_sync() {
+    use nqvpn_proto::transport::MAX_LANE_FRAME;
+    // A peer that writes its own frames: one declared at 65535 bytes
+    // (what the prefix allows, far past any MTU), then a normal one.
+    let server_id = TlsIdentity::generate("server").unwrap();
+    let client_id = TlsIdentity::generate("client").unwrap();
+    let fp = server_id.fingerprint();
+    let endpoint = quinn::Endpoint::server(server_config(&server_id, 30).unwrap(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let held = endpoint;
+        let chan = PacketChannel::start_lanes(conn.clone(), Mode::Stream, 1);
+        tokio::spawn(async move {
+            conn.closed().await;
+            drop(held);
+        });
+        chan
+    });
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(client_config(&client_id, Some(fp), 30).unwrap());
+    let conn = ep.connect(addr, "server").unwrap().await.unwrap();
+    std::mem::forget(ep);
+    let server = accept.await.unwrap();
+
+    let mut tx = conn.open_uni().await.unwrap();
+    tx.write_all(&[0u8]).await.unwrap(); // lane 0
+    assert!(u16::MAX as usize > MAX_LANE_FRAME);
+    tx.write_all(&u16::MAX.to_be_bytes()).await.unwrap();
+    tx.write_all(&vec![0xEE; u16::MAX as usize]).await.unwrap();
+    tx.write_all(&3u16.to_be_bytes()).await.unwrap();
+    tx.write_all(&[1, 2, 3]).await.unwrap();
+
+    let (pkt, _) = tokio::time::timeout(Duration::from_secs(5), server.recv())
+        .await
+        .expect("no timeout")
+        .expect("packet");
+    assert_eq!(&pkt[..], &[1, 2, 3], "the frame after the oversized one arrives intact");
+    assert_eq!(server.too_large(), 1);
+}

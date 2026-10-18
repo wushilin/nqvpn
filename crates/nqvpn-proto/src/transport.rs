@@ -30,6 +30,8 @@
 //! upgrade safe.
 
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 /// How tunneled packets cross a QUIC connection.
@@ -63,6 +65,14 @@ impl Mode {
 const SEND_QUEUE: usize = 1024;
 /// Packets are MTU-sized, so a 16-bit length prefix is ample.
 const LEN_PREFIX: usize = 2;
+/// Largest tunnel MTU a network may be configured with (the coordinator
+/// refuses more).
+pub const MAX_TUNNEL_MTU: usize = 9000;
+/// Largest frame a lane carries: a full-size sealed packet plus slack
+/// for the small control frames (handshakes, trace notes). The 16-bit
+/// prefix could say 65535; nothing legitimate comes near that, and a
+/// reader must not allocate what a peer merely declares.
+pub const MAX_LANE_FRAME: usize = MAX_TUNNEL_MTU + crate::quic::FRAME_OVERHEAD + 256;
 /// Upper bound on lanes, so a bad config cannot open unbounded streams.
 pub const MAX_LANES: u8 = 32;
 
@@ -80,17 +90,31 @@ pub struct PacketChannel {
     /// Inbound packets and the lane each arrived on, fed by reader tasks
     /// in both modes so callers see one interface.
     inbox: Mutex<mpsc::Receiver<(Bytes, u8)>>,
-    dropped: std::sync::atomic::AtomicU64,
-    /// Sends refused because the packet exceeded the path MTU. Counted
-    /// apart from ordinary drops: this one means our tunnel MTU is
-    /// misconfigured for this path, which a human must fix, whereas a
-    /// generic drop is congestion doing its job.
-    too_large: std::sync::atomic::AtomicU64,
+    /// Shared with the lane tasks, which drop frames too.
+    counters: Arc<Counters>,
+}
+
+#[derive(Default)]
+struct Counters {
+    dropped: AtomicU64,
+    /// Packets refused because they exceeded the path MTU (datagrams) or
+    /// the lane frame cap (streams), in either direction. Counted apart
+    /// from ordinary drops: this one means a tunnel MTU is misconfigured,
+    /// which a human must fix, whereas a generic drop is congestion doing
+    /// its job.
+    too_large: AtomicU64,
+}
+
+impl Counters {
+    fn oversized(&self) {
+        self.too_large.fetch_add(1, Ordering::Relaxed);
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl PacketChannel {
     /// Start carrying packets on `conn` with a single lane.
-    pub fn start(conn: quinn::Connection, mode: Mode) -> std::sync::Arc<PacketChannel> {
+    pub fn start(conn: quinn::Connection, mode: Mode) -> Arc<PacketChannel> {
         PacketChannel::start_lanes(conn, mode, 1)
     }
 
@@ -101,8 +125,9 @@ impl PacketChannel {
         conn: quinn::Connection,
         mode: Mode,
         lanes: u8,
-    ) -> std::sync::Arc<PacketChannel> {
+    ) -> Arc<PacketChannel> {
         let (in_tx, in_rx) = mpsc::channel::<(Bytes, u8)>(SEND_QUEUE);
+        let counters = Arc::new(Counters::default());
         let out = match mode {
             Mode::Datagram => {
                 let c = conn.clone();
@@ -141,9 +166,11 @@ impl PacketChannel {
                 // different lane count interoperate without negotiating.
                 let c = conn.clone();
                 let tx = in_tx.clone();
+                let ctr = counters.clone();
                 tokio::spawn(async move {
                     while let Ok(mut rx) = c.accept_uni().await {
                         let tx = tx.clone();
+                        let ctr = ctr.clone();
                         tokio::spawn(async move {
                             // Each lane names itself once, at open. Accept
                             // order would not be reliable enough to infer
@@ -160,6 +187,17 @@ impl PacketChannel {
                                     return;
                                 }
                                 let len = u16::from_be_bytes(header) as usize;
+                                if len > MAX_LANE_FRAME {
+                                    // Skip it without buffering it: the
+                                    // lane stays in sync and the rest of
+                                    // its flows keep moving.
+                                    ctr.oversized();
+                                    tracing::debug!(len, lane, "dropping oversized lane frame");
+                                    if skip(&mut rx, len).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 let mut buf = vec![0u8; len];
                                 if len > 0 && rx.read_exact(&mut buf).await.is_err() {
                                     return;
@@ -185,17 +223,23 @@ impl PacketChannel {
                     .map(|lane| {
                         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(per_lane);
                         let c = conn.clone();
+                        let ctr = counters.clone();
                         tokio::spawn(async move {
                             let Ok(mut tx) = c.open_uni().await else { return };
                             if tx.write_all(&[lane]).await.is_err() {
                                 return;
                             }
                             while let Some(pkt) = out_rx.recv().await {
-                                let len = pkt.len().min(u16::MAX as usize) as u16;
+                                // `send_on` already refuses these; never
+                                // truncate one into a corrupt frame.
+                                let Ok(len) = u16::try_from(pkt.len()) else {
+                                    ctr.oversized();
+                                    continue;
+                                };
                                 if tx.write_all(&len.to_be_bytes()).await.is_err() {
                                     return;
                                 }
-                                if tx.write_all(&pkt[..len as usize]).await.is_err() {
+                                if tx.write_all(&pkt).await.is_err() {
                                     return;
                                 }
                             }
@@ -205,13 +249,12 @@ impl PacketChannel {
                     .collect()
             }
         };
-        std::sync::Arc::new(PacketChannel {
+        Arc::new(PacketChannel {
             mode,
             conn,
             lanes: out,
             inbox: Mutex::new(in_rx),
-            dropped: std::sync::atomic::AtomicU64::new(0),
-            too_large: std::sync::atomic::AtomicU64::new(0),
+            counters,
         })
     }
 
@@ -236,11 +279,11 @@ impl PacketChannel {
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.counters.dropped.load(Ordering::Relaxed)
     }
 
     pub fn too_large(&self) -> u64 {
-        self.too_large.load(std::sync::atomic::Ordering::Relaxed)
+        self.counters.too_large.load(Ordering::Relaxed)
     }
 
     /// Largest inner packet this connection can carry right now.
@@ -268,11 +311,14 @@ impl PacketChannel {
         if self.mode == Mode::Datagram {
             if let Some(max) = self.conn.max_datagram_size() {
                 if packet.len() > max {
-                    self.too_large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.counters.oversized();
                     return false;
                 }
             }
+        } else if packet.len() > MAX_LANE_FRAME {
+            // The peer would only skip it; do not spend the bandwidth.
+            self.counters.oversized();
+            return false;
         }
         let ok = if self.lanes.is_empty() {
             self.mode == Mode::Datagram && self.conn.send_datagram(packet).is_ok()
@@ -280,7 +326,7 @@ impl PacketChannel {
             self.lanes[lane as usize % self.lanes.len()].try_send(packet).is_ok()
         };
         if !ok {
-            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters.dropped.fetch_add(1, Ordering::Relaxed);
         }
         ok
     }
@@ -317,6 +363,17 @@ impl PacketChannel {
         let mut rx = self.inbox.lock().await;
         rx.recv().await
     }
+}
+
+/// Read and discard `n` bytes of a lane without buffering them.
+async fn skip(rx: &mut quinn::RecvStream, mut n: usize) -> Result<(), ()> {
+    while n > 0 {
+        match rx.read_chunk(n, true).await {
+            Ok(Some(chunk)) => n -= chunk.bytes.len(),
+            _ => return Err(()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

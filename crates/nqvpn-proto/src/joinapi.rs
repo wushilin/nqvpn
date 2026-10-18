@@ -2,12 +2,12 @@
 //! every renewal, never on a hot path. Dependency-light on purpose — a
 //! hand-written HTTP/1.1 request over a rustls stream.
 //!
-//! TLS is always on. By default any server certificate is accepted
-//! (`trust_any_cert = true`): the coordinator generates a self-signed
-//! certificate on first start, and the join is still protected against
-//! passive listeners. Set `trust_any_cert = false` to verify against the
-//! system roots (or a `ca` file) — the strict mode for deployments that
-//! do not trust the path to the coordinator.
+//! TLS is always on and verified by default: a certificate whose
+//! fingerprint is pinned (the token carries the self-signed
+//! coordinator's), one from a `ca` file, or one that chains to the
+//! system roots. `trust_any_cert = true` skips verification, and only
+//! when there is no pin and no CA to verify against — it never overrides
+//! a pin.
 
 use crate::api::{ErrorBody, JoinRequest, JoinResponse};
 use crate::errors::ErrorCode;
@@ -58,18 +58,21 @@ impl JoinError {
     }
 }
 
-/// How the member verifies the coordinator's HTTPS certificate.
-#[derive(Debug, Clone)]
+/// How the member verifies the coordinator's HTTPS certificate. The
+/// default verifies (`trust_any_cert: false`).
+#[derive(Debug, Clone, Default)]
 pub struct JoinTls {
-    /// Accept any certificate. The default, so a fresh deployment works
-    /// with the coordinator's auto-generated certificate.
+    /// Accept any certificate — but only when there is no pinned
+    /// fingerprint and no CA; those are always enforced. Off by default:
+    /// the token pins a self-signed coordinator, so a fresh deployment
+    /// verifies without it.
     pub trust_any_cert: bool,
     /// Extra PEM roots to trust when verifying (self-signed coordinator
-    /// certificate, private CA), as a file path. Only used when
-    /// `trust_any_cert` is off.
+    /// certificate, private CA), as a file path. Its presence turns
+    /// verification on even with `trust_any_cert`.
     pub ca_pem: Option<PathBuf>,
-    /// Extra PEM roots inline (the coordinator's own certificate). Only
-    /// used when `trust_any_cert` is off and there is no `pinned_fp`.
+    /// Extra PEM roots inline (the coordinator's own certificate). Its
+    /// presence turns verification on even with `trust_any_cert`.
     pub ca_cert: Option<String>,
     /// Coordinator certificate fingerprints to trust: the token's, plus
     /// any the operator pre-staged for a rotation. When non-empty, a
@@ -90,12 +93,6 @@ impl JoinTls {
             out.extend(crate::quic::certs_from_pem(&pem));
         }
         Ok(out)
-    }
-}
-
-impl Default for JoinTls {
-    fn default() -> Self {
-        JoinTls { trust_any_cert: true, ca_pem: None, ca_cert: None, pinned_fps: Vec::new() }
     }
 }
 
@@ -333,6 +330,7 @@ mod tests {
     #[test]
     fn strict_mode_builds_a_root_store() {
         assert!(tls_config(&JoinTls { trust_any_cert: false, ca_pem: None, ca_cert: None, pinned_fps: Vec::new() }).is_ok());
-        assert!(tls_config(&JoinTls::default()).is_ok());
+        assert!(tls_config(&JoinTls { trust_any_cert: true, ..JoinTls::default() }).is_ok());
+        assert!(!JoinTls::default().trust_any_cert, "verification is the default");
     }
 }

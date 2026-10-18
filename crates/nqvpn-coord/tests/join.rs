@@ -504,11 +504,176 @@ fn rate_limit_kicks_in() {
     let h = harness();
     let mut r = req(10, Role::Client);
     r.secret = "wrong".into();
+    let limit = h.state.coord.limits.join_rate_per_min as usize;
     let mut codes = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..limit + 10 {
         codes.push(h.state.join(&r, "2.2.2.2").unwrap_err().code.as_str().to_string());
     }
     assert!(codes.iter().any(|c| c == "rate_limited"), "expected the limiter to refuse some attempts, got {codes:?}");
+}
+
+#[test]
+fn an_ipv6_source_is_limited_by_its_64() {
+    let h = harness();
+    let limit = h.state.coord.limits.join_rate_per_min as usize;
+    let mut r = req(10, Role::Client);
+    r.secret = "wrong".into();
+    // Every attempt from a different address of the same /64.
+    for i in 0..limit {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        assert_eq!(h.state.join(&r, &ip).unwrap_err().code.as_str(), "bad_credentials");
+    }
+    assert_eq!(h.state.join(&r, "2001:db8:1:2:ffff::9").unwrap_err().code.as_str(), "rate_limited", "the /64 is out of allowance");
+    assert_eq!(h.state.join(&r, "2001:db8:1:3::1").unwrap_err().code.as_str(), "bad_credentials", "another /64 is not");
+}
+
+#[test]
+fn a_secret_that_is_not_shaped_like_one_is_refused_unscanned() {
+    let h = harness();
+    for bad in ["x".repeat(nqvpn_coord::secrets::MAX_SECRET_LEN + 1), "s-c1 ".repeat(20), "s c1".into(), "s-c1\u{0}".into()] {
+        let mut r = req(10, Role::Client);
+        r.secret = bad.clone();
+        assert_eq!(h.state.join(&r, "1.1.1.1").unwrap_err().code.as_str(), "bad_credentials", "{bad:?}");
+    }
+    // Surrounding whitespace is still forgiven (tokens get pasted).
+    let mut r = req(10, Role::Client);
+    r.secret = " s-c1\n".into();
+    assert!(h.state.join(&r, "1.1.1.1").is_ok());
+}
+
+/// A harness with a second network "n2" (sorted after "n1"), so a test
+/// can hold n2's lock and stop a join *between* resolving its secret in
+/// n1 and taking n1's lock — the window the join must re-check.
+fn two_networks() -> Harness {
+    let h = harness();
+    let mut n2: NetworkConfig = toml::from_str(
+        "network_id = \"n2\"\ncidrs = [\"10.98.0.0/16\"]\n[clients.other]\nsecret = \"s-other\"\n",
+    )
+    .unwrap();
+    nqvpn_coord::config::validate_network(&mut n2).unwrap();
+    let reg = Registry::new();
+    h.db.save_network_and_registry(&n2, &reg).unwrap();
+    h.state.add_network(n2, reg);
+    h
+}
+
+/// Run `join(req)` on another thread, stopped inside the secret scan
+/// (n2 held) while `meanwhile` changes n1; then let it finish.
+fn join_racing(h: &Arc<Harness>, r: JoinRequest, meanwhile: impl FnOnce(&Harness)) -> Result<nqvpn_proto::api::JoinResponse, nqvpn_coord::error::ApiError> {
+    let n2 = h.state.net("n2").unwrap();
+    let guard = n2.lock().unwrap();
+    let h2 = h.clone();
+    let t = std::thread::spawn(move || h2.state.join(&r, "1.1.1.1"));
+    std::thread::sleep(std::time::Duration::from_millis(300)); // it has resolved n1 and waits on n2
+    meanwhile(h);
+    drop(guard);
+    t.join().expect("the join thread must not panic")
+}
+
+#[test]
+fn a_member_deleted_mid_join_is_refused_and_poisons_nothing() {
+    let h = Arc::new(two_networks());
+    let res = join_racing(&h, req(10, Role::Client), |h| h.state.delete_member("n1", "c1").unwrap());
+    assert_eq!(res.unwrap_err().code.as_str(), "bad_credentials", "the member is gone by the time the join commits");
+    let n1 = h.state.net("n1").unwrap();
+    assert!(!n1.is_poisoned());
+    assert!(n1.lock().unwrap().registry.by_name("c1").is_none(), "no record was re-created for the deleted member");
+    // Every network still serves joins.
+    assert!(h.state.join(&req(1, Role::Relay), "1.1.1.1").is_ok());
+    let other = JoinRequest { secret: "s-other".into(), pubkey: pubkey(50), cert_fingerprint: fp(50) };
+    assert!(h.state.join(&other, "1.1.1.1").is_ok());
+
+    // A headless member (no address to allocate) is refused the same way.
+    configure(&h, "r2", |s| s.want_vpn_ip = Some(false));
+    let res = join_racing(&h, req(2, Role::Relay), |h| h.state.delete_member("n1", "r2").unwrap());
+    assert_eq!(res.unwrap_err().code.as_str(), "bad_credentials");
+    assert!(h.state.net("n1").unwrap().lock().unwrap().registry.by_name("r2").is_none());
+}
+
+#[test]
+fn a_join_racing_a_rotation_gets_no_credential_at_the_new_login_gen() {
+    let h = Arc::new(two_networks());
+    let first = h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
+    let res = join_racing(&h, req(10, Role::Client), |h| {
+        h.state.rotate_member("n1", "c1").unwrap();
+    });
+    assert_eq!(res.unwrap_err().code.as_str(), "bad_credentials", "the old secret stopped working before the join committed");
+    let rec_gen = h.state.net("n1").unwrap().lock().unwrap().registry.by_name("c1").unwrap().login_gen;
+    assert!(rec_gen > first.login_gen);
+}
+
+#[test]
+fn a_join_on_a_deleted_network_is_refused() {
+    let h = Arc::new(two_networks());
+    let other = JoinRequest { secret: "s-other".into(), pubkey: pubkey(50), cert_fingerprint: fp(50) };
+    let n1 = h.state.net("n1").unwrap();
+    // Hold n1 so the join resolves n2 and then waits; delete n2 meanwhile.
+    let guard = n1.lock().unwrap();
+    let h2 = h.clone();
+    let t = std::thread::spawn(move || h2.state.join(&other, "1.1.1.1"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(guard);
+    let _ = t.join().unwrap(); // raced or not, it must not panic
+    h.state.delete_network("n2").unwrap();
+    let other = JoinRequest { secret: "s-other".into(), pubkey: pubkey(50), cert_fingerprint: fp(50) };
+    assert_eq!(h.state.join(&other, "1.1.1.1").unwrap_err().code.as_str(), "bad_credentials");
+    assert!(h.db.load_all().unwrap().iter().all(|(c, _)| c.network_id != "n2"));
+}
+
+#[test]
+fn an_auto_relay_address_gets_the_endpoint_rules() {
+    let h = harness();
+    // r3 is `auto:4444`: the source address becomes its relay address.
+    for bad in ["127.0.0.1", "::1", "10.99.3.3", "::ffff:10.99.3.3", "192.168.1.20", "224.0.0.1"] {
+        let err = h.state.join(&req(3, Role::Relay), bad).unwrap_err();
+        assert_eq!(err.code.as_str(), "bad_request", "{bad}: {}", err.message);
+    }
+    let ok = h.state.join(&req(3, Role::Relay), "::ffff:198.51.100.4").unwrap();
+    assert_eq!(ok.relay_addr.as_deref(), Some("198.51.100.4:4444"), "a mapped source is its IPv4 address");
+}
+
+#[test]
+fn import_is_validated_whole_and_applied_atomically() {
+    let h = harness();
+    let mut cfgs = h.state.export();
+    let good = cfgs.clone();
+
+    // A bad network id, a bad member name, a malformed secret, a secret
+    // shared across networks: each refuses the whole import.
+    let mut bad_id = good.clone();
+    bad_id[0].network_id = "no spaces".into();
+    let mut bad_name = good.clone();
+    let m = bad_name[0].clients.remove("c1").unwrap();
+    bad_name[0].clients.insert("bad/name".into(), m);
+    let mut bad_secret = good.clone();
+    bad_secret[0].clients.get_mut("c1").unwrap().secret = Some("not a secret!".into());
+    let mut dup = good.clone();
+    let mut n2: NetworkConfig =
+        toml::from_str("network_id = \"n2\"\ncidrs = [\"10.98.0.0/16\"]\n[clients.copycat]\nsecret = \"s-c1\"\n").unwrap();
+    nqvpn_coord::config::validate_network(&mut n2).unwrap();
+    dup.push(n2.clone());
+    for (what, cfgs) in [("id", bad_id), ("name", bad_name), ("secret", bad_secret), ("duplicate secret", dup)] {
+        let err = h.state.import(cfgs).unwrap_err();
+        assert_eq!(err.code.as_str(), "bad_request", "{what}: {}", err.message);
+    }
+    // Nothing was applied, in memory or on disk.
+    assert!(h.state.net("n2").is_none());
+    assert_eq!(h.db.load_all().unwrap().len(), 1);
+    // A secret already held by a network the import leaves alone counts too.
+    let mut lone = n2.clone();
+    lone.network_id = "n3".into();
+    assert_eq!(h.state.import(vec![lone]).unwrap_err().code.as_str(), "bad_request");
+
+    // A role change retires the member's current credential.
+    let before = h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
+    let m = cfgs[0].clients.remove("c1").unwrap();
+    cfgs[0].relays.insert("c1".into(), nqvpn_coord::config::MemberCfg { relay_addr: Some("198.51.100.7:4444".into()), ..m });
+    h.state.import(cfgs).unwrap();
+    let rec = h.state.net("n1").unwrap().lock().unwrap().registry.by_name("c1").unwrap().clone();
+    assert!(rec.login_gen > before.login_gen, "a credential minted for the old role is retired");
+    let again = h.state.join(&req(10, Role::Client), "1.1.1.1").unwrap();
+    assert_eq!(again.role, Role::Relay);
+    assert_eq!(again.node_id, before.node_id);
 }
 
 #[test]

@@ -1,10 +1,12 @@
 # NetQ VPN client: a token and nothing else. Address, preferred relay,
 # MTU and the relay fleet come from the coordinator at join.
 #
-# The config file is optional:  nqvpn-client --token "nqv1.…"
+# The config file is optional:  nqvpn-client --token-file /etc/nqvpn/client.token
+# (or NQVPN_TOKEN in the environment). --token "nqv1.…" works too, but
+# puts the secret in the process list for every local user to read.
 
-token_file = "/etc/nqvpn/client.token"
-# token = "nqv1.…"
+token_file = "/etc/nqvpn/client.token"   # keep it chmod 600
+# token = "nqv1.…"                        # then keep this file chmod 600
 state_dir = "/var/lib/nqvpn-client"
 # tun_name = "nqvpn0"             # Linux: any name; macOS: utunN
 # The coordinator is verified by default: the token carries its
@@ -12,3 +14,11 @@ state_dir = "/var/lib/nqvpn-client"
 # system roots (CA-signed). Nothing to configure.
 # trust_any_cert = true           # set only to deliberately skip verification
 # ca = "/etc/nqvpn/coord-ca.pem"  # extra CA file, if you verify a private CA
+
+# Optional local limit on what the coordinator can route into the tunnel.
+# Unset: every published prefix is accepted except ones wider than /8
+# (IPv4) or /16 (IPv6). Set: only prefixes inside these ranges are routed
+# and accepted — include the network's own address space, or peers become
+# unreachable. Refused prefixes are logged as warnings.
+# [routes]
+# allow = ["10.99.0.0/16", "192.168.7.0/24"]

@@ -9,3 +9,4 @@
 #
 #   cargo run -p nqvpn-update --bin nqvpn-release-sign -- keygen
 #
+bjq58JZB5KGTzC7HCBBPVhGhTRlhTXdvTQMiuGSNgV4=

@@ -171,10 +171,10 @@ pub fn verify(
     )
     .map_err(|_| CredError::Malformed)?;
 
-    if claims.exp + LEEWAY_SECS <= now {
+    if claims.exp.saturating_add(LEEWAY_SECS) <= now {
         return Err(CredError::Expired { exp: claims.exp, now });
     }
-    if claims.iat > now + LEEWAY_SECS {
+    if claims.iat > now.saturating_add(LEEWAY_SECS) {
         return Err(CredError::NotYetValid { iat: claims.iat, now });
     }
     if claims.aud != AUD {
@@ -250,6 +250,17 @@ mod tests {
             verify(&token, &keys, &expected(), 1000 + LEEWAY_SECS),
             Err(CredError::Expired { .. })
         ));
+    }
+
+    #[test]
+    fn extreme_timestamps_do_not_overflow() {
+        // A signed token is trusted input, but arithmetic on it must not
+        // be able to panic (debug) or wrap into "expired" (release).
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let keys = vec![("k1".to_string(), sk.verifying_key())];
+        let token = sign(&claims(u64::MAX), "k1", &sk);
+        assert!(verify(&token, &keys, &expected(), 500).is_ok());
+        assert!(verify(&token, &keys, &expected(), u64::MAX).is_err(), "nothing outlives the end of time");
     }
 
     #[test]

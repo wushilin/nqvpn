@@ -8,12 +8,17 @@ license.workspace = true
 # GitHub release, download this platform's archive, verify it, and swap
 # the running binary on disk. Blocking std I/O over rustls, like the
 # member join client, so the static binaries carry no HTTP stack.
+# Releases are signed with Ed25519 (`nqvpn-release-sign`); the trusted
+# public keys are compiled in from release-keys.txt.
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
 flate2.workspace = true
 hex.workspace = true
+rand.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

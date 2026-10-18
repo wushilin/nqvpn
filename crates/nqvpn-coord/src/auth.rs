@@ -21,8 +21,6 @@ pub struct Session {
 #[derive(Default)]
 pub struct Sessions {
     live: Mutex<HashMap<String, Session>>,
-    /// Failed logins per source address, this minute.
-    failures: Mutex<HashMap<String, (u64, u32)>>,
 }
 
 /// Hash a password for `coordinator.toml`.
@@ -41,26 +39,12 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     }
 }
 
-const MAX_FAILURES_PER_MIN: u32 = 10;
+/// Login attempts per source address (an IPv6 source by its /64) per
+/// minute. Counted *before* the password is checked, so concurrent
+/// guesses cannot all slip in under the limit; a success is refunded.
+pub const MAX_LOGIN_ATTEMPTS_PER_MIN: u32 = 10;
 
 impl Sessions {
-    /// Too many failed logins from this address this minute?
-    pub fn throttled(&self, ip: &str) -> bool {
-        let window = now_unix() / 60;
-        let mut f = self.failures.lock().unwrap();
-        f.retain(|_, (w, _)| *w == window);
-        f.get(ip).map(|(_, n)| *n >= MAX_FAILURES_PER_MIN).unwrap_or(false)
-    }
-
-    pub fn note_failure(&self, ip: &str) {
-        let window = now_unix() / 60;
-        let mut f = self.failures.lock().unwrap();
-        let e = f.entry(ip.to_string()).or_insert((window, 0));
-        if e.0 != window {
-            *e = (window, 0);
-        }
-        e.1 += 1;
-    }
 
     /// A fresh session token for a user who just authenticated.
     pub fn open(&self, user: &str, ttl_secs: u64) -> (String, u64) {
@@ -121,17 +105,6 @@ mod tests {
         assert!(s.lookup(&t).is_none());
         let (t2, _) = s.open("admin", 0);
         assert!(s.lookup(&t2).is_none(), "already expired");
-    }
-
-    #[test]
-    fn failures_throttle_per_minute() {
-        let s = Sessions::default();
-        for _ in 0..MAX_FAILURES_PER_MIN {
-            assert!(!s.throttled("1.1.1.1"));
-            s.note_failure("1.1.1.1");
-        }
-        assert!(s.throttled("1.1.1.1"));
-        assert!(!s.throttled("2.2.2.2"));
     }
 
     #[test]

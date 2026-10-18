@@ -59,6 +59,25 @@ impl View {
         self.changed.send_modify(|v| *v += 1);
     }
 
+    /// Install a snapshot received from the coordinator: normalised first
+    /// (lookups binary-search the member and attachment lists, and the
+    /// digest assumes canonical order), and refused if it is older than
+    /// what is held. Generations only grow, across coordinator restarts
+    /// too (DESIGN §4), so an older snapshot is a stale or replayed one,
+    /// never news. An equal generation is accepted: that is how a digest
+    /// mismatch is repaired. `Err` carries the generation held.
+    pub fn install(&self, mut s: Snapshot) -> Result<(), u64> {
+        s.normalize();
+        let mut cur = self.snap.lock().unwrap();
+        if s.gen < cur.gen {
+            return Err(cur.gen);
+        }
+        *cur = s;
+        drop(cur);
+        self.changed.send_modify(|v| *v += 1);
+        Ok(())
+    }
+
     pub fn apply(&self, d: &Delta) -> Result<(), GenerationGap> {
         let mut s = self.snap.lock().unwrap();
         let before = s.gen;
@@ -273,8 +292,10 @@ pub async fn run_session(
     for sock in addrs {
         let bind: SocketAddr = if sock.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
         let mut ep = quinn::Endpoint::client(bind)?;
-        // The credential exchange authenticates both directions; the
-        // coordinator's certificate is not pinned.
+        // The coordinator's certificate is verified exactly as the HTTPS
+        // join verified it: pinned to the token's fingerprint (plus any
+        // pre-staged for rotation), or against the system roots and any
+        // extra CA — unless `trust_any_cert` deliberately turns that off.
         let extra_ca = params.tls.extra_ca().map_err(|e| anyhow!("ca: {e}"))?;
         ep.set_default_client_config(
             nqvpn_proto::quic::coordinator_client_config(identity, &params.tls.pinned_fps, params.tls.trust_any_cert, &extra_ca, params.keepalive_secs)
@@ -369,8 +390,11 @@ pub async fn run_session(
             }
             k if k == Kind::Snapshot as u16 => {
                 let s: Snapshot = decode_payload(&env.payload)?;
-                tracing::info!(gen = s.gen, members = s.members.len(), "snapshot installed");
-                view.replace(s);
+                let (gen, members) = (s.gen, s.members.len());
+                match view.install(s) {
+                    Ok(()) => tracing::info!(gen, members, "snapshot installed"),
+                    Err(held) => tracing::warn!(gen, held, "refusing a snapshot older than the view already held"),
+                }
             }
             k if k == Kind::Delta as u16 => {
                 let d: Delta = decode_payload(&env.payload)?;
@@ -548,5 +572,24 @@ mod tests {
         let gap = Delta { base_gen: 5, gen: 12, ..Default::default() };
         assert_eq!(v.apply(&gap), Err(GenerationGap { base: 5, have: 11 }));
         assert_eq!(v.digest(), s2.digest());
+    }
+
+    #[test]
+    fn an_older_snapshot_is_refused_and_a_received_one_is_normalised() {
+        let v = View::new();
+        // Out of canonical order on the wire: installed sorted.
+        let s = Snapshot { gen: 20, members: vec![peer(3), peer(1), peer(2)], ..Snapshot::default() };
+        v.install(s).unwrap();
+        assert_eq!(v.with(|s| s.members.iter().map(|m| m.node_id).collect::<Vec<_>>()), vec![1, 2, 3]);
+        // Older: refused, the view is untouched.
+        let old = Snapshot { gen: 19, members: vec![peer(9)], ..Snapshot::default() };
+        assert_eq!(v.install(old), Err(20));
+        assert_eq!(v.gen(), 20);
+        assert_eq!(v.with(|s| s.members.len()), 3);
+        // Same generation (a digest repair) and newer: accepted.
+        v.install(Snapshot { gen: 20, members: vec![peer(1)], ..Snapshot::default() }).unwrap();
+        assert_eq!(v.with(|s| s.members.len()), 1);
+        v.install(Snapshot { gen: 21, ..Snapshot::default() }).unwrap();
+        assert_eq!(v.gen(), 21);
     }
 }

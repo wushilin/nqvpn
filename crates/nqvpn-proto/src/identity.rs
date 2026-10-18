@@ -68,12 +68,15 @@ impl TlsIdentity {
     /// read. A corrupt file is replaced rather than fatal: a certificate
     /// is cheap, and the coordinator learns the new one at the next join.
     pub fn load_or_create(dir: &Path, name: &str) -> Result<Self, IdentityError> {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
         let cert_path = dir.join("tls.crt");
         let key_path = dir.join("tls.key");
         if let (Ok(c), Ok(k)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
             match TlsIdentity::from_der(c, k) {
-                Ok(id) => return Ok(id),
+                Ok(id) => {
+                    tighten_key_mode(&key_path);
+                    return Ok(id);
+                }
                 Err(e) => tracing::warn!("stored TLS identity unusable ({e}); generating a new one"),
             }
         }
@@ -123,22 +126,84 @@ pub fn fingerprint_der(cert_der: &[u8]) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
+/// Create the state directory owner-only if it does not exist yet. An
+/// existing directory is the operator's and is left as it is.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// A private key readable by group or others is fixed, not refused: it
+/// is ours, and a node that will not start helps no one.
+fn tighten_key_mode(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(path = %path.display(), mode = format!("{mode:o}"), "TLS private key was readable by others; setting 0600");
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(path = %path.display(), "could not tighten key permissions: {e}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Write via a temp file and rename, so a crash leaves the old file or
+/// the new one, never half of either.
+///
+/// The temp name is per target (`tls.crt.tmp`, `tls.key.tmp`) so two
+/// writes never share one. It is opened `create_new` after removing any
+/// stale leftover: O_EXCL refuses an existing path — a symlink planted
+/// there included — so the key is never written through someone else's
+/// link. (O_NOFOLLOW would add nothing on top of O_EXCL for the final
+/// component, and this crate does not depend on libc for the flag.)
+/// The mode is set at creation and again on the open handle, so a umask
+/// cannot widen it, and the file and its directory are both synced so
+/// the rename survives a power cut.
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), IdentityError> {
     use std::io::Write;
-    let tmp = path.with_extension("tmp");
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
+    let mut f = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
     #[cfg(not(unix))]
     let _ = mode;
-    let mut f = opts.open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -176,6 +241,38 @@ mod tests {
         TlsIdentity::load_or_create(dir.path(), "node-a").unwrap();
         let mode = std::fs::metadata(dir.path().join("tls.key")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_state_dir_is_private_and_a_loose_key_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("state");
+        TlsIdentity::load_or_create(&dir, "node-a").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "a state dir we create is owner-only");
+        // No temp file is left behind, and cert and key did not collide.
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+
+        let key = dir.join("tls.key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        TlsIdentity::load_or_create(&dir, "node-a").unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "a group/world-readable key is tightened on load");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_symlink_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("tls.key.tmp")).unwrap();
+        TlsIdentity::load_or_create(dir.path(), "node-a").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(dir.path().join("tls.key")).unwrap().file_type().is_symlink());
     }
 
     #[test]

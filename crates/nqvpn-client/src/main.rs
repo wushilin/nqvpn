@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nqvpn_client::client::{Client, ClientReconciler};
-use nqvpn_client::config::ClientConfig;
+use nqvpn_client::config::{warn_if_exposed, ClientConfig, TokenOverride};
 use nqvpn_endpoint::tun::TunDevice;
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::seal::StaticKeys;
@@ -30,8 +30,14 @@ struct Cli {
     #[arg(long)]
     trace: Option<IpAddr>,
     /// The member token (overrides the config's token / token_file).
-    #[arg(long)]
+    /// Visible to every local user in the process list — prefer
+    /// --token-file or the NQVPN_TOKEN environment variable.
+    #[arg(long, conflicts_with = "token_file")]
     token: Option<String>,
+    /// Read the member token from this file (overrides NQVPN_TOKEN and
+    /// the config). Keep it mode 600.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
     /// Send ALL traffic through the tunnel (like OpenVPN's redirect-gateway):
     /// installs the 0.0.0.0/1 + 128.0.0.0/1 (and ::/1 + 8000::/1) default
     /// override and pins the coordinator/relay transport and the system
@@ -74,16 +80,27 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
+    let token = TokenOverride {
+        token: cli.token.clone(),
+        token_file: cli.token_file.clone(),
+        env: std::env::var("NQVPN_TOKEN").ok().filter(|t| !t.trim().is_empty()),
+    };
+    if cli.token.is_some() {
+        tracing::warn!("--token puts the member token in the process list, where every local user can read it; prefer --token-file or NQVPN_TOKEN");
+    }
     let cfg = Arc::new(match ClientConfig::load(&cli.config) {
         Ok(c) => c,
-        // No config file is fine when the token comes from the command line.
-        Err(e) if cli.token.is_some() && !cli.config.exists() => {
-            tracing::debug!("no config file ({e:#}); using --token alone");
+        // No config file is fine when the token comes from elsewhere.
+        Err(e) if token.is_set() && !cli.config.exists() => {
+            tracing::debug!("no config file ({e:#}); using the token alone");
             ClientConfig::default()
         }
         Err(e) => return Err(e),
     });
-    let member = Arc::new(cfg.member(cli.token.as_deref())?);
+    if cfg.token.is_some() {
+        warn_if_exposed(&cli.config, "the config file");
+    }
+    let member = Arc::new(cfg.member_from(&token)?);
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
@@ -155,10 +172,14 @@ async fn run(cli: Cli) -> Result<i32> {
     let route_all = cli.route_all || cli.route_all_via.is_some();
     let client =
         Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, route_all, cli.route_all_via.clone());
+    client.set_route_policy(cfg.route_policy());
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
-        use std::net::ToSocketAddrs;
-        if let Ok(it) = (host.as_str(), 443u16).to_socket_addrs() {
-            client.set_underlay(it.map(|s| s.ip()).collect());
+        // Async: the runtime is single-threaded, and a blocking lookup
+        // would stall it for as long as the resolver takes.
+        match tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host.as_str(), 443u16))).await {
+            Ok(Ok(it)) => client.set_underlay(it.map(|s| s.ip()).collect()),
+            Ok(Err(e)) => tracing::warn!(%host, "cannot resolve the coordinator; it will not be protected from member routes: {e}"),
+            Err(_) => tracing::warn!(%host, "resolving the coordinator timed out; it will not be protected from member routes"),
         }
     }
     if let Some(t) = cli.trace {
@@ -191,6 +212,10 @@ async fn run(cli: Cli) -> Result<i32> {
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received; removing routes and exiting cleanly");
             Ok(0)
+        }
+        _ = client.tun_failed() => {
+            // Exit non-zero so the supervisor restarts us with a new device.
+            Err(anyhow::anyhow!("the TUN device failed; exiting so the service manager can restart the client"))
         }
     }
 }

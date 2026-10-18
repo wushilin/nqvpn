@@ -36,26 +36,36 @@ pub struct TrafficSample {
     pub at: u64,
     pub report: nqvpn_proto::control::TrafficReport,
     pub prev_at: u64,
-    pub prev: Option<nqvpn_proto::control::TrafficReport>,
+    /// The previous sample's (tx_bytes, rx_bytes) per peer, indexed so a
+    /// rate costs a lookup rather than a scan.
+    pub prev: Option<HashMap<NodeId, (u64, u64)>>,
 }
 
 impl TrafficSample {
-    /// Bytes per second on one link since the previous sample. A relay
-    /// restart makes the counter smaller; that reads as zero, not a spike.
-    pub fn rate(&self, peer_id: NodeId, tx: bool) -> u64 {
+    /// Bytes per second on one link of `report` since the previous
+    /// sample. A relay restart makes the counter smaller; that reads as
+    /// zero, not a spike.
+    pub fn rate(&self, link: &nqvpn_proto::control::LinkTraffic, tx: bool) -> u64 {
         let (Some(prev), true) = (&self.prev, self.at > self.prev_at) else {
             return 0;
         };
-        let pick = |r: &nqvpn_proto::control::TrafficReport| {
-            r.links
-                .iter()
-                .find(|l| l.peer_id == peer_id)
-                .map(|l| if tx { l.tx_bytes } else { l.rx_bytes })
-                .unwrap_or(0)
-        };
-        pick(&self.report).saturating_sub(pick(prev)) / (self.at - self.prev_at)
+        let before = prev.get(&link.peer_id).map(|(t, r)| if tx { *t } else { *r }).unwrap_or(0);
+        let now = if tx { link.tx_bytes } else { link.rx_bytes };
+        now.saturating_sub(before) / (self.at - self.prev_at)
     }
 }
+
+/// A reported usable MTU as the network MTU may use it: clamped to
+/// `[MIN_TUNNEL_MTU, ceiling]` and, below the ceiling, rounded down to a
+/// multiple of `MTU_QUANTUM`, so jitter of a few bytes in a member's
+/// path MTU estimate is not a new view every heartbeat.
+pub fn quantize_mtu(reported: u16, ceiling: u16) -> u16 {
+    let v = reported.min(ceiling);
+    let v = if v < ceiling { v - v % MTU_QUANTUM } else { v };
+    v.max(MIN_TUNNEL_MTU)
+}
+
+pub const MTU_QUANTUM: u16 = 8;
 
 #[derive(Debug)]
 pub struct Directory {
@@ -276,9 +286,25 @@ impl Directory {
         NetworkMtu { mtu: best.max(MIN_TUNNEL_MTU), limited_by: who }
     }
 
-    pub fn record_traffic(&mut self, relay: NodeId, report: nqvpn_proto::control::TrafficReport, now: u64) {
+    /// Keep a relay's traffic report. Only links to `known` peers are
+    /// kept, each once, and at most `max_links` of them — a relay has no
+    /// more peers than the network has members, and the status view
+    /// walks every link.
+    pub fn record_traffic(
+        &mut self,
+        relay: NodeId,
+        mut report: nqvpn_proto::control::TrafficReport,
+        now: u64,
+        known: &dyn Fn(NodeId) -> bool,
+        max_links: usize,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        report.links.retain(|l| seen.len() < max_links && known(l.peer_id) && seen.insert(l.peer_id));
         let (prev, prev_at) = match self.traffic.get(&relay) {
-            Some(s) => (Some(s.report.clone()), s.at),
+            Some(s) => (
+                Some(s.report.links.iter().map(|l| (l.peer_id, (l.tx_bytes, l.rx_bytes))).collect()),
+                s.at,
+            ),
             None => (None, now),
         };
         self.traffic.insert(relay, TrafficSample { at: now, report, prev_at, prev });
@@ -462,7 +488,7 @@ local_cidrs = ["192.168.1.0/24"]
         let (c, mut reg) = (cfg(), registry());
         let mut l = Leases::default();
         online(&mut l, &[1, 10], 5);
-        l.heartbeat(1, Role::Relay, &Heartbeat { attached: vec![AttachedClient { node_id: 10, session_id: 1 }], ..Default::default() }, 5);
+        l.heartbeat(1, Role::Relay, &Heartbeat { attached: vec![AttachedClient { node_id: 10, session_id: 1 }], ..Default::default() }, 5, &|_| true, usize::MAX);
         let mut d = Directory::new(1, 0);
         d.recompute(&c, &reg, &l, &[], 5, 5);
         assert!(d.published.member(10).is_some());
@@ -494,16 +520,43 @@ local_cidrs = ["192.168.1.0/24"]
         }
     }
 
+    fn rate(d: &Directory) -> u64 {
+        let s = &d.traffic[&1];
+        s.rate(&s.report.links[0], true)
+    }
+
     #[test]
     fn rates_derive_from_samples_and_stale_rows_are_pruned() {
         let mut d = Directory::new(1, 0);
-        d.record_traffic(1, report(2, 1_000), 100);
-        assert_eq!(d.traffic[&1].rate(2, true), 0);
-        d.record_traffic(1, report(2, 11_000), 110);
-        assert_eq!(d.traffic[&1].rate(2, true), 1_000);
-        d.record_traffic(1, report(2, 12), 120);
-        assert_eq!(d.traffic[&1].rate(2, true), 0, "restart reads as zero");
+        let any = |_: NodeId| true;
+        d.record_traffic(1, report(2, 1_000), 100, &any, 16);
+        assert_eq!(rate(&d), 0);
+        d.record_traffic(1, report(2, 11_000), 110, &any, 16);
+        assert_eq!(rate(&d), 1_000);
+        d.record_traffic(1, report(2, 12), 120, &any, 16);
+        assert_eq!(rate(&d), 0, "restart reads as zero");
         d.prune_traffic(120 + TRAFFIC_RETENTION_SECS + 1);
         assert!(d.traffic.is_empty());
+    }
+
+    #[test]
+    fn a_traffic_report_keeps_only_known_peers_once_and_is_capped() {
+        let mut d = Directory::new(1, 0);
+        let mut r = report(2, 1);
+        for peer in [2, 3, 99, 4, 5] {
+            r.links.push(nqvpn_proto::control::LinkTraffic { peer_id: peer, tx_bytes: 1, tx_pkts: 0, rx_bytes: 0, rx_pkts: 0, up: true });
+        }
+        d.record_traffic(1, r, 100, &|n| n < 50, 3);
+        let peers: Vec<NodeId> = d.traffic[&1].report.links.iter().map(|l| l.peer_id).collect();
+        assert_eq!(peers, vec![2, 3, 4], "duplicate 2 and unknown 99 dropped; capped at 3");
+    }
+
+    #[test]
+    fn reported_mtu_is_clamped_and_quantized() {
+        assert_eq!(quantize_mtu(1300, 1350), 1296);
+        assert_eq!(quantize_mtu(1301, 1350), 1296, "jitter maps to one value");
+        assert_eq!(quantize_mtu(1500, 1350), 1350, "the ceiling is kept exactly");
+        assert_eq!(quantize_mtu(1350, 1350), 1350);
+        assert_eq!(quantize_mtu(500, 1350), MIN_TUNNEL_MTU);
     }
 }

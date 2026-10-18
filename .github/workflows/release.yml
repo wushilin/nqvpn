@@ -3,10 +3,16 @@
 #   git tag vX.Y.Z && git push origin vX.Y.Z   -> test, build, publish
 #   Actions tab -> release -> Run workflow      -> test and build only (dry run)
 #
-# Archives are nqvpn-<version>-<os>-<arch>.tar.gz (+ .sha256), each holding
-# nqvpn-coord, nqvpn-relay and nqvpn-client; --self-update fetches exactly
-# these names. Linux builds are static musl; macOS and FreeBSD link their
-# system libc (musl does not exist there).
+# Archives are nqvpn-<version>-<os>-<arch>.tar.gz (+ .sha256, + .sig), each
+# holding nqvpn-coord, nqvpn-relay and nqvpn-client; --self-update fetches
+# exactly these names. Linux builds are static musl; macOS and FreeBSD link
+# their system libc (musl does not exist there).
+#
+# The .sig files are Ed25519 release manifests made by nqvpn-release-sign
+# with the NQVPN_RELEASE_KEY repository secret, only on the runner that
+# publishes (never in the build jobs or the FreeBSD VMs). --self-update
+# refuses anything without a valid one, so a tag build without the secret
+# fails instead of publishing.
 
 name: release
 
@@ -29,7 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: v
+        env:
+          HAVE_RELEASE_KEY: ${{ secrets.NQVPN_RELEASE_KEY != '' }}
         run: |
+          # Fail a tag build up front, not after an hour of builds.
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$HAVE_RELEASE_KEY" != true ]; then
+            echo "::error::repository secret NQVPN_RELEASE_KEY is not set; releases must be signed (see README, Releases and updating)"
+            exit 1
+          fi
           v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
@@ -116,6 +129,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: sign
+        if: github.ref_type == 'tag'
+        env:
+          NQVPN_RELEASE_KEY: ${{ secrets.NQVPN_RELEASE_KEY }}
+        run: |
+          if [ -z "$NQVPN_RELEASE_KEY" ]; then
+            echo "::error::repository secret NQVPN_RELEASE_KEY is not set; releases must be signed (see README, Releases and updating)"
+            exit 1
+          fi
+          rm -f dist/*.sig
+          cargo run --release --locked -p nqvpn-update --bin nqvpn-release-sign -- \
+            sign --version "${{ needs.version.outputs.version }}" dist/*.tar.gz
       - run: ls -l dist
       - name: publish
         if: github.ref_type == 'tag'
@@ -125,7 +152,7 @@ jobs:
           v=${{ needs.version.outputs.version }}
           notes=.github/releases/v$v.md
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
-          gh release create "v$v" --title "nqvpn $v" "$@" dist/*.tar.gz dist/*.tar.gz.sha256
+          gh release create "v$v" --title "nqvpn $v" "$@" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.sig
 
   freebsd-arm64:
     needs: [version, release]
@@ -149,8 +176,24 @@ jobs:
         with:
           name: freebsd-arm64
           path: dist/*.tar.gz*
+      # Signed on the Linux host, not in the VM; its own target dir keeps
+      # the host build apart from the FreeBSD one synced back from the VM.
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+        if: github.ref_type == 'tag'
+      - name: sign
+        if: github.ref_type == 'tag'
+        env:
+          NQVPN_RELEASE_KEY: ${{ secrets.NQVPN_RELEASE_KEY }}
+        run: |
+          if [ -z "$NQVPN_RELEASE_KEY" ]; then
+            echo "::error::repository secret NQVPN_RELEASE_KEY is not set; releases must be signed"
+            exit 1
+          fi
+          rm -f dist/*.sig
+          cargo run --release --locked --target-dir target/host -p nqvpn-update --bin nqvpn-release-sign -- \
+            sign --version "${{ needs.version.outputs.version }}" dist/*.tar.gz
       - name: attach to the release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "v${{ needs.version.outputs.version }}" dist/*.tar.gz dist/*.tar.gz.sha256
+        run: gh release upload "v${{ needs.version.outputs.version }}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.sig

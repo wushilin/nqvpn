@@ -62,6 +62,7 @@ impl nqvpn_sync::link::MemberHooks for Hooks {
         self.net.set_credential(&r.credential);
         self.net.set_signing_keys(&r.coordinator_signing_keys);
         self.net.set_exit_designated(&r.granted_cidrs);
+        self.net.set_mtu_ceiling(r.mtu);
         // Facts the operator may have changed since the last join.
         let hosts = host_prefixes(r);
         match self.net.endpoint() {
@@ -103,7 +104,8 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-relay").context("loading relay TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
     // Each network's member loop returns only when this relay has been
-    // replaced under that name; the first one to do so ends the process.
+    // replaced under that name. That network is retired — the others
+    // keep serving — and the process exits once every network has.
     let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel::<(String, nqvpn_sync::MemberExit)>(4);
 
     // Bind before joining: the coordinator may probe the advertised
@@ -139,7 +141,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 tracing::warn!(advertised = %addr, %listen, "the coordinator advertises a different port than this relay listens on");
             }
         }
-        if nets.contains_key(&network_id) {
+        if nets.contains_key(&network_id) || nets.values().any(|n| n.network_uuid == joined.network_uuid) {
             anyhow::bail!("two tokens for network {network_id}");
         }
 
@@ -157,6 +159,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
         );
         net.set_signing_keys(&joined.coordinator_signing_keys);
         net.set_exit_designated(&joined.granted_cidrs);
+        net.set_mtu_ceiling(joined.mtu);
 
         // Endpoint role: an address, or a LAN to front.
         let hosts = host_prefixes(&joined);
@@ -178,12 +181,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 nqvpn_endpoint::routes::NetRouteProgrammer::new(device).context("opening the routing table")?,
             ));
             // The endpoint's own frames loop through the relay's tables;
-            // a local channel carries trace notes back to it.
-            let loopback = nqvpn_proto::transport::PacketChannel::start_lanes(
-                loopback_connection(&identity).await?,
-                Mode::Datagram,
-                1,
-            );
+            // trace notes for them come straight back to it.
             let ep = LocalEndpoint::new(
                 joined.node_id,
                 joined.network_uuid.clone(),
@@ -194,7 +192,6 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 joined.mtu,
                 joined.lanes.max(1),
                 routes,
-                loopback,
             );
             ep.bind(net.clone());
             ep.spawn_pumps();
@@ -212,7 +209,7 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
                 let mut t = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     t.tick().await;
-                    net.refresh_exit_readiness();
+                    net.refresh_exit_readiness().await;
                 }
             }
         });
@@ -254,23 +251,45 @@ async fn run(cfg: Arc<RelayConfig>, cli: Cli) -> Result<i32> {
         });
     }
     let _guards = guards;
-    tokio::select! {
-        got = exit_rx.recv() => match got {
-            Some((network, exit)) => {
-                let nqvpn_sync::MemberExit::Replaced(reason) = &exit;
-                tracing::error!(
-                    %network,
-                    %reason,
-                    "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
-                    exit.exit_code()
-                );
-                Ok(exit.exit_code())
+    let mut serving = nets.len();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            got = exit_rx.recv() => match got {
+                Some((network, exit)) => {
+                    // Only our own coordinator ends a member loop this way
+                    // (its control link said CLOSE_REPLACED, or the view
+                    // shows a newer login than ours). A peer relay's word
+                    // alone never does.
+                    let nqvpn_sync::MemberExit::Replaced(reason) = &exit;
+                    serving -= 1;
+                    if let Some(net) = nets.get(&network) {
+                        net.retire("this relay was replaced in this network");
+                    }
+                    if serving > 0 {
+                        tracing::error!(
+                            %network,
+                            %reason,
+                            still_serving = serving,
+                            "another instance joined as this relay in this network; it is no longer served here and not re-joined. If that was not you, regenerate this member's token at the coordinator."
+                        );
+                        continue;
+                    }
+                    tracing::error!(
+                        %network,
+                        %reason,
+                        "another instance joined as this relay; exiting with code {} and not re-joining. If that was not you, regenerate this member's token at the coordinator.",
+                        exit.exit_code()
+                    );
+                    return Ok(exit.exit_code());
+                }
+                None => std::future::pending().await,
+            },
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; removing routes and exiting cleanly");
+                return Ok(0);
             }
-            None => std::future::pending().await,
-        },
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received; removing routes and exiting cleanly");
-            Ok(0)
         }
     }
 }
@@ -288,34 +307,4 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-}
-
-/// A QUIC connection to ourselves, used only as a channel the endpoint
-/// role's trace notes ride back on. Cheap, and it keeps every packet
-/// path a `PacketChannel`.
-async fn loopback_connection(identity: &TlsIdentity) -> Result<quinn::Connection> {
-    let server = quinn::Endpoint::server(
-        server_config(identity, 15).map_err(|e| anyhow::anyhow!("{e}"))?,
-        "127.0.0.1:0".parse().unwrap(),
-    )?;
-    let addr = server.local_addr()?;
-    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
-    client.set_default_client_config(nqvpn_proto::quic::client_config(identity, None, 15).map_err(|e| anyhow::anyhow!("{e}"))?);
-    let accept = tokio::spawn(async move {
-        let inc = server.accept().await.ok_or_else(|| anyhow::anyhow!("no loopback accept"))?;
-        let conn = inc.await?;
-        // Keep the server side alive for the process lifetime.
-        tokio::spawn(async move {
-            let _keep = server;
-            conn.closed().await;
-        });
-        Ok::<(), anyhow::Error>(())
-    });
-    let conn = client.connect(addr, "loopback")?.await?;
-    accept.await??;
-    tokio::spawn(async move {
-        let _keep = client;
-        std::future::pending::<()>().await;
-    });
-    Ok(conn)
 }

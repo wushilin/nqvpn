@@ -437,13 +437,47 @@ async fn mtu_is_the_network_minimum_and_recovers_when_the_limiter_leaves() -> Re
     let mut b = Member::connect(&env, &bcred, &bid, 0).await?;
     let bv = b.snapshot().await?;
     let mut h = hb_of(&bv);
-    h.usable_mtu = 1300;
+    // Reports are quantized (multiples of 8 below the ceiling), so jitter
+    // in a path MTU estimate is not a new view every heartbeat.
+    h.usable_mtu = 1301;
     b.heartbeat(&h).await?;
-    a.until(&mut av, |v| v.mtu.mtu == 1300).await?;
+    a.until(&mut av, |v| v.mtu.mtu == 1296).await?;
     assert_eq!(av.mtu.limited_by, format!("#{b_node}"));
     drop(b);
     a.until(&mut av, |v| v.mtu.mtu == 1350).await?;
     assert_eq!(av.mtu.limited_by, "config");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_heartbeat_flood_does_not_mint_generations() -> Result<()> {
+    let env = setup().await;
+    let bid = TlsIdentity::generate("c1")?;
+    let (bcred, _) = join_as(&env, 10, Role::Client, &bid, vec![]);
+    let mut b = Member::connect(&env, &bcred, &bid, 0).await?;
+    let bv = b.snapshot().await?;
+    let gen_of = || env.state.net("n1").unwrap().lock().unwrap().directory.gen;
+    let mut h = hb_of(&bv);
+    h.usable_mtu = 1301;
+    b.heartbeat(&h).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let g0 = gen_of();
+    // MTU jitter of a byte, as fast as the member can send: every value
+    // quantizes to the same MTU, and nothing else changed.
+    for i in 0..200u16 {
+        h.usable_mtu = 1300 + (i % 2);
+        b.heartbeat(&h).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(gen_of(), g0, "no view change, no generation");
+    // A real change still lands, promptly, in spite of the flood.
+    h.usable_mtu = 1290;
+    b.heartbeat(&h).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while env.state.net("n1").unwrap().lock().unwrap().directory.published.mtu.mtu != 1288 {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the latest heartbeat was lost");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     Ok(())
 }
 

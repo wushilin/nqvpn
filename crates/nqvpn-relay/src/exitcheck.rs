@@ -10,10 +10,29 @@
 //! not ready. Linux-only; elsewhere it reports "unknown" (both false).
 
 use nqvpn_proto::control::ExitReadiness;
+use std::path::PathBuf;
 use std::process::Command;
 
+/// Where the tools below may live. Searched in this order instead of
+/// `$PATH`: this runs as root, and must not run whatever a writable
+/// directory early in the environment's path happens to provide.
+const TOOL_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// The absolute path of a system tool, if installed in a system
+/// directory.
+fn tool(name: &str) -> Option<PathBuf> {
+    TOOL_DIRS.iter().map(|d| PathBuf::from(d).join(name)).find(|p| p.is_file())
+}
+
+/// Run a system tool by absolute path; its stdout, or nothing.
+fn run(name: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(tool(name)?).args(args).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// One reading of egress readiness. Cheap enough for a ~30s timer; not
-/// meant to run per-heartbeat.
+/// meant to run per-heartbeat. It spawns processes: call it from a
+/// blocking context (`spawn_blocking`), never on an async worker.
 pub fn detect() -> ExitReadiness {
     ExitReadiness { ip_forward: ip_forward_on(), masquerade: masquerade_covers_egress() }
 }
@@ -31,8 +50,7 @@ fn ip_forward_on() -> bool {
 /// The interface of the default (internet) route, if any — the path
 /// forwarded tun traffic takes on its way out.
 fn egress_iface() -> Option<String> {
-    let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = run("ip", &["route", "show", "default"])?;
     for line in s.lines() {
         let mut it = line.split_whitespace();
         while let Some(tok) = it.next() {
@@ -59,8 +77,8 @@ fn masquerade_covers_egress() -> bool {
         ["iptables-legacy-save", "-t", "nat"].as_slice(),
         ["ip6tables-save", "-t", "nat"].as_slice(),
     ] {
-        if let Ok(o) = Command::new(cmd[0]).args(&cmd[1..]).output() {
-            text.push_str(&String::from_utf8_lossy(&o.stdout));
+        if let Some(o) = run(cmd[0], &cmd[1..]) {
+            text.push_str(&o);
             text.push('\n');
         }
     }

@@ -125,7 +125,7 @@ impl ClientCertVerifier for AnyClientCert {
 /// where the coordinator published what that relay presents), otherwise
 /// accepts any certificate — the coordinator's control port, where the
 /// credential exchange authenticates in both directions, and the join
-/// API when `trust_any_cert` is set.
+/// API when `trust_any_cert` is set and nothing is pinned.
 #[derive(Debug)]
 pub struct PinnedServerCert {
     /// Fingerprints to accept; empty means accept any certificate.
@@ -180,6 +180,11 @@ pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Per-stream receive window: one stream-mode lane's in-flight budget.
+pub const STREAM_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+/// Per-connection receive window: every stream together.
+pub const CONN_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
 fn transport(keepalive_secs: u64) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(keepalive_secs)));
@@ -196,7 +201,32 @@ fn transport(keepalive_secs: u64) -> Arc<quinn::TransportConfig> {
     // the receiver's to set, and a sender that exceeds it blocks rather
     // than failing loudly, so allow comfortably more than MAX_LANES and
     // keep the "receiver accepts whatever arrives" property true.
+    //
+    // The mode is a per-network setting and one server config serves
+    // every network on a relay, so this cannot drop to 0 for datagram
+    // networks; the connection window below bounds what idle uni streams
+    // can hold instead.
     t.max_concurrent_uni_streams((crate::transport::MAX_LANES as u32 * 2).into());
+    // Every connection carries exactly one bidirectional stream: the
+    // control stream (Hello and Refresh on a data session; pushes,
+    // heartbeats and RPC on the coordinator's). quinn's default of 100
+    // is 100 streams' worth of receive window a peer can open before
+    // saying a word of its credential.
+    t.max_concurrent_bidi_streams(1u32.into());
+    // Flow control is the memory a peer can make us hold, and the TLS
+    // layer accepts any client certificate, so it is held for strangers
+    // too until `Hello` is checked. quinn's default connection window is
+    // unbounded; cap it.
+    //
+    // Sizing is bandwidth-delay product: a stream-mode lane carries at
+    // most one stream window per RTT, so 4 MiB keeps a single lane at
+    // ~1 Gbit/s up to ~30 ms RTT (~300 Mbit/s at 100 ms) — above quinn's
+    // 1.25 MB default, so no lane gets slower. The connection window
+    // bounds the sum over all lanes plus control: 16 MiB is ~1.3 Gbit/s
+    // at 100 ms for the whole connection, and a hard ceiling on what one
+    // unauthenticated peer can pin.
+    t.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
+    t.receive_window(CONN_RECEIVE_WINDOW.into());
     // Start where our frames actually fit; discovery corrects downward
     // if the path is smaller, and black-hole detection recovers if a
     // middlebox silently eats the bigger packets.
@@ -312,12 +342,18 @@ impl ServerCertVerifier for CoordServerVerifier {
 /// The server-cert verifier for talking to the coordinator, honoring the
 /// member's trust settings. Shared by the HTTPS join and QUIC control
 /// plane so both channels trust the coordinator identically.
+///
+/// `trust_any` only applies when there is nothing to verify against: a
+/// pinned fingerprint (the token carries one for a self-signed
+/// coordinator) or a CA is always enforced. Otherwise a stray
+/// `trust_any_cert = true` would silently discard the pin the token
+/// delivered — exactly the MITM protection the pin exists for.
 pub fn coordinator_verifier(
     pinned_fps: &[String],
     trust_any: bool,
     extra_ca: &[CertificateDer<'static>],
 ) -> Result<Arc<dyn ServerCertVerifier>, TlsSetupError> {
-    if trust_any {
+    if trust_any && pinned_fps.is_empty() && extra_ca.is_empty() {
         Ok(Arc::new(PinnedServerCert { expected_fps: Vec::new(), supported: provider().signature_verification_algorithms }))
     } else {
         // Accept any pinned fingerprint (the token's, plus any the
@@ -410,6 +446,16 @@ mod tests {
         assert!(handshakes(&coord, cfg).await.is_ok(), "old cert still accepted");
         let cfg = coordinator_client_config(&member, &pins, false, &[], 5).unwrap();
         assert!(handshakes(&next, cfg).await.is_ok(), "new cert accepted before any member drops the old pin");
+
+        // trust-any never overrides a pin or a CA: with the token's
+        // fingerprint present, a different certificate is refused.
+        let pin = vec![fingerprint_der(&coord.cert_der)];
+        let cfg = coordinator_client_config(&member, &pin, true, &[], 5).unwrap();
+        assert!(handshakes(&coord, cfg).await.is_ok(), "trust_any + pin accepts the pinned cert");
+        let cfg = coordinator_client_config(&member, &pin, true, &[], 5).unwrap();
+        assert!(handshakes(&other, cfg).await.is_err(), "trust_any must not discard the pin");
+        let cfg = coordinator_client_config(&member, &[], true, std::slice::from_ref(&coord_cert), 5).unwrap();
+        assert!(handshakes(&other, cfg).await.is_err(), "trust_any must not discard a provided CA");
     }
 
     /// The bug this constant exists to prevent: quinn's default

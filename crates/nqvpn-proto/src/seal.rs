@@ -19,9 +19,13 @@
 //!   authentication leaves the window untouched, so neither an untrusted
 //!   relay nor a straggler from a previous session can move it.
 //! * **Timestamped initiation** — the first handshake message carries
-//!   the initiator's clock, encrypted under the responder's static key.
-//!   The engine keeps the newest value per peer and refuses older ones,
-//!   so a captured msg1 cannot be replayed to reset a working session.
+//!   the initiator's clock (seconds and nanoseconds, TAI64N-shaped),
+//!   encrypted under the responder's static key. The engine keeps the
+//!   newest value per peer *and static key* and refuses older ones, so a
+//!   captured msg1 cannot be replayed to reset a working session.
+//! * **Overlapping rekey** — a session is replaced before it must be,
+//!   and the one it replaced stays receive-only for a short grace, so
+//!   frames in flight across the switch still decrypt.
 
 use crate::types::NodeId;
 
@@ -32,13 +36,80 @@ pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// thousand frames must not turn the recovered lane into "replays".
 pub const REPLAY_WINDOW: u64 = 2048;
 /// Rekey after this many seconds (decision #7 — WireGuard's constant).
+/// This is the *soft* deadline: the session that initiated starts a
+/// replacement handshake while it keeps sending on the old keys.
 pub const REKEY_AFTER_SECS: u64 = 120;
+/// The responder of a session starts its own replacement this much
+/// later than the initiator would, so in the common case only one side
+/// rekeys and the two do not cross.
+pub const RESPONDER_REKEY_DELAY_SECS: u64 = 10;
+/// Hard deadline: a session this old is dropped whether or not its
+/// replacement arrived (WireGuard's REJECT_AFTER_TIME is 180 s too).
+/// Forward secrecy is bounded by this, not by the soft deadline.
+pub const REJECT_AFTER_SECS: u64 = 180;
+/// How long a replaced session still decrypts (never encrypts): frames
+/// sealed just before the peer switched keys are still on the wire.
+pub const PREVIOUS_GRACE_SECS: u64 = 10;
+// Both sides' soft deadlines, plus a handshake's worth of time, come
+// before the hard one: a working session is always replaced, not lost.
+const _: () = assert!(REJECT_AFTER_SECS > REKEY_AFTER_SECS + RESPONDER_REKEY_DELAY_SECS + HANDSHAKE_TIMEOUT_SECS);
 /// Give up on a handshake that never completed and start over. Without
 /// this a session stuck half-open blocks every later attempt, because
 /// the peer already "has" a session and never initiates another.
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
-/// Hard cap on messages per session before a rekey is mandatory.
+/// Messages per session before a rekey is started (soft).
 pub const REKEY_AFTER_MESSAGES: u64 = 1 << 40;
+/// Messages per session after which it is dropped outright (hard).
+pub const REJECT_AFTER_MESSAGES: u64 = (1 << 40) + (1 << 30);
+
+/// The initiator's clock as carried in msg1: seconds and nanoseconds
+/// since the Unix epoch, ordered lexicographically (TAI64N's shape,
+/// without its epoch offset — only the order matters here).
+///
+/// On the wire it is 12 bytes, big-endian seconds then nanoseconds. A
+/// responder also accepts the older 8-byte seconds-only payload (nanos
+/// read as zero), and an older responder reads the first 8 bytes of the
+/// new one as before, so the two formats interoperate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tai64n {
+    pub secs: u64,
+    pub nanos: u32,
+}
+
+impl Tai64n {
+    pub fn new(secs: u64, nanos: u32) -> Self {
+        Tai64n { secs, nanos }
+    }
+
+    pub fn now() -> Self {
+        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        Tai64n { secs: d.as_secs(), nanos: d.subsec_nanos() }
+    }
+
+    pub fn to_bytes(self) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[..8].copy_from_slice(&self.secs.to_be_bytes());
+        b[8..].copy_from_slice(&self.nanos.to_be_bytes());
+        b
+    }
+
+    /// Decode a msg1 payload: 12 bytes (current), 8 bytes (seconds only,
+    /// from an older peer), anything shorter is the zero timestamp.
+    pub fn from_payload(p: &[u8]) -> Self {
+        let secs = if p.len() >= 8 { u64::from_be_bytes(p[..8].try_into().expect("8 bytes")) } else { 0 };
+        let nanos = if p.len() >= 12 { u32::from_be_bytes(p[8..12].try_into().expect("4 bytes")) } else { 0 };
+        Tai64n { secs, nanos }
+    }
+
+    /// The smallest timestamp strictly after `self`.
+    pub fn succ(self) -> Self {
+        if self.nanos >= 999_999_999 {
+            Tai64n { secs: self.secs.saturating_add(1), nanos: 0 }
+        } else {
+            Tai64n { secs: self.secs, nanos: self.nanos + 1 }
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SealError {
@@ -103,11 +174,27 @@ impl StaticKeys {
     }
 }
 
+/// Write a secret file atomically without ever following a symlink an
+/// attacker may have planted in the state directory.
+///
+/// The temp file is created with `create_new` (`O_CREAT|O_EXCL`), which
+/// refuses to open through a symlink — POSIX requires `EEXIST` when the
+/// path names one — so a stale temp (ours, from a crash, or planted) is
+/// removed first (`remove_file` unlinks a link, it does not follow it).
+/// If something re-creates it in between, the open fails rather than
+/// writing through it. The mode is set at creation, so the key is never
+/// readable by others even for an instant. `rename` replaces the target
+/// itself (it does not follow a symlink there either), and the file and
+/// its directory are fsynced so a crash cannot leave an empty key.
 fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("key.tmp");
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -116,7 +203,14 @@ fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
     let mut f = opts.open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub fn decode_pubkey(b64: &str) -> Option<Vec<u8>> {
@@ -243,7 +337,8 @@ pub struct PairSession {
 impl PairSession {
     /// Start a session toward a peer whose static key we know from
     /// membership. Returns the session plus the first handshake message,
-    /// which carries `now` so the responder can refuse replays of it.
+    /// which carries `now` (whole seconds) so the responder can refuse
+    /// replays of it. The engine uses `initiate_at` with a finer clock.
     pub fn initiate(
         keys: &StaticKeys,
         peer: NodeId,
@@ -251,6 +346,22 @@ impl PairSession {
         network_uuid: &str,
         me: NodeId,
         now: u64,
+    ) -> Result<(PairSession, Vec<u8>), SealError> {
+        Self::initiate_at(keys, peer, peer_pubkey, network_uuid, me, now, Tai64n::new(now, 0))
+    }
+
+    /// `initiate` with an explicit msg1 timestamp. `now` (seconds) ages
+    /// the session; `ts` is what the responder's replay check compares,
+    /// and must be strictly increasing per static key for a handshake to
+    /// be accepted.
+    pub fn initiate_at(
+        keys: &StaticKeys,
+        peer: NodeId,
+        peer_pubkey: &[u8],
+        network_uuid: &str,
+        me: NodeId,
+        now: u64,
+        ts: Tai64n,
     ) -> Result<(PairSession, Vec<u8>), SealError> {
         let pro = prologue(network_uuid, me, peer);
         let mut hs = snow::Builder::new(PATTERN.parse().expect("valid pattern"))
@@ -263,7 +374,7 @@ impl PairSession {
             .build_initiator()
             .map_err(ne)?;
         let mut msg = vec![0u8; 1024];
-        let n = hs.write_message(&now.to_be_bytes(), &mut msg).map_err(ne)?;
+        let n = hs.write_message(&ts.to_bytes(), &mut msg).map_err(ne)?;
         msg.truncate(n);
         Ok((
             PairSession {
@@ -287,7 +398,7 @@ impl PairSession {
         me: NodeId,
         first_message: &[u8],
         now: u64,
-    ) -> Result<(PairSession, Vec<u8>, u64), SealError> {
+    ) -> Result<(PairSession, Vec<u8>, Tai64n), SealError> {
         // The initiator is the peer, so the prologue orders them first.
         let pro = prologue(network_uuid, peer, me);
         let mut hs = snow::Builder::new(PATTERN.parse().expect("valid pattern"))
@@ -299,11 +410,7 @@ impl PairSession {
             .map_err(ne)?;
         let mut scratch = vec![0u8; 1024];
         let n = hs.read_message(first_message, &mut scratch).map_err(ne)?;
-        let ts = if n >= 8 {
-            u64::from_be_bytes(scratch[..8].try_into().expect("8 bytes"))
-        } else {
-            0
-        };
+        let ts = Tai64n::from_payload(&scratch[..n]);
         let mut reply = vec![0u8; 1024];
         let n = hs.write_message(&[], &mut reply).map_err(ne)?;
         reply.truncate(n);
@@ -396,10 +503,25 @@ impl PairSession {
     }
 
     /// Sessions are replaced, never repaired: rekeying is a fresh
-    /// handshake, which also gives forward secrecy (§4).
+    /// handshake, which also gives forward secrecy (§4). This is the soft
+    /// deadline — the session stays usable while its replacement is
+    /// negotiated.
     pub fn needs_rekey(&self, now: u64) -> bool {
         now.saturating_sub(self.established_at) >= REKEY_AFTER_SECS
             || self.messages >= REKEY_AFTER_MESSAGES
+    }
+
+    /// The hard deadline: past it the session is dropped, replacement or
+    /// not.
+    pub fn must_expire(&self, now: u64) -> bool {
+        now.saturating_sub(self.established_at) >= REJECT_AFTER_SECS
+            || self.messages >= REJECT_AFTER_MESSAGES
+    }
+
+    /// Seconds since the session was started (its handshake, for the
+    /// initiator; its reply, for the responder).
+    pub fn age(&self, now: u64) -> u64 {
+        now.saturating_sub(self.established_at)
     }
 }
 
@@ -439,7 +561,7 @@ mod tests {
         let (_, msg1) = PairSession::initiate(&a_keys, 20, &b_keys.public, UUID, 10, 4242).unwrap();
         let (b, _, ts) = PairSession::respond(&b_keys, 10, UUID, 20, &msg1, 0).unwrap();
         assert_eq!(b.peer_static().unwrap(), a_keys.public);
-        assert_eq!(ts, 4242, "the initiator's clock rides inside msg1");
+        assert_eq!(ts, Tai64n::new(4242, 0), "the initiator's clock rides inside msg1");
     }
 
     #[test]
@@ -568,6 +690,46 @@ mod tests {
         let (a, _) = established();
         assert!(!a.needs_rekey(REKEY_AFTER_SECS - 1));
         assert!(a.needs_rekey(REKEY_AFTER_SECS));
+    }
+
+    #[test]
+    fn the_handshake_timestamp_carries_nanoseconds_and_reads_the_old_format() {
+        let (a_keys, b_keys) = pair();
+        let ts = Tai64n::new(1_700_000_000, 123_456_789);
+        let (_, msg1) = PairSession::initiate_at(&a_keys, 20, &b_keys.public, UUID, 10, 0, ts).unwrap();
+        let (_, _, got) = PairSession::respond(&b_keys, 10, UUID, 20, &msg1, 0).unwrap();
+        assert_eq!(got, ts);
+        // An older peer's 8-byte, seconds-only payload still decodes.
+        assert_eq!(Tai64n::from_payload(&42u64.to_be_bytes()), Tai64n::new(42, 0));
+        // And the first 8 bytes of the new one are the seconds an older
+        // responder reads.
+        assert_eq!(u64::from_be_bytes(ts.to_bytes()[..8].try_into().unwrap()), ts.secs);
+        assert!(Tai64n::new(5, 1) > Tai64n::new(5, 0) && Tai64n::new(6, 0) > Tai64n::new(5, 999_999_999));
+        assert_eq!(Tai64n::new(5, 999_999_999).succ(), Tai64n::new(6, 0));
+    }
+
+    #[test]
+    fn a_session_is_rekeyed_softly_before_it_must_expire() {
+        let (a, _) = established();
+        assert!(a.needs_rekey(REKEY_AFTER_SECS) && !a.must_expire(REKEY_AFTER_SECS), "still usable while its replacement is negotiated");
+        assert!(a.must_expire(REJECT_AFTER_SECS));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_never_written_through_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        // A symlink where the temp file goes: it is removed, not followed.
+        std::os::unix::fs::symlink(&victim, dir.path().join("static.key.tmp")).unwrap();
+        let k = StaticKeys::load_or_create(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+        let meta = std::fs::symlink_metadata(dir.path().join("static.key")).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(StaticKeys::load_or_create(dir.path()).unwrap().public, k.public);
     }
 
     #[test]

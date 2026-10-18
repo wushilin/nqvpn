@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -24,7 +25,7 @@ const AF_PREFIX: usize = 0;
 pub struct RealTun {
     rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     write_tx: mpsc::Sender<Vec<u8>>,
-    mtu: u16,
+    mtu: AtomicU16,
     pub name: String,
     dev: Arc<tun_rs::SyncDevice>,
     addrs: Mutex<Vec<IpNet>>,
@@ -93,14 +94,27 @@ impl RealTun {
                             // stays visible, but the length guard is
                             // just the empty-read case above.
                             let pkt = buf[AF_PREFIX..n].to_vec();
-                            // Bounded: a stalled engine drops packets
-                            // rather than growing memory.
+                            // Bounded: a stalled engine blocks this thread
+                            // (back-pressure) rather than growing memory;
+                            // the kernel then drops at the device queue.
                             if tx.blocking_send(pkt).is_err() {
                                 return;
                             }
                         }
+                        // A signal, or a spurious wakeup on a descriptor
+                        // the backend made non-blocking: not a failure.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
                         Err(e) => {
-                            tracing::warn!("TUN read failed: {e}");
+                            // Anything else means the device is gone or
+                            // broken. Returning drops `tx`, which closes the
+                            // reader channel: the owner sees that and exits
+                            // so its supervisor restarts it, instead of
+                            // running on with a dead outbound path.
+                            tracing::error!("TUN read failed: {e}; the device is unusable");
                             return;
                         }
                     }
@@ -122,7 +136,7 @@ impl RealTun {
             })
             .context("spawning TUN writer")?;
 
-        Ok(Arc::new(RealTun { rx: Mutex::new(Some(rx)), write_tx, mtu, name, dev, addrs: Mutex::new(addrs.to_vec()) }))
+        Ok(Arc::new(RealTun { rx: Mutex::new(Some(rx)), write_tx, mtu: AtomicU16::new(mtu), name, dev, addrs: Mutex::new(addrs.to_vec()) }))
     }
 }
 
@@ -151,7 +165,13 @@ impl TunDevice for RealTun {
     }
 
     fn mtu(&self) -> u16 {
-        self.mtu
+        self.mtu.load(Ordering::Relaxed)
+    }
+
+    fn set_mtu(&self, mtu: u16) -> Result<()> {
+        crate::routes::set_device_mtu(&self.name, mtu)?;
+        self.mtu.store(mtu, Ordering::Relaxed);
+        Ok(())
     }
 
     fn name(&self) -> String {

@@ -356,6 +356,99 @@ async fn assigning_an_address_held_by_another_member_is_rejected_atomically() {
     assert_eq!(alice["ip4"], assigned[0]);
 }
 
+#[tokio::test]
+async fn an_empty_bearer_token_is_never_a_credential() {
+    let api = spawn().await;
+    for h in ["Bearer ", "Bearer    ", "Bearer"] {
+        assert_eq!(get(api.addr, "/api/v1/status", &[("Authorization", h)]).await.status, 401, "{h:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_cross_origin_request_with_the_session_cookie_is_refused() {
+    let api = spawn().await;
+    let a = api.addr;
+    let ok = post(a, "/api/v1/login", &[], r#"{"user":"admin","password":"s3cr3t-pw"}"#).await;
+    let cookie = ok.cookie().unwrap();
+    let net = r#"{"network_id":"x","ipv4_cidr":"10.7.0.0/16","settings":{}}"#;
+    let evil = post(a, "/api/v1/networks", &[("Cookie", &cookie), ("Origin", "https://evil.example")], net).await;
+    assert_eq!(evil.status, 403, "{}", evil.body);
+    assert!(get(a, "/api/v1/status", &bearer()).await.json()["networks"].as_array().unwrap().is_empty());
+    // The coordinator's own page (Origin = the Host it was served from) is fine,
+    // and so is a request with no Origin at all.
+    let own = post(a, "/api/v1/networks", &[("Cookie", &cookie), ("Origin", "https://localhost")], net).await;
+    assert_eq!(own.status, 200, "{}", own.body);
+    let net2 = r#"{"network_id":"y","ipv4_cidr":"10.6.0.0/16","settings":{}}"#;
+    assert_eq!(post(a, "/api/v1/networks", &[("Cookie", &cookie)], net2).await.status, 200);
+    // A script with the bearer token is not judged by Origin.
+    let net3 = r#"{"network_id":"z","ipv4_cidr":"10.5.0.0/16","settings":{}}"#;
+    let mut h = bearer();
+    h.push(("Origin", "https://dashboard.example"));
+    assert_eq!(post(a, "/api/v1/networks", &h, net3).await.status, 200);
+    // The live feed's upgrade is checked the same way.
+    let ws = get(
+        a,
+        "/api/v1/ws",
+        &[
+            ("Cookie", &cookie),
+            ("Origin", "https://evil.example"),
+            ("Upgrade", "websocket"),
+            ("Connection", "upgrade"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+    assert_eq!(ws.status, 403);
+}
+
+#[tokio::test]
+async fn login_attempts_are_counted_before_the_password_is_checked() {
+    let api = spawn().await;
+    let a = api.addr;
+    // Fire more concurrent wrong guesses than the per-minute allowance:
+    // counting first means some are refused outright, however they race.
+    let window = now_unix() / 60;
+    let n = nqvpn_coord::auth::MAX_LOGIN_ATTEMPTS_PER_MIN as usize + 6;
+    let tasks: Vec<_> = (0..n)
+        .map(|_| tokio::spawn(async move { post(a, "/api/v1/login", &[], r#"{"user":"admin","password":"nope"}"#).await.status }))
+        .collect();
+    let mut codes = Vec::new();
+    for t in tasks {
+        codes.push(t.await.unwrap());
+    }
+    let late = post(a, "/api/v1/login", &[], r#"{"user":"admin","password":"s3cr3t-pw"}"#).await;
+    if now_unix() / 60 != window {
+        return; // the one-minute window rolled mid-test (argon2 is slow in debug builds)
+    }
+    let unauthorized = codes.iter().filter(|c| **c == 401).count();
+    assert!(unauthorized <= nqvpn_coord::auth::MAX_LOGIN_ATTEMPTS_PER_MIN as usize, "{codes:?}");
+    assert!(codes.contains(&429), "{codes:?}");
+    // The right password is refused too, now: the source is out of attempts.
+    assert_eq!(late.status, 429);
+}
+
+#[tokio::test]
+async fn an_invalid_import_changes_nothing() {
+    let api = spawn().await;
+    let a = api.addr;
+    post(a, "/api/v1/networks", &bearer(), r#"{"network_id":"n","ipv4_cidr":"10.0.0.0/16","settings":{}}"#).await;
+    post(a, "/api/v1/networks/n/members", &bearer(), r#"{"name":"c1","role":"client"}"#).await;
+    let export = get(a, "/api/v1/export", &bearer()).await.json();
+    // One good network and one with an invalid id: neither is applied.
+    let mut fresh = export[0].clone();
+    fresh["network_id"] = "fresh".into();
+    fresh["clients"] = serde_json::json!({});
+    let mut bad = export[0].clone();
+    bad["network_id"] = "../etc".into();
+    bad["clients"] = serde_json::json!({});
+    let body = serde_json::to_string(&serde_json::json!([fresh, bad])).unwrap();
+    let r = post(a, "/api/v1/import", &bearer(), &body).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    let nets = get(a, "/api/v1/status", &bearer()).await.json();
+    assert_eq!(nets["networks"].as_array().unwrap().len(), 1, "the valid network in a refused import is not created");
+}
+
 fn base64_std(b: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;

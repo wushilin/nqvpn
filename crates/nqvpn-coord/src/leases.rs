@@ -12,6 +12,13 @@
 //! attached to its relay. The relay's own session with the client is
 //! the truth, and the relay reports it for as long as it lasts.
 //!
+//! One check keeps a relay from claiming clients it does not hold: only
+//! clients of the network can be declared at all, and while a client is
+//! online and reports which relay it is attached to, only that relay's
+//! declaration counts for it. Both sides heartbeat at once on every
+//! attach, so this costs a move no time; a client silent to us (or not
+//! saying) falls back to the most recent declaration.
+//!
 //! All timestamps here are **milliseconds**: two relays can declare the
 //! same client within one second during a move, and the later one must
 //! still win.
@@ -67,18 +74,37 @@ impl Leases {
         !was_online
     }
 
-    /// Fold in a heartbeat. Returns true if the derived attachment table
-    /// may have changed.
-    pub fn heartbeat(&mut self, node: NodeId, role: Role, hb: &Heartbeat, now: u64) -> bool {
-        self.seen(node, now);
+    /// Fold in a heartbeat. Returns true if the published view may have
+    /// changed: the member just came online, or the derived attachment
+    /// table may have moved.
+    ///
+    /// A relay's `attached` is filtered to `is_client` and at most
+    /// `max_attached` entries are considered — the network has no more
+    /// clients than that.
+    pub fn heartbeat(
+        &mut self,
+        node: NodeId,
+        role: Role,
+        hb: &Heartbeat,
+        now: u64,
+        is_client: &dyn Fn(NodeId) -> bool,
+        max_attached: usize,
+    ) -> bool {
+        let came_online = self.seen(node, now);
         self.reported.insert(node, Report { gen: hb.gen, digest: hb.digest, at: now });
-        match role {
+        let changed = match role {
             Role::Relay => {
+                if hb.attached.len() > max_attached {
+                    tracing::warn!(relay = node, declared = hb.attached.len(), max_attached, "relay declared more clients than the network has; truncating");
+                }
                 let next_seq = &mut self.next_seq;
                 let mine = self.declared.entry(node).or_default();
                 let mut changed = false;
                 let mut keep: HashMap<NodeId, Claim> = HashMap::new();
-                for AttachedClient { node_id, session_id } in &hb.attached {
+                for AttachedClient { node_id, session_id } in hb.attached.iter().take(max_attached) {
+                    if !is_client(*node_id) {
+                        continue;
+                    }
                     let claim = match mine.get(node_id) {
                         Some(c) if c.session_id == *session_id => *c,
                         _ => {
@@ -97,13 +123,15 @@ impl Leases {
                 changed
             }
             Role::Client => {
-                match hb.attached_to {
+                let before = match hb.attached_to {
                     Some(r) => self.attached_to.insert(node, r),
                     None => self.attached_to.remove(&node),
                 };
-                false
+                // The client's own report picks among relays claiming it.
+                before != hb.attached_to
             }
-        }
+        };
+        came_online || changed
     }
 
     /// Expire members silent for longer than `window`. Returns the ones
@@ -170,11 +198,16 @@ impl Leases {
         self.last_seen.keys().copied().collect()
     }
 
-    /// client -> relay, the most recent declaration winning.
+    /// client -> relay, the most recent declaration winning — among the
+    /// declarations the client itself confirms, while it is online and
+    /// says where it is attached.
     pub fn attachments(&self) -> BTreeMap<NodeId, NodeId> {
         let mut best: BTreeMap<NodeId, (u64, NodeId)> = BTreeMap::new();
         for (relay, claims) in &self.declared {
             for (client, c) in claims {
+                if self.attached_to.get(client).is_some_and(|r| r != relay) {
+                    continue; // the client says it is elsewhere
+                }
                 match best.get(client) {
                     Some((seq, _)) if *seq > c.seq => {}
                     _ => {
@@ -229,35 +262,35 @@ mod tests {
     #[test]
     fn declarations_are_sets_not_events() {
         let mut l = Leases::default();
-        assert!(l.heartbeat(1, Role::Relay, &hb(&[(10, 1), (11, 1)]), 100));
+        assert!(l.heartbeat(1, Role::Relay, &hb(&[(10, 1), (11, 1)]), 100, &|_| true, usize::MAX));
         assert_eq!(l.attachments().get(&10), Some(&1));
         // A lost "detach" cannot exist: the next declaration omits 11.
-        assert!(l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 105));
+        assert!(l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 105, &|_| true, usize::MAX));
         assert!(!l.attachments().contains_key(&11));
         // Re-declaring the same set changes nothing.
-        assert!(!l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 110));
+        assert!(!l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 110, &|_| true, usize::MAX));
     }
 
     #[test]
     fn a_move_is_won_by_the_most_recent_declaration() {
         let mut l = Leases::default();
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100, &|_| true, usize::MAX);
         // Client moves to relay 2; relay 1's stale session still lists it.
-        l.heartbeat(2, Role::Relay, &hb(&[(10, 1)]), 110);
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 115);
+        l.heartbeat(2, Role::Relay, &hb(&[(10, 1)]), 110, &|_| true, usize::MAX);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 115, &|_| true, usize::MAX);
         assert_eq!(l.attachments()[&10], 2, "newer declaration wins even while the old repeats");
         // Relay 1's stale session dies; nothing to detach, it just stops.
-        l.heartbeat(1, Role::Relay, &hb(&[]), 120);
+        l.heartbeat(1, Role::Relay, &hb(&[]), 120, &|_| true, usize::MAX);
         assert_eq!(l.attachments()[&10], 2);
         // The client bounces back to relay 1 with a *new* session.
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 2)]), 130);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 2)]), 130, &|_| true, usize::MAX);
         assert_eq!(l.attachments()[&10], 1, "a new session id is a new declaration");
     }
 
     #[test]
     fn control_leases_expiring_do_not_detach_anyone() {
         let mut l = Leases::default();
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100, &|_| true, usize::MAX);
         l.seen(10, 100);
         let mut gone = l.expire(200, 15);
         gone.sort();
@@ -267,10 +300,10 @@ mod tests {
         // the fact that the relay holds the client's session.
         assert_eq!(l.attachments().get(&10), Some(&1));
         // The relay stops declaring it: now it is gone.
-        l.heartbeat(1, Role::Relay, &hb(&[]), 300);
+        l.heartbeat(1, Role::Relay, &hb(&[]), 300, &|_| true, usize::MAX);
         assert!(!l.attachments().contains_key(&10));
         // Explicit removal drops claims at once.
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 400);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 400, &|_| true, usize::MAX);
         l.remove(10);
         assert!(!l.attachments().contains_key(&10));
     }
@@ -278,7 +311,7 @@ mod tests {
     #[test]
     fn explicit_removal_forgets_everything() {
         let mut l = Leases::default();
-        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100);
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 1)]), 100, &|_| true, usize::MAX);
         l.remove_relay(1);
         assert!(l.attachments().is_empty());
         assert!(!l.is_online(1));
@@ -291,11 +324,39 @@ mod tests {
         h.gen = 42;
         h.digest = 7;
         h.attached_to = Some(1);
-        assert!(!l.heartbeat(10, Role::Client, &h, 100));
+        assert!(l.heartbeat(10, Role::Client, &h, 100, &|_| true, usize::MAX), "came online");
         assert_eq!(l.report(10).unwrap().gen, 42);
         assert_eq!(l.attached_to(10), Some(1));
         assert_eq!(l.online_since(10), Some(100));
+        assert!(!l.heartbeat(10, Role::Client, &h, 120, &|_| true, usize::MAX), "nothing new");
         l.seen(10, 150);
         assert_eq!(l.online_since(10), Some(100), "still the same online period");
+    }
+
+    #[test]
+    fn a_relay_cannot_claim_non_clients_or_a_client_that_says_it_is_elsewhere() {
+        let mut l = Leases::default();
+        let clients = |n: NodeId| n >= 10;
+        // Relay 2 claims client 10 and relay 1 (not a client): only 10 counts.
+        l.heartbeat(2, Role::Relay, &hb(&[(10, 1), (1, 1)]), 100, &clients, 8);
+        assert_eq!(l.declared_by(2), vec![10]);
+        // More entries than the network has clients: the excess is ignored.
+        l.heartbeat(2, Role::Relay, &hb(&[(10, 1), (11, 1), (12, 1)]), 101, &clients, 2);
+        let mut d = l.declared_by(2);
+        d.sort();
+        assert_eq!(d, vec![10, 11]);
+
+        // Client 10 is online and says it is on relay 1. Relay 2's newer
+        // claim is a hijack attempt and does not win.
+        l.heartbeat(1, Role::Relay, &hb(&[(10, 5)]), 102, &clients, 8);
+        l.heartbeat(2, Role::Relay, &hb(&[(10, 9)]), 103, &clients, 8);
+        assert_eq!(l.attachments()[&10], 2, "no word from the client: most recent declaration");
+        let mut h = hb(&[]);
+        h.attached_to = Some(1);
+        assert!(l.heartbeat(10, Role::Client, &h, 104, &clients, 8));
+        assert_eq!(l.attachments()[&10], 1, "the client's own report decides");
+        // The client goes silent: back to the declarations alone.
+        l.offline(10);
+        assert_eq!(l.attachments()[&10], 2);
     }
 }

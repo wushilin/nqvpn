@@ -152,15 +152,16 @@ impl Snapshot {
     /// Put every list in canonical order. Diff, apply and digest all
     /// assume it; the coordinator normalises before publishing and apply
     /// keeps the invariant.
+    ///
+    /// Of two entries with the same key the *last* wins — the same rule
+    /// `diff` and `apply` get from collecting into a map, so all three
+    /// agree on what a list with duplicates means.
     pub fn normalize(&mut self) {
-        self.members.sort_by_key(|m| m.node_id);
-        self.members.dedup_by_key(|m| m.node_id);
-        self.attachments.sort_by_key(|a| a.node_id);
-        self.attachments.dedup_by_key(|a| a.node_id);
-        self.relays.sort_by_key(|r| r.relay_id);
-        self.relays.dedup_by_key(|r| r.relay_id);
-        self.keys.sort_by(|a, b| a.kid.cmp(&b.kid));
-        self.reserved_prefixes.sort_by_key(|p| p.to_string());
+        keep_last_sorted(&mut self.members, |m| m.node_id);
+        keep_last_sorted(&mut self.attachments, |a| a.node_id);
+        keep_last_sorted(&mut self.relays, |r| r.relay_id);
+        keep_last_sorted(&mut self.keys, |k| k.kid.clone());
+        self.reserved_prefixes.sort_by_key(prefix_order);
         self.reserved_prefixes.dedup();
     }
 
@@ -170,7 +171,10 @@ impl Snapshot {
         let mut c = self.clone();
         c.gen = 0;
         c.normalize();
-        let bytes = crate::envelope::encode_payload(&c).unwrap_or_default();
+        // Unbounded: a size cap here would not make a large view smaller,
+        // only make every large view hash alike. A value this type can
+        // hold always encodes; a failure would be a bug worth a panic.
+        let bytes = crate::envelope::encode_unbounded(&c).expect("a snapshot always encodes");
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bytes {
             h ^= b as u64;
@@ -274,6 +278,24 @@ impl Snapshot {
             .binary_search_by_key(&id, |a| a.node_id)
             .ok()
             .map(|i| self.attachments[i].relay_id)
+    }
+}
+
+/// Sort by key and drop duplicates, keeping the one that came last.
+/// Reversing first makes the stable sort put the last occurrence of each
+/// key ahead of the others, which `dedup_by_key` then keeps.
+fn keep_last_sorted<T, K: Ord>(v: &mut Vec<T>, key: impl Fn(&T) -> K) {
+    v.reverse();
+    v.sort_by_key(|x| key(x));
+    v.dedup_by(|a, b| key(a) == key(b));
+}
+
+/// Canonical prefix order: family, then address numerically, then
+/// length. Not the string form, which puts 10.0.0.0/8 before 9.0.0.0/8.
+fn prefix_order(p: &IpNet) -> (u8, u128, u8) {
+    match p {
+        IpNet::V4(n) => (4, u32::from(n.addr()) as u128, n.prefix_len()),
+        IpNet::V6(n) => (6, u128::from(n.addr()), n.prefix_len()),
     }
 }
 
@@ -489,6 +511,116 @@ mod tests {
         assert!(d.members_changed.is_empty() && d.members_removed.is_empty());
         assert!(d.attachments_changed.is_empty() && d.attachments_removed.is_empty());
         assert!(d.relays.is_none() && d.mtu.is_none() && d.keys.is_none());
+    }
+
+    #[test]
+    fn diff_then_apply_agrees_with_normalize_even_with_duplicates() {
+        // Deterministic pseudo-random inputs (no RNG dependency in the
+        // property): every list gets duplicate keys with differing
+        // content, in arbitrary order, on both sides.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let random_snap = |gen: u64, next: &mut dyn FnMut(u64) -> u64| {
+            let mut s = Snapshot { gen, ..Default::default() };
+            for _ in 0..next(12) {
+                let id = next(6) as NodeId;
+                s.members.push(peer(id, &format!("10.0.0.{}/32", next(250)), next(2) == 0));
+            }
+            for _ in 0..next(8) {
+                s.attachments.push(AttachmentEntry { node_id: next(6) as NodeId, relay_id: next(3) as NodeId });
+            }
+            for _ in 0..next(4) {
+                let id = next(3) as NodeId;
+                s.relays.push(RelayEndpoint { relay_id: id, name: format!("r{}", next(9)), addr: "a:1".into(), cert_fp: "f".into() });
+            }
+            for _ in 0..next(4) {
+                s.keys.push(KeyInfo { kid: format!("k{}", next(3)), key: format!("K{}", next(9)), state: "active".into() });
+            }
+            for _ in 0..next(5) {
+                let p: IpNet = match next(3) {
+                    0 => format!("{}.0.0.0/8", 1 + next(20)).parse().unwrap(),
+                    1 => format!("10.{}.0.0/16", next(4)).parse().unwrap(),
+                    _ => format!("fd00:{:x}::/48", next(4)).parse().unwrap(),
+                };
+                s.reserved_prefixes.push(p);
+            }
+            s
+        };
+        for round in 0..500 {
+            let a_raw = random_snap(round * 2 + 1, &mut next);
+            let b_raw = random_snap(round * 2 + 2, &mut next);
+            let mut a = a_raw.clone();
+            a.normalize();
+            let mut b = b_raw.clone();
+            b.normalize();
+            // Diff over the raw (duplicate-laden) lists must mean the same
+            // as diff over normalised ones.
+            let mut applied = a.clone();
+            applied.apply(&a_raw.diff(&b_raw)).unwrap();
+            assert_eq!(applied, b, "round {round}: raw diff");
+            let mut applied = a.clone();
+            applied.apply(&a.diff(&b)).unwrap();
+            assert_eq!(applied, b, "round {round}: normalised diff");
+            assert_eq!(applied.digest(), b.digest());
+            // Normalising is idempotent.
+            let mut again = b.clone();
+            again.normalize();
+            assert_eq!(again, b);
+        }
+    }
+
+    #[test]
+    fn duplicates_keep_the_last_entry_and_prefixes_sort_numerically() {
+        let mut s = Snapshot {
+            members: vec![peer(1, "10.0.0.1/32", true), peer(1, "10.0.0.1/32", false)],
+            ..Default::default()
+        };
+        s.keys = vec![
+            KeyInfo { kid: "k1".into(), key: "old".into(), state: "active".into() },
+            KeyInfo { kid: "k1".into(), key: "new".into(), state: "active".into() },
+        ];
+        s.reserved_prefixes = vec![
+            "fd00::/48".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+            "9.0.0.0/8".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+        ];
+        s.normalize();
+        assert_eq!(s.members.len(), 1);
+        assert!(!s.members[0].online, "the later duplicate wins, as in diff/apply");
+        assert_eq!(s.keys.len(), 1);
+        assert_eq!(s.keys[0].key, "new");
+        let order: Vec<String> = s.reserved_prefixes.iter().map(|p| p.to_string()).collect();
+        assert_eq!(order, vec!["9.0.0.0/8", "10.0.0.0/8", "fd00::/48"]);
+    }
+
+    #[test]
+    fn a_view_past_one_mib_still_encodes_and_digests_by_content() {
+        // ~12k members is well past the old 1 MiB cap. It must still go
+        // on the wire, and two different large views must not collide on
+        // the hash of an empty encoding.
+        let mut a = Snapshot { gen: 1, ..Default::default() };
+        for id in 0..12_000u32 {
+            let mut p = peer(id, "10.0.0.1/32", true);
+            p.pubkey = format!("{id:0>44}");
+            p.name = format!("member-{id:06}-with-a-longer-name");
+            a.members.push(p);
+        }
+        a.normalize();
+        let bytes = encode_msg(Kind::Snapshot, &a).unwrap();
+        assert!(bytes.len() > crate::envelope::MAX_PAYLOAD as usize, "test must exceed the small cap");
+        let (env, _) = Envelope::decode(&bytes).unwrap();
+        let back: Snapshot = decode_payload(&env.payload).unwrap();
+        assert_eq!(back, a);
+        let mut b = a.clone();
+        b.members[5].online = false;
+        assert_ne!(a.digest(), b.digest(), "large views hash by content");
+        assert_ne!(a.digest(), 0xcbf2_9ce4_8422_2325, "never the hash of nothing");
     }
 
     #[test]

@@ -6,14 +6,16 @@
 //! its listener before joining, the coordinator can simply try the
 //! advertised address and say so immediately.
 //!
-//! This is advisory, never a rejection: the coordinator's vantage point
-//! is not every peer's, firewalls can be source-specific, and a slow
-//! start-up would produce false negatives. It converts an invisible
-//! partial mesh into a visible warning, which is the whole point.
+//! By default ("warn") this is advisory, never a rejection: the
+//! coordinator's vantage point is not every peer's, firewalls can be
+//! source-specific, and a slow start-up would produce false negatives.
+//! It converts an invisible partial mesh into a visible warning, which
+//! is the whole point. A network set to "deny" probes before answering
+//! the join and refuses it (`relay_unreachable`; the relay retries).
 
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::quic::client_config;
-use std::net::ToSocketAddrs;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 /// What the coordinator learned about an advertised relay address.
@@ -42,11 +44,21 @@ impl Reachability {
 /// we deliberately do not authenticate, since we only care about
 /// reachability, and the relay will reject us at the app layer anyway.
 pub async fn probe(addr: &str, timeout: Duration) -> Reachability {
-    let Ok(mut resolved) = addr.to_socket_addrs() else {
+    // Resolved off the reactor (and within the probe's own deadline):
+    // the system resolver blocks.
+    let Ok(Ok(mut resolved)) = tokio::time::timeout(timeout, tokio::net::lookup_host(addr)).await else {
         return Reachability::Unreachable;
     };
     let Some(sock) = resolved.next() else {
         return Reachability::Unreachable;
+    };
+    // An IPv4-mapped address is dialed as the IPv4 address it is.
+    let sock = SocketAddr::new(sock.ip().to_canonical(), sock.port());
+    // Bind the family being dialed: an IPv4 wildcard socket cannot reach
+    // an IPv6 relay.
+    let bind: SocketAddr = match sock {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     };
     // A throwaway identity: the peer refuses our credential, but only
     // after the transport handshake we are measuring has succeeded.
@@ -56,11 +68,16 @@ pub async fn probe(addr: &str, timeout: Duration) -> Reachability {
     let Ok(cfg) = client_config(&id, None, 5) else {
         return Reachability::Unknown;
     };
-    let Ok(mut ep) = quinn::Endpoint::client("0.0.0.0:0".parse().expect("wildcard")) else {
+    let Ok(mut ep) = quinn::Endpoint::client(bind) else {
         return Reachability::Unknown;
     };
     ep.set_default_client_config(cfg);
-    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("relay");
+    // A bracketed IPv6 literal is not a valid TLS server name; the bare
+    // address is.
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_start_matches('[').trim_end_matches(']'))
+        .unwrap_or("relay");
     let connecting = match ep.connect(sock, host) {
         Ok(c) => c,
         Err(_) => return Reachability::Unreachable,
@@ -103,6 +120,21 @@ mod tests {
             probe(&addr.to_string(), Duration::from_secs(3)).await,
             Reachability::Reachable
         );
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_listener_is_reachable() {
+        let id = TlsIdentity::generate("relay").unwrap();
+        let Ok(ep) = quinn::Endpoint::server(server_config(&id, 5).unwrap(), "[::1]:0".parse().unwrap()) else {
+            return; // no IPv6 loopback on this host
+        };
+        let addr = ep.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(i) = ep.accept().await {
+                let _ = i.await;
+            }
+        });
+        assert_eq!(probe(&addr.to_string(), Duration::from_secs(3)).await, Reachability::Reachable);
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@
 
 use anyhow::Result;
 use nqvpn_endpoint::engine::{Engine, Uplink};
-use nqvpn_endpoint::peers::PeerTable;
-use nqvpn_endpoint::routes::{exclude_local, wanted_routes};
+use nqvpn_endpoint::peers::{PeerTable, RoutePolicy};
+use nqvpn_endpoint::routes::{exclude_local, refused_prefixes, wanted_routes_with};
 use nqvpn_endpoint::tun::TunDevice;
 use nqvpn_proto::api::{JoinResponse, RelayEntry};
 use nqvpn_proto::control::{Heartbeat, Snapshot};
@@ -17,11 +17,11 @@ use nqvpn_session::{End, Session, SessionConfig};
 use nqvpn_sync::link::MemberHooks;
 use nqvpn_session::{Refused, CLOSE_EVICTED, CLOSE_STALE_LOGIN};
 use nqvpn_sync::{LinkHandle, LocalFacts, Reconcile, View};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Route programming behind one method, so the harness can record.
 pub trait RouteSink: Send + Sync {
@@ -133,14 +133,25 @@ pub struct Client {
     /// The exit each family is currently sealed to, so a change of exit is
     /// reported once rather than every reconcile.
     exit_chosen: Mutex<std::collections::BTreeMap<bool, NodeId>>,
-    /// Relay transport address -> its resolved IPs, resolved once and kept.
+    /// Relay transport address -> its resolved IPs.
     ///
     /// Under route-all these are the hosts we pin to the real gateway, so
     /// re-resolving them on every reconcile would make the tunnel depend on
     /// working DNS *forever* — and DNS is one of the things the tunnel
-    /// captures. Resolving once, before the catch-all is armed, is what
-    /// keeps that from becoming circular.
-    relay_addrs: Mutex<HashMap<String, Vec<IpAddr>>>,
+    /// captures. A result, once had, is therefore never given up: it is
+    /// refreshed after `RELAY_ADDR_TTL`, but a refresh that fails keeps
+    /// the old addresses. Lookups run off the reconcile path (see
+    /// `RelayAddrs`), so a slow resolver never stalls the runtime.
+    relay_addrs: Arc<Mutex<HashMap<String, RelayAddr>>>,
+    /// What the route policy (`[routes] allow`) refuses, as last logged,
+    /// so a refusal is warned about once per change, not per reconcile.
+    route_policy: Mutex<RoutePolicy>,
+    refused_seen: Mutex<BTreeSet<(ipnet::IpNet, Option<NodeId>)>>,
+    /// Route-all families last reported as failed closed / withheld.
+    route_all_reported: Mutex<(Vec<bool>, Vec<bool>)>,
+    /// Signalled when the TUN's reader ends: the device is gone and the
+    /// process must exit so its supervisor restarts it.
+    tun_gone: tokio::sync::Notify,
     pub counters: ClientCounters,
     /// `--route-all`: send all traffic through the tunnel (the two-/1
     /// default override), pinning the underlay transport to the real
@@ -200,7 +211,11 @@ impl Client {
             preferred_relay: Mutex::new(preferred_relay.or_else(|| joined.preferred_relay.clone())),
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
             underlay: Mutex::new(Vec::new()),
-            relay_addrs: Mutex::new(HashMap::new()),
+            relay_addrs: Arc::new(Mutex::new(HashMap::new())),
+            route_policy: Mutex::new(RoutePolicy::default()),
+            refused_seen: Mutex::new(BTreeSet::new()),
+            route_all_reported: Mutex::new((Vec::new(), Vec::new())),
+            tun_gone: tokio::sync::Notify::new(),
             exit_chosen: Mutex::new(std::collections::BTreeMap::new()),
             counters: ClientCounters::default(),
             route_all,
@@ -212,6 +227,20 @@ impl Client {
         self.credential.lock().unwrap().clone()
     }
 
+    /// Resolves when the TUN device has failed for good (its reader ended).
+    pub async fn tun_failed(&self) {
+        self.tun_gone.notified().await
+    }
+
+    /// Apply a route policy (the config's `[routes] allow`) to the OS
+    /// routes and the in-VPN table. Takes effect at the next reconcile,
+    /// which this triggers.
+    pub fn set_route_policy(&self, policy: RoutePolicy) {
+        *self.route_policy.lock().unwrap() = policy.clone();
+        self.engine.peers.lock().unwrap().set_policy(policy);
+        self.view.poke();
+    }
+
     /// Start the pumps: TUN -> engine -> uplink, and the rekey sweep.
     pub fn spawn_pumps(self: &Arc<Self>) {
         let mut reader = self.tun.reader();
@@ -220,6 +249,11 @@ impl Client {
             while let Some(pkt) = reader.recv().await {
                 me.engine.outbound(pkt, me.uplink.as_ref(), me.tun.as_ref());
             }
+            // The device's reader only ends when the device is unusable.
+            // Running on would leave a process that looks alive but sends
+            // nothing; `tun_failed` lets the owner exit instead.
+            tracing::error!(device = %me.device, "the TUN device stopped delivering packets");
+            me.tun_gone.notify_one();
         });
         let me = self.clone();
         tokio::spawn(async move {
@@ -353,8 +387,11 @@ impl MemberHooks for Client {
     fn refused(&self, refused: bool) {
         if refused {
             tracing::warn!("refused by the coordinator; dropping the uplink until accepted again");
+            // Take the session before clearing the slot: once cleared there
+            // is nothing left to close, and the relay keeps it open.
+            let held = self.uplink.session();
             self.uplink.set(None, None);
-            if let Some(s) = self.uplink.session() {
+            if let Some(s) = held {
                 s.close(CLOSE_EVICTED, "refused by the coordinator");
             }
         }
@@ -448,55 +485,22 @@ impl Client {
     /// Peers, routes and the uplink, reconciled against the view.
     pub fn reconcile_view(&self, view: &Snapshot) {
         let c = self;
-        {
-            let mut peers = c.engine.peers.lock().unwrap();
-            // A peer whose key changed must not keep using the old session.
-            let mut changed_keys = Vec::new();
-            for m in &view.members {
-                if let Some(old) = peers.get(m.node_id) {
-                    if old.pubkey != m.pubkey {
-                        changed_keys.push(m.node_id);
-                    }
-                }
-            }
-            peers.replace_all(view.members.clone());
-            drop(peers);
-            let mut sessions = c.engine.sessions.lock().unwrap();
-            for id in changed_keys {
-                sessions.remove(id);
-            }
-        }
+        // Peers and sessions: a session whose peer left the view, or whose
+        // authenticated key is no longer the published one, is dropped,
+        // with its queue (see `Engine::sync_peers`).
+        c.engine.sync_peers(view.members.clone());
+        c.apply_mtu(view.mtu.mtu);
         let mine = c.mine.lock().unwrap().clone();
-        let wanted = wanted_routes(view, c.node_id, &mine);
+        let policy = c.route_policy.lock().unwrap().clone();
+        c.report_refused(view, &policy);
+        let wanted = wanted_routes_with(view, c.node_id, &mine, &policy);
         let local = nqvpn_endpoint::ifaces::local_prefixes(&c.device);
         let mut underlay = c.underlay.lock().unwrap().clone();
-        // Relay addresses from the view, resolved once per address and kept:
-        // a relay that joins later is resolved and pinned on the reconcile
-        // its snapshot triggers, and never looked up again.
-        {
-            use std::net::ToSocketAddrs;
-            let mut cache = c.relay_addrs.lock().unwrap();
-            for r in &view.relays {
-                let ips = cache.entry(r.addr.clone()).or_insert_with(|| {
-                    match r.addr.to_socket_addrs() {
-                        Ok(it) => it.map(|s| s.ip()).collect(),
-                        Err(e) => {
-                            // Left uncached (empty is cached, an error is not)
-                            // so the next reconcile tries again. Unpinned, this
-                            // relay's transport falls into the catch-all and is
-                            // unreachable, so say so rather than failing mutely.
-                            tracing::warn!(relay = %r.name, addr = %r.addr, "cannot resolve this relay's address; it will not be pinned and may be unreachable under route-all: {e}");
-                            Vec::new()
-                        }
-                    }
-                });
-                if ips.is_empty() {
-                    cache.remove(&r.addr);
-                    continue;
-                }
-                underlay.extend(ips.iter().copied());
-            }
-        }
+        // Relay addresses from the view, from the resolver cache: a relay
+        // that joins later is looked up in the background and pinned on
+        // the reconcile its result triggers.
+        let (relay_ips, resolving) = c.relay_ips(view);
+        underlay.extend(relay_ips);
         let (mut keep, excluded) = exclude_local(wanted, &local, &underlay);
         for (net, why) in excluded {
             tracing::warn!(prefix = %net, %why, "not routing member prefix into the tunnel");
@@ -521,7 +525,17 @@ impl Client {
             // to is the best exit there is: no mesh hop, and it moves only
             // when our attachment does.
             let attached_relay = c.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id);
-            let plan = nqvpn_endpoint::routes::route_all_plan(view, c.via.as_deref(), attached_relay, &to_pin, &pinned);
+            let plan = nqvpn_endpoint::routes::route_all_plan(view, c.via.as_deref(), attached_relay, &underlay, &to_pin, &pinned);
+            // Not armed yet and a relay's first lookup is still running:
+            // wait for it (it pokes the view when done), or the catch-all
+            // would go up before that relay's pin and swallow its dial.
+            let plan = if resolving && c.exit_chosen.lock().unwrap().is_empty() {
+                tracing::info!("route-all: waiting for relay addresses to resolve before arming the catch-all");
+                nqvpn_endpoint::routes::RouteAllPlan::default()
+            } else {
+                plan
+            };
+            c.report_route_all(view, attached_relay, &plan, &to_pin, &pinned);
             if plan.nets.is_empty() {
                 tracing::warn!(
                     via = ?c.via,
@@ -592,6 +606,172 @@ impl Client {
     }
 }
 
+/// How long a resolver gets before a lookup counts as failed.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A relay address that resolved is looked up again after this long.
+const RELAY_ADDR_TTL: Duration = Duration::from_secs(3600);
+/// Retry delay after a failed lookup: doubles per failure up to the cap.
+const RELAY_ADDR_RETRY_MIN: Duration = Duration::from_secs(5);
+const RELAY_ADDR_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// One relay transport address in the resolver cache.
+#[derive(Debug, Clone)]
+pub struct RelayAddr {
+    /// The last successful result; kept through failed refreshes.
+    pub ips: Vec<IpAddr>,
+    /// When to look it up (again).
+    due: Instant,
+    /// Consecutive failures, for the backoff.
+    failures: u32,
+    in_flight: bool,
+}
+
+impl Client {
+    /// The IPs of every relay in the view, from the cache. Addresses not
+    /// yet resolved, or due a refresh, are looked up in the background —
+    /// never here: this runs on the reconcile path of a single-threaded
+    /// runtime, where a blocking lookup would stall probes, heartbeats
+    /// and the data pumps for the resolver's whole timeout. A finished
+    /// lookup pokes the view, so its result is pinned on the next pass.
+    ///
+    /// Also says whether some relay's *first* lookup has not finished yet.
+    fn relay_ips(&self, view: &Snapshot) -> (Vec<IpAddr>, bool) {
+        let now = Instant::now();
+        let (mut out, mut resolving) = (Vec::new(), false);
+        let mut cache = self.relay_addrs.lock().unwrap();
+        cache.retain(|addr, _| view.relays.iter().any(|r| &r.addr == addr));
+        for r in &view.relays {
+            let e = cache.entry(r.addr.clone()).or_insert_with(|| RelayAddr { ips: Vec::new(), due: now, failures: 0, in_flight: false });
+            out.extend(e.ips.iter().copied());
+            resolving |= e.ips.is_empty() && e.failures == 0;
+            if e.in_flight || e.due > now {
+                continue;
+            }
+            let Ok(rt) = tokio::runtime::Handle::try_current() else { continue };
+            e.in_flight = true;
+            let (addr, name) = (r.addr.clone(), r.name.clone());
+            let (cache, view) = (self.relay_addrs.clone(), self.view.clone());
+            rt.spawn(async move {
+                let got = match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(addr.as_str())).await {
+                    Ok(Ok(it)) => Ok(it.map(|s| s.ip()).collect::<Vec<_>>()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("timed out".to_string()),
+                };
+                let changed = {
+                    let mut cache = cache.lock().unwrap();
+                    let Some(e) = cache.get_mut(&addr) else { return };
+                    e.in_flight = false;
+                    match got {
+                        Ok(mut ips) if !ips.is_empty() => {
+                            ips.sort();
+                            ips.dedup();
+                            e.failures = 0;
+                            e.due = Instant::now() + RELAY_ADDR_TTL;
+                            let changed = e.ips != ips;
+                            e.ips = ips;
+                            changed
+                        }
+                        other => {
+                            e.failures = e.failures.saturating_add(1);
+                            let backoff = RELAY_ADDR_RETRY_MIN.saturating_mul(1u32 << e.failures.min(16).saturating_sub(1)).min(RELAY_ADDR_RETRY_MAX);
+                            e.due = Instant::now() + backoff;
+                            let why = other.err().unwrap_or_else(|| "no addresses".into());
+                            if e.ips.is_empty() {
+                                // Unpinned, this relay's transport falls into
+                                // the catch-all and is unreachable under
+                                // route-all, so say so rather than failing mutely.
+                                tracing::warn!(relay = %name, %addr, retry_in_secs = backoff.as_secs(), "cannot resolve this relay's address; it will not be pinned and may be unreachable under route-all: {why}");
+                            } else {
+                                tracing::debug!(relay = %name, %addr, "refreshing this relay's address failed; keeping the last result: {why}");
+                            }
+                            false
+                        }
+                    }
+                };
+                if changed {
+                    view.poke();
+                }
+            });
+        }
+        (out, resolving)
+    }
+
+    /// Follow the network MTU the coordinator publishes: the engine's
+    /// oversize check and the device both move with it.
+    fn apply_mtu(&self, mtu: u16) {
+        // 0 is "not published yet"; anything below IPv6's minimum is not
+        // a value a coordinator hands out (it clamps to 1280).
+        if mtu < 1280 || mtu == self.engine.mtu() {
+            return;
+        }
+        tracing::info!(from = self.engine.mtu(), to = mtu, device = %self.device, "network MTU changed at the coordinator; applying");
+        self.engine.set_mtu(mtu);
+        if let Err(e) = self.tun.set_mtu(mtu) {
+            tracing::warn!("setting the TUN's MTU to {mtu}: {e:#}");
+        }
+    }
+
+    /// Warn — once per change, not every reconcile — about published
+    /// prefixes the route policy refuses. They are neither routed nor
+    /// accepted, which an operator will want to know about loudly.
+    fn report_refused(&self, view: &Snapshot, policy: &RoutePolicy) {
+        let refused = refused_prefixes(view, self.node_id, policy);
+        let now: BTreeSet<(ipnet::IpNet, Option<NodeId>)> = refused.iter().map(|(n, o, _)| (*n, *o)).collect();
+        let mut seen = self.refused_seen.lock().unwrap();
+        for (net, owner, why) in &refused {
+            if seen.contains(&(*net, *owner)) {
+                continue;
+            }
+            match owner {
+                Some(id) => {
+                    let name = view.members.iter().find(|m| m.node_id == *id).map(|m| m.name.as_str()).unwrap_or("?");
+                    tracing::warn!(prefix = %net, member = name, node = id, %why, "refusing a prefix the coordinator published for a member; it is not routed and not accepted")
+                }
+                None => tracing::warn!(prefix = %net, %why, "refusing a reserved prefix the coordinator published; it is not routed"),
+            }
+        }
+        for (net, owner) in seen.difference(&now) {
+            tracing::info!(prefix = %net, node = ?owner, "a previously refused prefix is no longer published");
+        }
+        *seen = now;
+    }
+
+    /// Route-all's exceptions, logged once per change: a family armed
+    /// although some of its hosts could not be pinned (failed closed), and
+    /// a family left outside the tunnel although an exit exists — the one
+    /// case where route-all does not hold, said as loudly as it is.
+    fn report_route_all(
+        &self,
+        view: &Snapshot,
+        attached: Option<NodeId>,
+        plan: &nqvpn_endpoint::routes::RouteAllPlan,
+        to_pin: &[IpAddr],
+        pinned: &[IpAddr],
+    ) {
+        let withheld: Vec<bool> = [false, true]
+            .into_iter()
+            .filter(|v6| {
+                nqvpn_endpoint::routes::exit_gateway(view, self.via.as_deref(), attached, *v6).is_some()
+                    && !plan.exits.iter().any(|(f, _)| f == v6)
+            })
+            .collect();
+        let mut last = self.route_all_reported.lock().unwrap();
+        if (plan.failed_closed.clone(), withheld.clone()) == *last {
+            return;
+        }
+        let unpinned = |v6: bool| to_pin.iter().filter(|ip| ip.is_ipv6() == v6 && !pinned.contains(ip)).map(|ip| ip.to_string()).collect::<Vec<_>>().join(", ");
+        for v6 in &plan.failed_closed {
+            let family = if *v6 { "IPv6" } else { "IPv4" };
+            tracing::warn!(family, unpinned = %unpinned(*v6), "route-all: some underlay hosts could not be pinned; this family's traffic goes through the tunnel anyway (fail closed), so traffic to those hosts enters it too");
+        }
+        for v6 in &withheld {
+            let family = if *v6 { "IPv6" } else { "IPv4" };
+            tracing::error!(family, unpinned = %unpinned(*v6), "route-all: the coordinator/relay transport of this family could not be pinned and the other family cannot carry the tunnel; this family's traffic is NOT going through the tunnel");
+        }
+        *last = (plan.failed_closed.clone(), withheld);
+    }
+}
+
 struct AbortGuard(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortGuard {
@@ -659,17 +839,27 @@ pub async fn choose_relay(fleet: &[RelayEntry], preferred: Option<&str>, identit
         })
 }
 
-/// One-shot reachability + latency check against a relay.
+/// One-shot reachability + latency check against a relay. The lookup is
+/// async (a blocking one would stall the whole single-threaded runtime
+/// for the resolver's timeout), and every address is tried in turn, so a
+/// relay whose first address family is blackholed (route-all failing
+/// closed) is still reached on the other.
 async fn probe_rtt(entry: &RelayEntry, identity: &TlsIdentity, keepalive: u64) -> Option<u128> {
-    use std::net::ToSocketAddrs;
-    let addr = entry.addr.to_socket_addrs().ok()?.next()?;
-    let bind: std::net::SocketAddr = if addr.is_ipv4() { "0.0.0.0:0".parse().ok()? } else { "[::]:0".parse().ok()? };
-    let mut ep = quinn::Endpoint::client(bind).ok()?;
-    ep.set_default_client_config(nqvpn_proto::quic::client_config(identity, Some(entry.cert_fp.clone()), keepalive).ok()?);
-    let started = std::time::Instant::now();
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(entry.addr.as_str())).await.ok()?.ok()?.collect();
     let host = entry.addr.rsplit_once(':').map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']')).unwrap_or("relay");
-    let conn = tokio::time::timeout(Duration::from_secs(5), ep.connect(addr, host).ok()?).await.ok()?.ok()?;
-    let rtt = started.elapsed().as_millis();
-    conn.close(0u32.into(), b"probe");
-    Some(rtt)
+    let config = nqvpn_proto::quic::client_config(identity, Some(entry.cert_fp.clone()), keepalive).ok()?;
+    for addr in addrs {
+        let bind: std::net::SocketAddr = if addr.is_ipv4() { "0.0.0.0:0".parse().ok()? } else { "[::]:0".parse().ok()? };
+        let Ok(mut ep) = quinn::Endpoint::client(bind) else { continue };
+        ep.set_default_client_config(config.clone());
+        let started = std::time::Instant::now();
+        let Ok(connecting) = ep.connect(addr, host) else { continue };
+        if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
+            let rtt = started.elapsed().as_millis();
+            conn.close(0u32.into(), b"probe");
+            return Some(rtt);
+        }
+    }
+    None
 }

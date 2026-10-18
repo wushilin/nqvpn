@@ -29,7 +29,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -123,8 +123,10 @@ pub enum RpcError {
 /// What a peer does with an inbound request.
 ///
 /// Synchronous on purpose: every verb we have is a short state mutation
-/// under a lock. The peer still spawns the call, so a slow handler cannot
-/// stall the single ordered stream behind it.
+/// under a lock, so the peer answers inline, on the reader's own task.
+/// That bounds the work a peer can queue to one request at a time —
+/// spawning a task per request let a flood of requests spawn without
+/// limit. A handler must therefore stay short and must not block.
 pub trait VerbHandler: Send + Sync + 'static {
     /// Every verb this side implements, with its version range.
     fn supported(&self) -> Vec<VerbSupport>;
@@ -160,6 +162,23 @@ pub struct RpcPeer {
     pending: Pending,
     next_id: AtomicU64,
     timeout: Duration,
+    /// Set once the reply queue overflowed: the peer sends requests
+    /// faster than it reads our answers. From then on requests are
+    /// ignored and calls fail, rather than buffering without bound.
+    stopped: AtomicBool,
+}
+
+/// Removes a call's waiter however the call ends — reply, timeout, an
+/// error, or the caller's future being dropped mid-await.
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    req_id: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.req_id);
+    }
 }
 
 impl RpcPeer {
@@ -173,6 +192,7 @@ impl RpcPeer {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             timeout: DEFAULT_TIMEOUT,
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -194,21 +214,26 @@ impl RpcPeer {
         req: R,
         version: u16,
     ) -> Result<R::Response, RpcError> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Err(RpcError::SessionClosed);
+        }
         let payload = crate::envelope::encode_payload(&req)
             .map_err(|e| RpcError::Codec(e.to_string()))?;
         let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(req_id, tx);
-
         let bytes = encode_msg(
             Kind::Request,
             &Request { req_id, verb: R::VERB, version, payload },
         )
         .map_err(|e| RpcError::Codec(e.to_string()))?;
 
+        // Register only once there is something to send, and let the
+        // guard deregister on every way out — including this future
+        // being dropped, which no explicit cleanup line would see.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(req_id, tx);
+        let _guard = PendingGuard { pending: &self.pending, req_id };
+
         if self.out.send(bytes).await.is_err() {
-            self.pending.lock().unwrap().remove(&req_id);
             return Err(RpcError::SessionClosed);
         }
 
@@ -218,10 +243,7 @@ impl RpcPeer {
         let resp = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => return Err(RpcError::SessionClosed),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&req_id);
-                return Err(RpcError::Timeout(self.timeout));
-            }
+            Err(_) => return Err(RpcError::Timeout(self.timeout)),
         };
 
         if let Some(code) = resp.code {
@@ -259,17 +281,33 @@ impl RpcPeer {
         if env.kind != Kind::Request as u16 {
             return false;
         }
+        if self.stopped.load(Ordering::Relaxed) {
+            return true;
+        }
         let Ok(req) = decode_payload::<Request>(&env.payload) else {
             // Undecodable request: nothing to correlate a reply to, so
             // there is nothing useful to say.
             return true;
         };
-        let me = self.clone();
-        tokio::spawn(async move {
-            let resp = me.dispatch(&req);
-            let _ = me.respond(resp).await;
-        });
+        let resp = self.dispatch(&req);
+        let Ok(bytes) = encode_msg(Kind::Response, &resp) else {
+            return true;
+        };
+        // Never wait for room: the reader must not stall behind our own
+        // writer. A full queue means the peer is not reading its answers
+        // while it keeps asking, so stop serving it instead of queueing.
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.out.try_send(bytes) {
+            tracing::warn!(req_id = req.req_id, "rpc reply queue full; peer is not reading replies — stopping rpc on this session");
+            self.stopped.store(true, Ordering::Relaxed);
+            self.close();
+        }
         true
+    }
+
+    /// The reply queue overflowed and this peer stopped serving and
+    /// issuing calls. The owner may close the session on seeing it.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 
     fn dispatch(&self, req: &Request) -> Response {
@@ -306,12 +344,6 @@ impl RpcPeer {
             Ok(payload) => Response { req_id: req.req_id, code: None, payload },
             Err(code) => fail(code, Vec::new()),
         }
-    }
-
-    async fn respond(&self, resp: Response) -> Result<(), RpcError> {
-        let bytes =
-            encode_msg(Kind::Response, &resp).map_err(|e| RpcError::Codec(e.to_string()))?;
-        self.out.send(bytes).await.map_err(|_| RpcError::SessionClosed)
     }
 
     /// Fail every outstanding call. Called when the session ends, so no
@@ -553,6 +585,48 @@ mod tests {
         .unwrap();
         let (env, _) = Envelope::decode(&stray).unwrap();
         assert!(a.on_envelope(&env), "still ours to consume");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_does_not_leak_its_waiter() {
+        // A caller that gives up (its future dropped, e.g. by a select!)
+        // must not leave an entry behind for the life of the session.
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(64);
+        let a = RpcPeer::new(tx, Arc::new(NoVerbs)).with_timeout(Duration::from_secs(30));
+        let a2 = a.clone();
+        let call = tokio::spawn(async move { a2.call(Echo { msg: "?".into() }).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(a.pending_count(), 1);
+        call.abort();
+        let _ = call.await;
+        assert_eq!(a.pending_count(), 0, "an abandoned call must deregister");
+    }
+
+    #[tokio::test]
+    async fn a_request_flood_with_unread_replies_is_bounded() {
+        // A peer that floods requests and never reads replies: the
+        // replies fill the queue, then the layer stops instead of
+        // spawning or buffering without bound.
+        let (tx, _never_read) = mpsc::channel::<Vec<u8>>(4);
+        let b = RpcPeer::new(tx, Arc::new(TestHandler));
+        let req = |id| {
+            let payload = crate::envelope::encode_payload(&Echo { msg: "x".into() }).unwrap();
+            let bytes = encode_msg(Kind::Request, &Request { req_id: id, verb: V_ECHO, version: 1, payload }).unwrap();
+            Envelope::decode(&bytes).unwrap().0
+        };
+        for id in 0..4 {
+            assert!(b.on_envelope(&req(id)));
+            assert!(!b.is_stopped(), "replies fit in the queue so far");
+        }
+        assert!(b.on_envelope(&req(4)));
+        assert!(b.is_stopped(), "a full reply queue stops the layer");
+        for id in 5..1000 {
+            assert!(b.on_envelope(&req(id)), "still consumed, just not served");
+        }
+        match b.call(Echo { msg: "?".into() }).await {
+            Err(RpcError::SessionClosed) => {}
+            other => panic!("a stopped peer must refuse calls, got {other:?}"),
+        }
     }
 
     #[tokio::test]

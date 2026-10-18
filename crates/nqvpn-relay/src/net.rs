@@ -3,7 +3,10 @@
 //!
 //! Every table here has exactly one writer:
 //!  * `clients` / `mesh` are written only by the session tasks' own
-//!    lifecycle (open → insert, end → remove);
+//!    lifecycle (open → insert, end → remove), and `tables`' local and
+//!    mesh sets are updated under the same write lock, so the two never
+//!    disagree about a node. Lock order: `clients`/`mesh` before
+//!    `tables`; nothing takes `tables` and then a session map;
 //!  * `attachments`, the dialer set, and eviction decisions are written
 //!    only by `reconcile`, from the coordinator's view;
 //!  * counters are atomic.
@@ -19,16 +22,16 @@ use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use nqvpn_proto::control::{AttachedClient, Heartbeat, LinkTraffic, RelayEndpoint, Snapshot, TrafficReport};
 use nqvpn_proto::credential::{self, Claims, Expected};
-use nqvpn_proto::frame::{bump_hop, Decision, RoutedHeader, TraceNote, T_TRACE_NOTE};
+use nqvpn_proto::frame::{bump_hop, Decision, RoutedHeader, TraceNote, ROUTED_HEADER_LEN, T_TRACE_NOTE};
 use nqvpn_proto::identity::TlsIdentity;
 use nqvpn_proto::transport::{Mode, PacketChannel};
 use nqvpn_proto::types::{NodeId, Role};
 use nqvpn_session::{End, Refused, Session, SessionConfig, StaleLogin, Verifier, CLOSE_EVICTED, CLOSE_REPLACED, CLOSE_STALE_LOGIN};
 use nqvpn_sync::{LinkHandle, LocalFacts, Reconcile, View};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::endpoint::LocalEndpoint;
 use crate::tables::{ByteCounter, Counters, LinkCounters, Origin, Route, Tables, TokenBucket};
@@ -39,7 +42,47 @@ struct Held {
     id: u64,
     session: Arc<Session>,
     /// Mesh only: we dialed it (so our credential is what it verifies).
+    /// Such a session carries *our* claims, not the peer's: the peer is
+    /// authenticated by the fingerprint we pinned (`session.peer_fp`),
+    /// and that — not a login generation — is what the view can revoke.
     dialed: bool,
+}
+
+/// Bytes a frame may carry beyond the inner MTU: the routed header, the
+/// counter and the AEAD tag, plus slack for a member whose TUN still
+/// uses an older (larger) MTU than the one the view now publishes.
+const FRAME_SLACK: usize = ROUTED_HEADER_LEN + 8 + 16 + 256;
+
+/// How long a relay admits members without a view of its network (just
+/// started, first snapshot not in yet). After that, no view means no
+/// admission: a coordinator path that lets us join but withholds the
+/// view must not leave us vouching for any unexpired credential.
+pub const NO_VIEW_GRACE: Duration = Duration::from_secs(20);
+
+/// Trace notes accepted per second from one mesh link. A trace yields
+/// at most one note per relay per traced frame; this only stops a peer
+/// relay from using notes as a free channel to our clients.
+const TRACE_NOTES_PER_SEC: u32 = 64;
+
+/// A per-session budget for trace notes; lives with the session task.
+struct NoteBudget {
+    window: Instant,
+    used: u32,
+}
+
+impl NoteBudget {
+    fn new() -> NoteBudget {
+        NoteBudget { window: Instant::now(), used: 0 }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.window.elapsed() >= Duration::from_secs(1) {
+            self.window = Instant::now();
+            self.used = 0;
+        }
+        self.used += 1;
+        self.used <= TRACE_NOTES_PER_SEC
+    }
 }
 
 struct Dialer {
@@ -86,10 +129,17 @@ pub struct RelayNet {
     chaos: RwLock<Option<Chaos>>,
     chaos_seq: AtomicU64,
     /// This relay is a designated internet exit (granted a default route).
-    exit_designated: std::sync::atomic::AtomicBool,
+    exit_designated: AtomicBool,
     /// The last self-check of egress readiness, refreshed on a slow timer
     /// and carried in each heartbeat (never re-run per heartbeat).
     exit_ready: RwLock<Option<nqvpn_proto::control::ExitReadiness>>,
+    /// When this network was set up; bounds admission without a view.
+    created: Instant,
+    /// The MTU the coordinator configured (from the join), 0 if unknown.
+    mtu_ceiling: AtomicU32,
+    /// Largest frame forwarded (inner MTU + `FRAME_SLACK`); 0 = no cap
+    /// known yet. Recomputed on every reconcile.
+    max_frame: AtomicU32,
 }
 
 impl RelayNet {
@@ -130,8 +180,11 @@ impl RelayNet {
             endpoint: RwLock::new(None),
             chaos: RwLock::new(None),
             chaos_seq: AtomicU64::new(0),
-            exit_designated: std::sync::atomic::AtomicBool::new(false),
+            exit_designated: AtomicBool::new(false),
             exit_ready: RwLock::new(None),
+            created: Instant::now(),
+            mtu_ceiling: AtomicU32::new(0),
+            max_frame: AtomicU32::new(0),
         })
     }
 
@@ -140,7 +193,7 @@ impl RelayNet {
     /// egress self-check.
     pub fn set_exit_designated(&self, granted_cidrs: &[ipnet::IpNet]) {
         let is_exit = granted_cidrs.iter().any(|c| c.prefix_len() == 0);
-        self.exit_designated.store(is_exit, std::sync::atomic::Ordering::Relaxed);
+        self.exit_designated.store(is_exit, Ordering::Relaxed);
         if !is_exit {
             *self.exit_ready.write().unwrap() = None;
         }
@@ -148,17 +201,26 @@ impl RelayNet {
 
     /// Re-run the egress readiness self-check (IP forwarding + masquerade)
     /// if this relay is a designated exit; otherwise clear it. Called on a
-    /// slow timer so the link only ever reads the cached value.
-    pub fn refresh_exit_readiness(&self) {
-        let designated = self.exit_designated.load(std::sync::atomic::Ordering::Relaxed);
-        let next = designated.then(crate::exitcheck::detect);
+    /// slow timer so the link only ever reads the cached value. The check
+    /// spawns processes, so it runs on the blocking pool.
+    pub async fn refresh_exit_readiness(&self) {
+        let designated = self.exit_designated.load(Ordering::Relaxed);
+        let next = if designated { tokio::task::spawn_blocking(crate::exitcheck::detect).await.ok() } else { None };
+        // Designation may have been withdrawn while the check ran.
+        let next = next.filter(|_| self.exit_designated.load(Ordering::Relaxed));
         *self.exit_ready.write().unwrap() = next;
+    }
+
+    /// The network MTU the coordinator configured (from a join): with the
+    /// view's published MTU, it bounds the frames this relay forwards.
+    pub fn set_mtu_ceiling(&self, mtu: u16) {
+        self.mtu_ceiling.store(mtu as u32, Ordering::Relaxed);
     }
 
     /// Record a readiness reading directly (tests, or a host whose check
     /// is done elsewhere). Ignored unless this relay is a designated exit.
     pub fn set_exit_readiness(&self, reading: nqvpn_proto::control::ExitReadiness) {
-        if self.exit_designated.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.exit_designated.load(Ordering::Relaxed) {
             *self.exit_ready.write().unwrap() = Some(reading);
         }
     }
@@ -168,12 +230,11 @@ impl RelayNet {
         *self.chaos.write().unwrap() = mode;
     }
 
-    /// Close the mesh link to `peer` from this side, as a link failure
-    /// would. The dialer (whichever side dials) re-establishes it.
     /// The coordinator refuses this relay (disabled, deleted, token
     /// regenerated): everything it knows is stale, so it carries nothing
     /// until accepted again — every session is closed and new ones are
-    /// refused at `verify`. Members re-attach elsewhere at once.
+    /// refused at `verify`. Members re-attach elsewhere at once. Dialers
+    /// stay idle meanwhile (see `dialer`).
     pub fn suspend(&self, why: &str) {
         let clients: Vec<Arc<Session>> = self.clients.read().unwrap().values().map(|h| h.session.clone()).collect();
         let mesh: Vec<Arc<Session>> = self.mesh.read().unwrap().values().map(|h| h.session.clone()).collect();
@@ -183,6 +244,52 @@ impl RelayNet {
         }
     }
 
+    /// This network's member loop has ended for good: another instance
+    /// holds our identity in it (`MemberExit::Replaced`). We carry
+    /// nothing for it again — sessions are closed, dialers stopped, and
+    /// `verify` refuses everyone. Other networks this process serves
+    /// are unaffected.
+    pub fn retire(&self, why: &str) {
+        for (_, d) in self.dialers.lock().unwrap().drain() {
+            d.task.abort();
+        }
+        // Called on every reconcile once retired: quiet when nothing is
+        // left to close.
+        if !self.clients.read().unwrap().is_empty() || !self.mesh.read().unwrap().is_empty() {
+            self.suspend(why);
+        }
+    }
+
+    /// Replaced in this network (see `retire`): the member loop has
+    /// recorded a stop, which is never cleared.
+    pub fn is_retired(&self) -> bool {
+        self.link.stop_reason().is_some()
+    }
+
+    /// A peer relay refused or closed our mesh session as a stale login.
+    /// That is only a hint: any holder of a relay credential in this
+    /// network can send that code. We are replaced only if our own
+    /// coordinator says so — the control link closes with
+    /// `CLOSE_REPLACED` (the member loop handles that), or the view
+    /// lists us with a newer login generation than our credential.
+    fn peer_says_stale(&self, peer: &str, reason: &str) {
+        let ours = nqvpn_sync::join::own_claims(&self.credential()).map(|c| c.login_gen);
+        let published = self.view.with(|s| s.member(self.my_node_id).map(|m| m.login_gen));
+        match (ours, published) {
+            (Some(ours), Some(published)) if published > ours => {
+                self.link.replaced(format!("relay {peer} says: {reason} (the view agrees: login_gen {published} > ours {ours})"));
+            }
+            _ => {
+                tracing::warn!(network = %self.network_id, %peer, ?ours, ?published, "a peer relay calls our login stale, but our view does not: {reason}");
+                // Heartbeat now: if we really were replaced, the
+                // coordinator answers on the control link.
+                self.link.kick();
+            }
+        }
+    }
+
+    /// Close the mesh link to `peer` from this side, as a link failure
+    /// would. The dialer (whichever side dials) re-establishes it.
     pub fn close_mesh(&self, peer: NodeId) -> bool {
         match self.mesh.read().unwrap().get(&peer) {
             Some(h) => {
@@ -259,7 +366,7 @@ impl RelayNet {
         let mut bucket = TokenBucket::new(self.max_mbps);
         let end = session
             .run(&self.probe_cfg(false), Some(self.as_ref()), move |d, lane| {
-                me.forward_limited(Origin::Client(node), &chan, d, lane, &mut bucket)
+                me.forward_limited(Origin::Client(node), Some(&chan), d, lane, &mut bucket)
             })
             .await;
         drop(reg);
@@ -274,13 +381,21 @@ impl RelayNet {
         tracing::info!(network = %self.network_id, peer, dialed, "mesh link up");
         let me = self.clone();
         let chan = session.chan.clone();
+        let mut notes = NoteBudget::new();
         let end = session
-            .run(&self.probe_cfg(dialed), Some(self.as_ref()), move |d, lane| me.forward(Origin::Relay(peer), &chan, d, lane))
+            .run(&self.probe_cfg(dialed), Some(self.as_ref()), move |d, lane| {
+                if d.first() == Some(&T_TRACE_NOTE) && !notes.allow() {
+                    return;
+                }
+                me.forward(Origin::Relay(peer), Some(&chan), d, lane)
+            })
             .await;
         drop(reg);
         tracing::info!(network = %self.network_id, peer, ?end, "mesh link down");
-        if let Some((CLOSE_STALE_LOGIN, reason)) = session.close_reason() {
-            self.link.replaced(format!("relay {peer} says: {reason}"));
+        // Only a session that carried our credential can be stale on our
+        // side; one we accepted carried the peer's.
+        if let (true, Some((CLOSE_STALE_LOGIN, reason))) = (dialed, session.close_reason()) {
+            self.peer_says_stale(&peer.to_string(), &reason);
         }
         end
     }
@@ -303,11 +418,16 @@ impl RelayNet {
 
     /// Dial one peer relay until told to stop: connect, hold the session,
     /// back off, repeat. Aborted by `reconcile` when the peer leaves the
-    /// fleet or its address changes.
+    /// fleet or its address changes. Idle while this relay is refused
+    /// (it carries nothing then, and the peer would refuse us anyway);
+    /// done once it is retired.
     async fn dialer(self: Arc<Self>, entry: RelayEndpoint) {
         let mut delay = Duration::from_secs(1);
         loop {
-            if self.has_mesh(entry.relay_id) {
+            if self.is_retired() {
+                return;
+            }
+            if self.link.is_refused() || self.has_mesh(entry.relay_id) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -325,10 +445,10 @@ impl RelayNet {
                 }
                 Err(e) => {
                     if let Some(Refused { code: CLOSE_STALE_LOGIN, reason }) = e.downcast_ref::<Refused>() {
-                        self.link.replaced(format!("relay {} says: {reason}", entry.name));
-                        return;
+                        self.peer_says_stale(&entry.name, reason);
+                    } else {
+                        tracing::warn!(network = %self.network_id, peer = %entry.name, addr = %entry.addr, "mesh dial failed: {e:#}");
                     }
-                    tracing::warn!(network = %self.network_id, peer = %entry.name, addr = %entry.addr, "mesh dial failed: {e:#}");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
@@ -354,17 +474,34 @@ impl RelayNet {
     }
 
     /// The entire relay data plane for one frame: parse, decide, send,
-    /// and — if the origin asked — say what we did.
-    pub fn forward(&self, origin: Origin, arrived_on: &PacketChannel, datagram: Bytes, lane: u8) {
+    /// and — if the origin asked — say what we did. `arrived_on` is the
+    /// session the frame came in on; `None` for our own endpoint's
+    /// frames, whose trace notes go straight to it.
+    pub fn forward(&self, origin: Origin, arrived_on: Option<&PacketChannel>, datagram: Bytes, lane: u8) {
         let bytes = datagram.len() as u64;
         if let Origin::Relay(peer) = origin {
             self.link_counters(peer).rx.add(bytes);
         }
+        let max = self.max_frame.load(Ordering::Relaxed) as usize;
+        if max > 0 && datagram.len() > max {
+            // No member of this network seals a frame this large.
+            self.counters.note(Decision::DropMalformed);
+            tracing::debug!(network = %self.network_id, ?origin, len = datagram.len(), max, "dropping oversized frame");
+            return;
+        }
         if datagram.first() == Some(&T_TRACE_NOTE) {
-            // A note travelling back toward the origin: pass it to the
-            // client that sent the traced frame, if it is ours.
-            if let (Origin::Relay(_), Some(note)) = (origin, TraceNote::parse(&datagram)) {
-                if let Some(chan) = self.channel_for(&Route::Local(note.origin)) {
+            // A note travelling back toward the origin, from the mesh
+            // peer that handled the traced frame: pass it to the client
+            // that sent it if attached here, or to our own endpoint.
+            if let (Origin::Relay(peer), Some(note)) = (origin, TraceNote::parse(&datagram)) {
+                if note.relay_id != peer {
+                    return;
+                }
+                if note.origin == self.my_node_id {
+                    if let Some(ep) = self.endpoint() {
+                        ep.deliver(&datagram);
+                    }
+                } else if let Some(chan) = self.channel_for(&Route::Local(note.origin)) {
                     let _ = chan.send(datagram);
                 }
             }
@@ -441,18 +578,28 @@ impl RelayNet {
         }
     }
 
-    /// Answer a traced frame on the session it arrived on.
-    fn trace(&self, h: &RoutedHeader, hop: u8, arrived_on: &PacketChannel, decision: Decision, detail: u32) {
+    /// Answer a traced frame on the session it arrived on (for our own
+    /// endpoint's frames: to the endpoint directly).
+    fn trace(&self, h: &RoutedHeader, hop: u8, arrived_on: Option<&PacketChannel>, decision: Decision, detail: u32) {
         if !h.traced() {
             return;
         }
-        let note = TraceNote { origin: h.src_id, trace: h.trace, hop, relay_id: self.my_node_id, decision, detail };
-        let _ = arrived_on.send(note.encode().into());
+        let note = TraceNote { origin: h.src_id, trace: h.trace, hop, relay_id: self.my_node_id, decision, detail }.encode();
+        match arrived_on {
+            Some(chan) => {
+                let _ = chan.send(note.into());
+            }
+            None => {
+                if let Some(ep) = self.endpoint() {
+                    ep.deliver(&note);
+                }
+            }
+        }
     }
 
     /// Rate-limited variant for client origins; the bucket lives with
     /// the session task, not in shared state.
-    pub fn forward_limited(&self, origin: Origin, arrived_on: &PacketChannel, datagram: Bytes, lane: u8, bucket: &mut Option<TokenBucket>) {
+    pub fn forward_limited(&self, origin: Origin, arrived_on: Option<&PacketChannel>, datagram: Bytes, lane: u8, bucket: &mut Option<TokenBucket>) {
         if let Some(b) = bucket.as_mut() {
             if !b.allow(datagram.len()) {
                 self.counters.note(Decision::DropRateLimited);
@@ -524,18 +671,28 @@ impl Verifier for RelayNet {
         anyhow::ensure!(claims.cert_fp == presented_fp, "cert_fp mismatch: credential {} vs TLS {presented_fp}", claims.cert_fp);
         anyhow::ensure!(claims.node_id != self.my_node_id, "a member may not connect to itself");
         anyhow::ensure!(!self.link.is_refused(), "this relay is currently refused by the coordinator");
+        anyhow::ensure!(!self.is_retired(), "this relay was replaced in this network");
         // The view is the authority once we have one: a node it does not
         // list (deleted, disabled, or simply not yet pushed — the member
         // retries in a second) is refused, and one it lists with a newer
-        // login generation is a replaced instance.
-        let (known, member) = self.view.with(|s| (!s.members.is_empty(), s.member(claims.node_id).cloned()));
+        // login generation is a replaced instance. Its role must match
+        // the view's, and a relay gets a mesh slot only if the fleet
+        // lists it.
+        let (known, member, in_fleet) = self.view.with(|s| {
+            (!s.members.is_empty(), s.member(claims.node_id).cloned(), s.relays.iter().any(|r| r.relay_id == claims.node_id))
+        });
         match member {
             Some(m) if claims.login_gen < m.login_gen => {
                 return Err(StaleLogin(format!("node {} was replaced by a newer join", claims.node_id)).into());
             }
-            Some(_) => {}
+            Some(m) => {
+                anyhow::ensure!(m.role == claims.role, "node {} is a {} in the view, not a {}", claims.node_id, m.role, claims.role);
+                anyhow::ensure!(claims.role != Role::Relay || in_fleet, "relay {} is not in the published fleet", claims.node_id);
+            }
             None if known => anyhow::bail!("node {} is not in the network view", claims.node_id),
-            None => {}
+            // No view yet: admit for a short grace (the first reconcile
+            // evicts whatever the view does not vouch for), then refuse.
+            None => anyhow::ensure!(self.created.elapsed() < NO_VIEW_GRACE, "no network view yet"),
         }
         Ok(claims)
     }
@@ -585,10 +742,23 @@ impl RelayNet {
         if !view.keys.is_empty() {
             self.set_signing_keys(&view.keys);
         }
+        if self.is_retired() {
+            // Replaced in this network: nothing to dial, nobody to hold.
+            self.retire("this relay was replaced in this network");
+            return;
+        }
         self.tables.write().unwrap().replace_attachments(view.attachments.iter().map(|a| (a.node_id, a.relay_id)));
+        let mtu = self.mtu_ceiling.load(Ordering::Relaxed).max(view.mtu.mtu as u32);
+        self.max_frame.store(if mtu > 0 { mtu + FRAME_SLACK as u32 } else { 0 }, Ordering::Relaxed);
 
         // Evict sessions the view no longer vouches for. An empty view
         // (nothing received yet) vouches for nobody and evicts nobody.
+        // A session we accepted carries the member's credential: a login
+        // generation older than the view's is a replaced instance. A
+        // mesh session we dialed carries *our* credential, so its login
+        // generation says nothing about the peer; the peer proved the
+        // fingerprint we pinned, so the link is stale once the fleet
+        // publishes a different one.
         let stale: Vec<(Arc<Session>, u32, &'static str)> = {
             let mut v = Vec::new();
             if !view.members.is_empty() {
@@ -596,6 +766,12 @@ impl RelayNet {
                     let node = held.session.node_id();
                     match view.member(node) {
                         None => v.push((held.session.clone(), CLOSE_EVICTED, "no longer a member")),
+                        Some(_) if held.dialed => {
+                            let published = view.relays.iter().find(|r| r.relay_id == node).map(|r| r.cert_fp.as_str());
+                            if matches!(published, Some(fp) if fp != held.session.peer_fp) {
+                                v.push((held.session.clone(), CLOSE_EVICTED, "relay certificate changed"));
+                            }
+                        }
                         Some(m) if held.session.login_gen() < m.login_gen => {
                             v.push((held.session.clone(), CLOSE_STALE_LOGIN, "replaced by a newer join"))
                         }
@@ -700,25 +876,34 @@ struct Registration {
 
 impl Registration {
     fn client(net: Arc<RelayNet>, node: NodeId, session: Arc<Session>) -> Registration {
-        let id = net.session_seq.fetch_add(1, Ordering::Relaxed);
-        let old = net.clients.write().unwrap().insert(node, Held { id, session, dialed: false });
-        if let Some(old) = old {
-            old.session.close(CLOSE_REPLACED, "replaced by a newer session");
-        }
-        net.tables.write().unwrap().set_local(node, true);
-        net.link.kick();
-        Registration { net, node, id, mesh: false }
+        Self::insert(net, node, session, false, false)
     }
 
     fn mesh(net: Arc<RelayNet>, peer: NodeId, session: Arc<Session>, dialed: bool) -> Registration {
+        Self::insert(net, peer, session, dialed, true)
+    }
+
+    /// The session map and the forwarding table change together, under
+    /// the map's write lock: an older session's teardown can never land
+    /// between our insert and our table update.
+    fn insert(net: Arc<RelayNet>, node: NodeId, session: Arc<Session>, dialed: bool, mesh: bool) -> Registration {
         let id = net.session_seq.fetch_add(1, Ordering::Relaxed);
-        let old = net.mesh.write().unwrap().insert(peer, Held { id, session, dialed });
+        let old = {
+            let mut map = if mesh { net.mesh.write().unwrap() } else { net.clients.write().unwrap() };
+            let old = map.insert(node, Held { id, session, dialed });
+            let mut tables = net.tables.write().unwrap();
+            if mesh {
+                tables.set_mesh(node, true);
+            } else {
+                tables.set_local(node, true);
+            }
+            old
+        };
         if let Some(old) = old {
-            old.session.close(CLOSE_REPLACED, "replaced by a newer mesh session");
+            old.session.close(CLOSE_REPLACED, if mesh { "replaced by a newer mesh session" } else { "replaced by a newer session" });
         }
-        net.tables.write().unwrap().set_mesh(peer, true);
         net.link.kick();
-        Registration { net, node: peer, id, mesh: true }
+        Registration { net, node, id, mesh }
     }
 }
 
@@ -730,19 +915,19 @@ impl Drop for Registration {
             match t.get(&self.node) {
                 Some(h) if h.id == self.id => {
                     t.remove(&self.node);
+                    // Still under the map's lock: see `insert`.
+                    let mut tables = self.net.tables.write().unwrap();
+                    if self.mesh {
+                        tables.set_mesh(self.node, false);
+                    } else {
+                        tables.set_local(self.node, false);
+                    }
                     true
                 }
                 _ => false,
             }
         };
         if mine {
-            let mut tables = self.net.tables.write().unwrap();
-            if self.mesh {
-                tables.set_mesh(self.node, false);
-            } else {
-                tables.set_local(self.node, false);
-            }
-            drop(tables);
             self.net.link.kick();
         }
     }

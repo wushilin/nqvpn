@@ -42,6 +42,71 @@ pub struct ClientConfig {
     /// Requested TUN device name (Linux: any; macOS: `utunN`).
     #[serde(default)]
     pub tun_name: Option<String>,
+    /// Local policy over the prefixes the coordinator publishes.
+    #[serde(default)]
+    pub routes: RoutesConfig,
+}
+
+/// `[routes]`: which coordinator-published prefixes this client accepts.
+///
+/// The coordinator decides who owns which prefix; this is the client's
+/// own limit on what it will let that pull into the tunnel. Unset, every
+/// published prefix is accepted except ones wider than `/8` (IPv4) or
+/// `/16` (IPv6). Set, only prefixes inside one of the listed ranges are
+/// routed (OS routes) *and* accepted (the in-VPN table and its ingress
+/// filter) — so list the network's own address space too, or peers become
+/// unreachable. Refusals are logged as warnings. `--route-all`'s catch-all
+/// is the client's own and is not affected.
+///
+/// ```toml
+/// [routes]
+/// allow = ["10.99.0.0/16", "192.168.7.0/24"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutesConfig {
+    #[serde(default)]
+    pub allow: Option<Vec<ipnet::IpNet>>,
+}
+
+/// Where the token comes from when not from the config file, in order of
+/// precedence: `--token`, `--token-file`, the `NQVPN_TOKEN` environment
+/// variable. Each beats the config's `token` / `token_file`.
+#[derive(Debug, Clone, Default)]
+pub struct TokenOverride {
+    pub token: Option<String>,
+    pub token_file: Option<PathBuf>,
+    pub env: Option<String>,
+}
+
+impl TokenOverride {
+    pub fn is_set(&self) -> bool {
+        self.token.is_some() || self.token_file.is_some() || self.env.is_some()
+    }
+}
+
+/// The permission bits of `path` that let group or others read it, if
+/// any (Unix). A token is a bearer secret: anyone who reads it can join
+/// as this member.
+pub fn exposed_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+        (mode & 0o044 != 0).then_some(mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Warn when a file holding the token is readable beyond its owner.
+pub fn warn_if_exposed(path: &Path, what: &str) {
+    if let Some(mode) = exposed_mode(path) {
+        tracing::warn!(path = %path.display(), mode = format!("{mode:03o}"), "{what} holds the member token and is readable by other local users; chmod 600 it");
+    }
 }
 
 fn d_false() -> bool {
@@ -52,12 +117,22 @@ fn d_state() -> PathBuf {
     PathBuf::from("/var/lib/nqvpn-client")
 }
 
-/// The same defaults whether or not a config file exists (`--token`
-/// alone must trust any coordinator certificate, like a parsed file
-/// with the key omitted would).
+/// The same defaults whether or not a config file exists: `--token`
+/// alone verifies the coordinator exactly as a parsed file with the keys
+/// omitted would (the token's pinned fingerprint, or the system roots).
 impl Default for ClientConfig {
     fn default() -> Self {
-        ClientConfig { token: None, token_file: None, trust_any_cert: false, ca: None, ca_cert: None, coordinator_fp: Vec::new(), state_dir: d_state(), tun_name: None }
+        ClientConfig {
+            token: None,
+            token_file: None,
+            trust_any_cert: false,
+            ca: None,
+            ca_cert: None,
+            coordinator_fp: Vec::new(),
+            state_dir: d_state(),
+            tun_name: None,
+            routes: RoutesConfig::default(),
+        }
     }
 }
 
@@ -70,16 +145,38 @@ impl ClientConfig {
 
     /// The token: from the command line, the config, or a file.
     pub fn token(&self, override_token: Option<&str>) -> Result<Token> {
-        let raw = if let Some(t) = override_token {
-            t.to_string()
+        self.token_from(&TokenOverride { token: override_token.map(str::to_string), ..Default::default() })
+    }
+
+    /// The token, by the precedence `TokenOverride` documents. A token
+    /// file that others can read is warned about.
+    pub fn token_from(&self, o: &TokenOverride) -> Result<Token> {
+        let read = |f: &Path| -> Result<String> {
+            warn_if_exposed(f, "the token file");
+            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))
+        };
+        let raw = if let Some(t) = &o.token {
+            t.clone()
+        } else if let Some(f) = &o.token_file {
+            read(f)?
+        } else if let Some(t) = &o.env {
+            t.clone()
         } else if let Some(t) = &self.token {
             t.clone()
         } else if let Some(f) = &self.token_file {
-            std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?
+            read(f)?
         } else {
-            anyhow::bail!("no token: pass --token, or set token / token_file in the config")
+            anyhow::bail!("no token: pass --token-file (or --token, or NQVPN_TOKEN), or set token / token_file in the config")
         };
-        Token::parse(&raw).map_err(|e| anyhow::anyhow!("{e}"))
+        Token::parse(raw.trim()).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// The route policy `[routes]` describes.
+    pub fn route_policy(&self) -> nqvpn_endpoint::peers::RoutePolicy {
+        match &self.routes.allow {
+            Some(allow) => nqvpn_endpoint::peers::RoutePolicy::allow_list(allow.clone()),
+            None => nqvpn_endpoint::peers::RoutePolicy::default(),
+        }
     }
 
     pub fn tls(&self) -> JoinTls {
@@ -87,7 +184,11 @@ impl ClientConfig {
     }
 
     pub fn member(&self, override_token: Option<&str>) -> Result<nqvpn_sync::MemberConfig> {
-        let token = self.token(override_token)?;
+        self.member_from(&TokenOverride { token: override_token.map(str::to_string), ..Default::default() })
+    }
+
+    pub fn member_from(&self, o: &TokenOverride) -> Result<nqvpn_sync::MemberConfig> {
+        let token = self.token_from(o)?;
         let mut tls = self.tls();
         // Trust the token's fingerprint plus any pre-staged for rotation.
         tls.pinned_fps = token.fp.iter().cloned().chain(self.coordinator_fp.iter().cloned()).collect();
@@ -130,6 +231,44 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
         let c = ClientConfig::load(&root.join("client.toml")).expect("client.toml");
         assert!(c.token_file.is_some() || c.token.is_some());
+    }
+
+    #[test]
+    fn the_token_comes_from_the_command_line_a_file_or_the_environment_in_that_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t");
+        let other = Token { coordinator: "https://file.example:8443".into(), secret: "f".into(), fp: None }.encode();
+        std::fs::write(&file, format!("{other}\n")).unwrap();
+        let env = Token { coordinator: "https://env.example:8443".into(), secret: "e".into(), fp: None }.encode();
+        let c = ClientConfig { token: Some(tok()), ..ClientConfig::default() };
+        let o = |token: Option<String>, token_file: Option<PathBuf>, env: Option<String>| TokenOverride { token, token_file, env };
+        assert_eq!(c.member_from(&o(None, None, None)).unwrap().secret, "s", "the config's own token");
+        assert_eq!(c.member_from(&o(None, None, Some(env.clone()))).unwrap().secret, "e", "NQVPN_TOKEN beats the config");
+        assert_eq!(c.member_from(&o(None, Some(file.clone()), Some(env.clone()))).unwrap().secret, "f", "--token-file beats the environment (trailing newline trimmed)");
+        assert_eq!(c.member_from(&o(Some(tok()), Some(file), Some(env))).unwrap().secret, "s", "--token beats everything");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_others_can_read_is_noticed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t");
+        std::fs::write(&f, tok()).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(exposed_mode(&f), None);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(exposed_mode(&f), Some(0o644));
+    }
+
+    #[test]
+    fn the_routes_allowlist_parses_and_becomes_a_policy() {
+        let c: ClientConfig = toml::from_str("token = \"x\"\n[routes]\nallow = [\"10.99.0.0/16\", \"fd00:99::/64\"]\n").unwrap();
+        let p = c.route_policy();
+        assert!(p.permits(&"10.99.1.2/32".parse().unwrap()));
+        assert!(!p.permits(&"10.98.0.0/16".parse().unwrap()));
+        assert!(ClientConfig::default().route_policy().allow.is_none(), "unset: the default width rule only");
+        assert!(toml::from_str::<ClientConfig>("[routes]\nalow = []\n").is_err(), "a typo is an error, not a silent no-op");
     }
 
     #[test]

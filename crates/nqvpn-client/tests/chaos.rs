@@ -179,7 +179,9 @@ fn member(coord_url: &str, node_id: NodeId, role: Role) -> Arc<MemberConfig> {
         Role::Relay => format!("r{node_id}"),
         Role::Client => format!("c{node_id}"),
     };
-    Arc::new(MemberConfig { coordinator: coord_url.to_string(), secret: secret_of(&name), tls: nqvpn_proto::joinapi::JoinTls::default() })
+    // No token here, so no pin: trust the test coordinator's
+    // self-signed certificate explicitly (no longer the default).
+    Arc::new(MemberConfig { coordinator: coord_url.to_string(), secret: secret_of(&name), tls: nqvpn_proto::joinapi::JoinTls { trust_any_cert: true, ..Default::default() } })
 }
 
 async fn join(cfg: &Arc<MemberConfig>, id: &TlsIdentity, keys: &StaticKeys) -> JoinResponse {
@@ -1290,5 +1292,27 @@ async fn the_coordinator_reloads_everything_from_its_database() -> Result<()> {
     assert_eq!(a.ip4(), ip_a);
     let c = ClientHandle::start_with_secret(&w.url(), 30, &secret).await;
     all_pairs_reach(&[&a, &b, &c], Duration::from_secs(20)).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_allowlist_keeps_an_unlisted_lan_out_of_the_tunnel() -> Result<()> {
+    // a allows only the network's own space; b has no allowlist. When the
+    // relay starts fronting a LAN, b routes it and a refuses it — neither
+    // an OS route nor an in-tunnel owner — while the two still reach each
+    // other.
+    let (w, rp) = World::new(&[1], &[10, 20]).await;
+    let _r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let a = ClientHandle::start(&w.url(), 10).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    a.client.set_route_policy(nqvpn_endpoint::peers::RoutePolicy::allow_list(vec!["10.99.0.0/16".parse().unwrap()]));
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    w.coord().configure("r1", |s| s.local_cidrs = vec!["100.64.77.0/24".parse().unwrap()]);
+    wait_until("b routes the relay's LAN", Duration::from_secs(15), || b.os_has("100.64.77.0/24")).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!a.os_has("100.64.77.0/24"), "outside a's allowlist: not routed");
+    assert_eq!(a.client.engine.peers.lock().unwrap().owner_of("100.64.77.1".parse().unwrap()), None, "nor owned in a's tunnel table");
+    assert!(a.os_has("10.99.0.0/16"), "the allowed network space is still routed");
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
     Ok(())
 }

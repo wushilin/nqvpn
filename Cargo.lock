@@ -1510,6 +1510,7 @@ dependencies = [
  "futures-util",
  "hex",
  "ipnet",
+ "libc",
  "nqvpn-proto",
  "nqvpn-update",
  "quinn",
@@ -1634,9 +1635,12 @@ name = "nqvpn-update"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
+ "ed25519-dalek",
  "flate2",
  "hex",
+ "rand 0.10.3",
  "rustls",
  "serde",
  "serde_json",

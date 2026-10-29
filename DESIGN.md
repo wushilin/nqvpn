@@ -1,7 +1,8 @@
 # nqvpn — Design
 
 An L3 (TUN-based), dual-stack VPN in Rust, built as a **distributed,
-interconnected relay service**. Three binaries with one job each. No
+interconnected relay service**. Three binaries with one job each (plus an
+optional transport-only UDP forwarder, §6). No
 peer-to-peer data connections between clients — simplicity is the
 product.
 
@@ -80,6 +81,9 @@ nqvpn-relay      forwarding only
   tables (route decision — pure), endpoint (gateway role), config
 
 nqvpn-client     thin: config + client (uplink chooser, reconciler hooks) + main
+
+nqvpn-forward    standalone UDP forwarder in front of one relay (no nqvpn deps
+  beyond self-update); used by clients through `relay_via`
 
 nqvpn-coord      one module per concern, all mutation through one lock per network
   config, registry (durable identity), secrets, ipam, leases (heartbeat intake),
@@ -409,6 +413,18 @@ reachable, else lowest RTT — probed in parallel), dials it, and the
 relay's next heartbeat lists it. Convergence is sub-second (a local
 change kicks an immediate heartbeat), ≤ one period if a push is lost.
 
+**Forwarders (`relay_via`).** A client may be configured locally with
+`relay_via = "<relay>=<host:port>"`: it dials that fleet relay at a
+`nqvpn-forward` address instead of the published one, pinned to the
+relay's published `cert_fp` as usual. The forwarder is a per-source-
+address UDP flow table to one fixed target; it is transport only and
+outside the trust model — it can drop traffic, never read or forge it.
+`relay_via` outranks `preferred`; an unreachable forwarder falls back to
+the normal choice, and the client returns once it answers. The attached
+entry records the published address separately from the dialed one, so
+the reconcile check for a re-registered relay is unaffected. Under
+route-all the forwarder is an underlay host and pinned like a relay.
+
 **Relay mesh.** Every relay connects to every relay; the **lower id
 dials**, pinned to the fingerprint the coordinator published for the
 peer. The dialer set is a diff of the view against running dialer
@@ -595,4 +611,5 @@ token_file = "/etc/nqvpn/relay.token"
 token_file = "/etc/nqvpn/client.token"   # or: nqvpn-client --token "nqv1.…"
 state_dir  = "/var/lib/nqvpn-client"
 # tun_name = "nqvpn0"
+# relay_via = "sg-relay=cn-fwd.example.com:44449"   # or --relay-via
 ```

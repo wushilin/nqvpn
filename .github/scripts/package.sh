@@ -1,13 +1,13 @@
 #!/bin/sh
 # package.sh VERSION OS ARCH BINDIR
 #
-# Pack the three binaries from BINDIR into dist/nqvpn-VERSION-OS-ARCH.tar.gz
+# Pack the binaries from BINDIR into dist/nqvpn-VERSION-OS-ARCH.tar.gz
 # plus a `.sha256` ("<hex>  <file>"). These names are what --self-update
 # looks for, so every platform goes through here. POSIX sh: runs on the
 # Linux and macOS runners and inside the FreeBSD VM.
 set -eu
 v=$1 os=$2 arch=$3 dir=$4
-bins="nqvpn-coord nqvpn-relay nqvpn-client"
+bins="nqvpn-coord nqvpn-relay nqvpn-client nqvpn-forward"
 name="nqvpn-$v-$os-$arch.tar.gz"
 mkdir -p dist
 for b in $bins; do

@@ -57,6 +57,13 @@ struct Cli {
     /// choice; which relay carries the traffic is picked normally.
     #[arg(long, visible_alias = "via")]
     route_all_via: Option<String>,
+    /// Reach the relay named <RELAY> through a forwarder (nqvpn-forward) at
+    /// <HOST:PORT> instead of its published address: <RELAY>=<HOST:PORT>.
+    /// The relay's certificate is still verified. Outranks the preferred
+    /// relay; if the forwarder is unreachable the fleet is used until it
+    /// answers again. Overrides the config's relay_via.
+    #[arg(long, value_name = "RELAY=HOST:PORT")]
+    relay_via: Option<String>,
     #[command(flatten)]
     update: nqvpn_update::UpdateArgs,
 }
@@ -101,6 +108,7 @@ async fn run(cli: Cli) -> Result<i32> {
         warn_if_exposed(&cli.config, "the config file");
     }
     let member = Arc::new(cfg.member_from(&token)?);
+    let relay_via = cfg.relay_via(cli.relay_via.as_deref())?;
     let identity = TlsIdentity::load_or_create(&cfg.state_dir, "nqvpn-client").context("loading TLS certificate")?;
     let keys = StaticKeys::load_or_create(&cfg.state_dir).map_err(|e| anyhow::anyhow!("loading static keys: {e}"))?;
 
@@ -173,6 +181,10 @@ async fn run(cli: Cli) -> Result<i32> {
     let client =
         Client::new(&joined, identity.clone(), keys.clone(), tun, routes, None, route_all, cli.route_all_via.clone());
     client.set_route_policy(cfg.route_policy());
+    if let Some(v) = &relay_via {
+        tracing::info!(relay = %v.relay, forwarder = %v.addr, "reaching this relay through a forwarder");
+    }
+    client.set_relay_via(relay_via);
     if let Ok((host, _)) = nqvpn_proto::joinapi::parse_url(&member.coordinator) {
         // Async: the runtime is single-threaded, and a blocking lookup
         // would stall it for as long as the resolver takes.

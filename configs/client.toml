@@ -15,6 +15,12 @@ state_dir = "/var/lib/nqvpn-client"
 # trust_any_cert = true           # set only to deliberately skip verification
 # ca = "/etc/nqvpn/coord-ca.pem"  # extra CA file, if you verify a private CA
 
+# Reach one relay through a forwarder (nqvpn-forward) that is easier to get
+# to from here, instead of its published address. The relay's certificate
+# is still verified end to end. If the forwarder is down the client falls
+# back to the fleet and returns once it answers. --relay-via overrides it.
+# relay_via = "sg-relay=cn-fwd.example.com:44449"
+
 # Optional local limit on what the coordinator can route into the tunnel.
 # Unset: every published prefix is accepted except ones wider than /8
 # (IPv4) or /16 (IPv6). Set: only prefixes inside these ranges are routed

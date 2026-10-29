@@ -1479,6 +1479,7 @@ dependencies = [
  "ipnet",
  "nqvpn-coord",
  "nqvpn-endpoint",
+ "nqvpn-forward",
  "nqvpn-proto",
  "nqvpn-relay",
  "nqvpn-session",
@@ -1542,6 +1543,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tun-rs",
+]
+
+[[package]]
+name = "nqvpn-forward"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nqvpn-update",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

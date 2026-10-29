@@ -45,6 +45,10 @@ pub struct ClientConfig {
     /// Local policy over the prefixes the coordinator publishes.
     #[serde(default)]
     pub routes: RoutesConfig,
+    /// Reach one relay through a forwarder (`nqvpn-forward`):
+    /// `"<relay-name>=<host:port>"`. `--relay-via` overrides it.
+    #[serde(default)]
+    pub relay_via: Option<String>,
 }
 
 /// `[routes]`: which coordinator-published prefixes this client accepts.
@@ -132,6 +136,7 @@ impl Default for ClientConfig {
             state_dir: d_state(),
             tun_name: None,
             routes: RoutesConfig::default(),
+            relay_via: None,
         }
     }
 }
@@ -169,6 +174,14 @@ impl ClientConfig {
             anyhow::bail!("no token: pass --token-file (or --token, or NQVPN_TOKEN), or set token / token_file in the config")
         };
         Token::parse(raw.trim()).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// The `relay_via` override, `cli` (from `--relay-via`) first.
+    pub fn relay_via(&self, cli: Option<&str>) -> Result<Option<crate::client::RelayVia>> {
+        match cli.or(self.relay_via.as_deref()) {
+            None => Ok(None),
+            Some(s) => s.parse().map(Some).map_err(|e| anyhow::anyhow!("relay_via {s:?}: {e}")),
+        }
     }
 
     /// The route policy `[routes]` describes.
@@ -224,6 +237,18 @@ mod tests {
         assert!(!m.tls.trust_any_cert);
         assert!(m.tls.pinned_fps.is_empty());
         assert_eq!(c.state_dir, d_state());
+    }
+
+    #[test]
+    fn relay_via_is_name_equals_host_port_and_the_command_line_wins() {
+        let c: ClientConfig = toml::from_str("relay_via = \"sg-relay=cn-fwd.example:44449\"\n").unwrap();
+        let v = c.relay_via(None).unwrap().unwrap();
+        assert_eq!((v.relay.as_str(), v.addr.as_str()), ("sg-relay", "cn-fwd.example:44449"));
+        assert_eq!(c.relay_via(Some("r2=[::1]:9")).unwrap().unwrap().addr, "[::1]:9");
+        assert!(ClientConfig::default().relay_via(None).unwrap().is_none());
+        for bad in ["sg-relay", "=h:1", "r=host", "r=:1", "r=h:notaport"] {
+            assert!(ClientConfig::default().relay_via(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

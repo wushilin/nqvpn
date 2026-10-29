@@ -9,6 +9,7 @@ members = [
     "crates/nqvpn-session",
     "crates/nqvpn-sync",
     "crates/nqvpn-update",
+    "crates/nqvpn-forward",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ nqvpn-endpoint = { path = "crates/nqvpn-endpoint" }
 nqvpn-session = { path = "crates/nqvpn-session" }
 nqvpn-sync = { path = "crates/nqvpn-sync" }
 nqvpn-update = { path = "crates/nqvpn-update" }
+nqvpn-forward = { path = "crates/nqvpn-forward" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

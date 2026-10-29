@@ -4,7 +4,7 @@
 #   Actions tab -> release -> Run workflow      -> test and build only (dry run)
 #
 # Archives are nqvpn-<version>-<os>-<arch>.tar.gz (+ .sha256), each holding
-# nqvpn-coord, nqvpn-relay and nqvpn-client; --self-update fetches exactly
+# nqvpn-coord, nqvpn-relay, nqvpn-client and nqvpn-forward; --self-update fetches exactly
 # these names. Linux builds are static musl; macOS and FreeBSD link their
 # system libc (musl does not exist there).
 
@@ -74,7 +74,7 @@ jobs:
           v=${{ needs.version.outputs.version }}
           for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:amd64; do
             target=${pair%%:*} arch=${pair##*:}
-            cargo build --release --locked --target "$target" -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            cargo build --release --locked --target "$target" -p nqvpn-coord -p nqvpn-relay -p nqvpn-client -p nqvpn-forward
             .github/scripts/package.sh "$v" macos "$arch" "target/$target/release"
           done
       - uses: actions/upload-artifact@v7
@@ -100,7 +100,7 @@ jobs:
             echo 'FreeBSD: { url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
             pkg install -y rust
           run: |
-            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client -p nqvpn-forward
             .github/scripts/package.sh ${{ needs.version.outputs.version }} freebsd amd64 target/release
       - uses: actions/upload-artifact@v7
         with:
@@ -143,7 +143,7 @@ jobs:
             echo 'FreeBSD: { url: "pkg+http://pkg.FreeBSD.org/${ABI}/latest" }' > /usr/local/etc/pkg/repos/FreeBSD.conf
             pkg install -y rust
           run: |
-            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client
+            cargo build --release --locked -p nqvpn-coord -p nqvpn-relay -p nqvpn-client -p nqvpn-forward
             .github/scripts/package.sh ${{ needs.version.outputs.version }} freebsd arm64 target/release
       - uses: actions/upload-artifact@v7
         with:

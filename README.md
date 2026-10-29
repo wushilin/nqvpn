@@ -251,6 +251,7 @@ nqvpn-client --token "nqv1.…" --route-all-via cloud-exit   # prefer this one
 | `nqvpn-client` | ~500 lines of wiring |
 | `nqvpn-coord` | networks and members in SQLite, join by token, leases, directory with generations and a delta ring, HTTPS API, embedded live admin UI |
 | `nqvpn-update` | `--self-update` / `--check-update` for every binary, from GitHub releases |
+| `nqvpn-forward` | a byte-for-byte UDP forwarder in front of one relay, for clients that reach it more easily (`--relay-via`) |
 
 Dependencies point strictly downward (`proto ← session ← sync/endpoint ←
 relay/client`; `coord ← proto`), so each crate is reviewable on its own.
@@ -325,6 +326,34 @@ Unset, every published prefix is accepted except ones wider than `/8`
 (IPv4) or `/16` (IPv6). Set, only prefixes inside the list are routed and
 accepted (OS routes and the in-tunnel table alike); refusals are logged as
 warnings. `--route-all`'s catch-all is the client's own and unaffected.
+
+### Reaching a relay through a forwarder
+
+When some clients reach a relay poorly — say the relay is abroad and
+the clients are in mainland China — run `nqvpn-forward` on a host they
+reach well, pointed at that relay, and give only those clients
+`--relay-via`:
+
+```sh
+# on the forwarding host (e.g. a cloud VM near the clients)
+nqvpn-forward sg-relay.example.com:4444 --bind 0.0.0.0:44449
+
+# on each client that should use it
+nqvpn-client --token-file /etc/nqvpn/client.token --relay-via sg-relay=cn-fwd.example.com:44449
+# or in client.toml:  relay_via = "sg-relay=cn-fwd.example.com:44449"
+```
+
+The forwarder copies UDP datagrams and nothing else: no token, no keys,
+no configuration at the coordinator, which never hears of it. The QUIC
+session runs end to end, and the client still pins the relay's own
+certificate fingerprint from the view, so a forwarder pointed at the
+wrong relay (or tampering) fails the handshake. Other clients are
+unaffected. `--relay-via` outranks the preferred relay; if the forwarder
+is unreachable the client uses the fleet as usual and moves back once it
+answers again. Under `--route-all` the forwarder's address is pinned to
+the real gateway like any relay's. The client still talks to the
+coordinator directly. `configs/systemd/nqvpn-forward.service` runs it as
+an unprivileged service.
 
 Change anything about a member in the UI — its address, the LAN it routes,
 its preferred relay — and it is told to re-join; it applies the change in

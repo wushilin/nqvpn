@@ -1,0 +1,19 @@
+[package]
+name = "nqvpn-forward"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A UDP port forwarder in front of one relay, for clients that reach this
+# host more easily than the relay itself. Transport only: it never decodes
+# a packet, holds no keys and talks to no coordinator. QUIC runs end to end
+# through it, so the client still pins the relay's certificate.
+
+[dependencies]
+nqvpn-update.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

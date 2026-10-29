@@ -73,8 +73,42 @@ pub struct RelayUplink {
 pub struct Attached {
     pub relay_id: NodeId,
     pub name: String,
+    /// The relay's published address — what reconcile compares.
     pub addr: String,
     pub cert_fp: String,
+    /// What was actually dialed: `addr`, or a forwarder (`--relay-via`).
+    pub dialed: String,
+}
+
+/// `--relay-via <relay>=<host:port>`: reach the fleet relay named `relay`
+/// through a forwarder at `addr` (`nqvpn-forward`) instead of its published
+/// address. Local to this client; the coordinator never hears of it. The
+/// session is still pinned to the relay's own certificate, so the
+/// forwarder is trusted with nothing but delivery.
+///
+/// It outranks the coordinator's preferred relay. While the forwarder is
+/// unreachable the uplink falls back to the fleet as usual, and returns
+/// through the forwarder once it answers again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayVia {
+    pub relay: String,
+    pub addr: String,
+}
+
+impl std::str::FromStr for RelayVia {
+    type Err = String;
+    fn from_str(s: &str) -> Result<RelayVia, String> {
+        let (relay, addr) = s.split_once('=').ok_or("expected <relay-name>=<host:port>")?;
+        let (relay, addr) = (relay.trim(), addr.trim());
+        if relay.is_empty() {
+            return Err("missing the relay name before '='".into());
+        }
+        match addr.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ => return Err(format!("{addr:?} is not host:port")),
+        }
+        Ok(RelayVia { relay: relay.to_string(), addr: addr.to_string() })
+    }
 }
 
 impl RelayUplink {
@@ -126,8 +160,10 @@ pub struct Client {
     /// Configured at the coordinator; applied at every join.
     preferred_relay: Mutex<Option<String>>,
     /// While attached to a fallback relay, how often to check whether
-    /// the preferred one is reachable again.
+    /// the preferred one (or the `relay_via` forwarder) is reachable again.
     pub prefer_recheck: Mutex<Duration>,
+    /// Local override: dial this relay through a forwarder.
+    relay_via: Mutex<Option<RelayVia>>,
     /// Underlay addresses that must never be routed into the tunnel.
     underlay: Mutex<Vec<IpAddr>>,
     /// The exit each family is currently sealed to, so a change of exit is
@@ -210,6 +246,7 @@ impl Client {
             keepalive_secs: joined.keepalive_secs.max(1) as u64,
             preferred_relay: Mutex::new(preferred_relay.or_else(|| joined.preferred_relay.clone())),
             prefer_recheck: Mutex::new(Duration::from_secs(30)),
+            relay_via: Mutex::new(None),
             underlay: Mutex::new(Vec::new()),
             relay_addrs: Arc::new(Mutex::new(HashMap::new())),
             route_policy: Mutex::new(RoutePolicy::default()),
@@ -239,6 +276,27 @@ impl Client {
         *self.route_policy.lock().unwrap() = policy.clone();
         self.engine.peers.lock().unwrap().set_policy(policy);
         self.view.poke();
+    }
+
+    /// Reach a relay through a forwarder (`--relay-via`). Takes effect at
+    /// the next attach; an uplink already held elsewhere moves once the
+    /// forwarder answers.
+    pub fn set_relay_via(&self, via: Option<RelayVia>) {
+        *self.relay_via.lock().unwrap() = via;
+    }
+
+    /// The `relay_via` relay as a dialable entry — the fleet entry with the
+    /// forwarder's address — when it is in the view.
+    fn via_entry(&self) -> Option<RelayEntry> {
+        let via = self.relay_via.lock().unwrap().clone()?;
+        self.view.with(|s| {
+            s.relays.iter().find(|r| r.name == via.relay).map(|r| RelayEntry {
+                relay_id: r.relay_id,
+                name: r.name.clone(),
+                addr: via.addr.clone(),
+                cert_fp: r.cert_fp.clone(),
+            })
+        })
     }
 
     /// Start the pumps: TUN -> engine -> uplink, and the rekey sweep.
@@ -298,7 +356,22 @@ impl Client {
                 continue;
             }
             let preferred = self.preferred_relay.lock().unwrap().clone();
-            let Some(entry) = choose_relay(&candidates, preferred.as_deref(), &self.identity, self.keepalive_secs).await else {
+            let via = self.relay_via.lock().unwrap().clone();
+            // The forwarder first, when configured and it answers; then the
+            // fleet as usual.
+            let mut picked = None;
+            if let Some(v) = &via {
+                match self.via_entry() {
+                    Some(e) if probe_rtt(&e, &self.identity, self.keepalive_secs).await.is_some() => picked = Some(e),
+                    Some(_) => tracing::warn!(relay = %v.relay, forwarder = %v.addr, "relay forwarder unreachable; falling back to the fleet"),
+                    None => tracing::warn!(relay = %v.relay, "relay_via names a relay that is not in the fleet; ignoring it"),
+                }
+            }
+            let picked = match picked {
+                Some(e) => Some(e),
+                None => choose_relay(&candidates, preferred.as_deref(), &self.identity, self.keepalive_secs).await,
+            };
+            let Some(entry) = picked else {
                 failures = failures.saturating_add(1);
                 let wait = nqvpn_proto::joinapi::retry_delay(false, failures);
                 tracing::warn!(retry_in_secs = wait.as_secs(), "no reachable relay");
@@ -313,19 +386,29 @@ impl Client {
             match nqvpn_session::dial(&entry.addr, &self.identity, Some(entry.cert_fp.clone()), &credential, self.keepalive_secs, self.mode, self.lanes, entry.relay_id, nqvpn_proto::types::Role::Relay, claims).await {
                 Ok(session) => {
                     self.counters.attaches.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(relay = %entry.name, addr = %entry.addr, "attached");
+                    // Reconcile compares the relay's published address, not
+                    // the forwarder's, or every pass would call it stale.
+                    let published = candidates.iter().find(|r| r.relay_id == entry.relay_id).map(|r| r.addr.clone()).unwrap_or_else(|| entry.addr.clone());
+                    let through_via = published != entry.addr;
+                    if through_via {
+                        tracing::info!(relay = %entry.name, forwarder = %entry.addr, "attached through the forwarder");
+                    } else {
+                        tracing::info!(relay = %entry.name, addr = %entry.addr, "attached");
+                    }
                     self.uplink.set(
                         Some(session.clone()),
-                        Some(Attached { relay_id: entry.relay_id, name: entry.name.clone(), addr: entry.addr.clone(), cert_fp: entry.cert_fp.clone() }),
+                        Some(Attached { relay_id: entry.relay_id, name: entry.name.clone(), addr: published, cert_fp: entry.cert_fp.clone(), dialed: entry.addr.clone() }),
                     );
                     self.link.kick();
                     let attached_at = std::time::Instant::now();
-                    // Preferred but not attached to it: keep checking,
-                    // and move as soon as it is reachable again.
-                    let _return_watch = preferred
-                        .as_deref()
-                        .filter(|p| *p != entry.name)
-                        .map(|_| AbortGuard(tokio::spawn(self.clone().watch_for_preferred(session.clone()))));
+                    // Not where we would rather be (the forwarder, else the
+                    // preferred relay): keep checking, and move as soon as
+                    // it is reachable again.
+                    let away = match &via {
+                        Some(_) => !through_via,
+                        None => preferred.as_deref().is_some_and(|p| p != entry.name),
+                    };
+                    let _return_watch = away.then(|| AbortGuard(tokio::spawn(self.clone().watch_for_return(session.clone()))));
                     let me = self.clone();
                     let end: End = session
                         .run(&SessionConfig { probe_secs: 2, probe_misses: 5 }, None, move |d, _lane| {
@@ -363,7 +446,7 @@ impl Client {
     }
 
     pub fn status_line(&self) -> String {
-        let relay = self.uplink.attached_to.lock().unwrap().clone().map(|a| a.name);
+        let relay = self.uplink.attached_to.lock().unwrap().clone().map(|a| if a.dialed != a.addr { format!("{} via {}", a.name, a.dialed) } else { a.name });
         format!(
             "{} relay={:?} gen={} attaches={} uplink_drops={}",
             self.engine.status_line(),
@@ -443,9 +526,10 @@ impl Client {
             *pref = r.preferred_relay.clone();
             drop(pref);
             // Attached somewhere the new preference does not point:
-            // the uplink loop re-evaluates when this session ends.
+            // the uplink loop re-evaluates when this session ends. A local
+            // relay_via outranks the preference, so it stays put.
             let attached = self.uplink.attached_to.lock().unwrap().clone();
-            let want = self.preferred_relay.lock().unwrap().clone();
+            let want = self.preferred_relay.lock().unwrap().clone().filter(|_| self.relay_via.lock().unwrap().is_none());
             if let (Some(a), Some(w)) = (attached, want) {
                 if a.name != w {
                     if let Some(s) = self.uplink.session() {
@@ -638,10 +722,16 @@ impl Client {
     fn relay_ips(&self, view: &Snapshot) -> (Vec<IpAddr>, bool) {
         let now = Instant::now();
         let (mut out, mut resolving) = (Vec::new(), false);
+        // Every relay, plus the relay_via forwarder: under route-all it is
+        // a transport host like any other and must stay off the tunnel.
+        let mut targets: Vec<(String, String)> = view.relays.iter().map(|r| (r.addr.clone(), r.name.clone())).collect();
+        if let Some(v) = self.relay_via.lock().unwrap().clone() {
+            targets.push((v.addr, format!("{} (forwarder)", v.relay)));
+        }
         let mut cache = self.relay_addrs.lock().unwrap();
-        cache.retain(|addr, _| view.relays.iter().any(|r| &r.addr == addr));
-        for r in &view.relays {
-            let e = cache.entry(r.addr.clone()).or_insert_with(|| RelayAddr { ips: Vec::new(), due: now, failures: 0, in_flight: false });
+        cache.retain(|addr, _| targets.iter().any(|(a, _)| a == addr));
+        for (addr, name) in &targets {
+            let e = cache.entry(addr.clone()).or_insert_with(|| RelayAddr { ips: Vec::new(), due: now, failures: 0, in_flight: false });
             out.extend(e.ips.iter().copied());
             resolving |= e.ips.is_empty() && e.failures == 0;
             if e.in_flight || e.due > now {
@@ -649,7 +739,7 @@ impl Client {
             }
             let Ok(rt) = tokio::runtime::Handle::try_current() else { continue };
             e.in_flight = true;
-            let (addr, name) = (r.addr.clone(), r.name.clone());
+            let (addr, name) = (addr.clone(), name.clone());
             let (cache, view) = (self.relay_addrs.clone(), self.view.clone());
             rt.spawn(async move {
                 let got = match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(addr.as_str())).await {
@@ -781,22 +871,28 @@ impl Drop for AbortGuard {
 }
 
 impl Client {
-    /// Attached to a fallback while a preferred relay is named: go back
-    /// to it once it answers. Preference is non-binding either way.
-    async fn watch_for_preferred(self: Arc<Self>, session: Arc<Session>) {
-        let Some(name) = self.preferred_relay.lock().unwrap().clone() else { return };
+    /// Attached to a fallback while the relay_via forwarder (or else a
+    /// preferred relay) is named: go back once it answers. Both are
+    /// non-binding.
+    async fn watch_for_return(self: Arc<Self>, session: Arc<Session>) {
         loop {
             let every = *self.prefer_recheck.lock().unwrap();
             tokio::time::sleep(every).await;
-            let entry = self.view.with(|s| {
-                s.relays
-                    .iter()
-                    .find(|r| r.name == name)
-                    .map(|r| RelayEntry { relay_id: r.relay_id, name: r.name.clone(), addr: r.addr.clone(), cert_fp: r.cert_fp.clone() })
-            });
+            let (entry, what) = if self.relay_via.lock().unwrap().is_some() {
+                (self.via_entry(), "relay forwarder")
+            } else {
+                let Some(name) = self.preferred_relay.lock().unwrap().clone() else { return };
+                let entry = self.view.with(|s| {
+                    s.relays
+                        .iter()
+                        .find(|r| r.name == name)
+                        .map(|r| RelayEntry { relay_id: r.relay_id, name: r.name.clone(), addr: r.addr.clone(), cert_fp: r.cert_fp.clone() })
+                });
+                (entry, "preferred relay")
+            };
             if let Some(e) = entry {
                 if probe_rtt(&e, &self.identity, self.keepalive_secs).await.is_some() {
-                    tracing::info!(relay = %name, "preferred relay is reachable again; moving to it");
+                    tracing::info!(relay = %e.name, addr = %e.addr, "{what} is reachable again; moving to it");
                     session.close(CLOSE_EVICTED, "moving to the preferred relay");
                     return;
                 }

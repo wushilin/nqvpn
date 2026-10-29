@@ -30,7 +30,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
 
-BINS="nqvpn-coord nqvpn-relay nqvpn-client"
+BINS="nqvpn-coord nqvpn-relay nqvpn-client nqvpn-forward"
 TOOLS="$ROOT/.build-tools"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 

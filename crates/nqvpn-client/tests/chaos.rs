@@ -5,7 +5,7 @@
 //! hand — the property the design is built around.
 
 use anyhow::Result;
-use nqvpn_client::client::{Client, ClientReconciler};
+use nqvpn_client::client::{Client, ClientReconciler, RelayVia};
 use nqvpn_coord::admin::MemberSpec;
 use nqvpn_coord::config::{CoordConfig, NetworkConfig};
 use nqvpn_coord::db::Db;
@@ -319,6 +319,15 @@ impl ClientHandle {
 
     /// With a specific token secret (after a rotation).
     async fn start_with_secret(coord_url: &str, node_id: NodeId, secret: &str) -> ClientHandle {
+        Self::start_full(coord_url, node_id, secret, None).await
+    }
+
+    /// Reaching one relay through a forwarder (`--relay-via`).
+    async fn start_via(coord_url: &str, node_id: NodeId, via: RelayVia) -> ClientHandle {
+        Self::start_full(coord_url, node_id, &secret_of(&format!("c{node_id}")), Some(via)).await
+    }
+
+    async fn start_full(coord_url: &str, node_id: NodeId, secret: &str, via: Option<RelayVia>) -> ClientHandle {
         let identity = TlsIdentity::generate(&format!("client{node_id}")).unwrap();
         let keys = StaticKeys::generate().unwrap();
         let mut m = (*member(coord_url, node_id, Role::Client)).clone();
@@ -329,6 +338,7 @@ impl ClientHandle {
         let routes = Arc::new(RouteSet::new(RecordingProgrammer::default()));
         let client = Client::new(&joined, identity.clone(), keys.clone(), tun.clone(), routes.clone(), None, false, None);
         *client.prefer_recheck.lock().unwrap() = Duration::from_secs(2);
+        client.set_relay_via(via);
         client.spawn_pumps();
         let tasks = vec![
             nqvpn_sync::spawn_reconciler(client.view.clone(), Arc::new(ClientReconciler(client.clone())), Duration::from_secs(1)),
@@ -368,6 +378,15 @@ impl ClientHandle {
 
     fn attached_to(&self) -> Option<NodeId> {
         self.client.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.relay_id)
+    }
+
+    /// The address the uplink was actually dialed at.
+    fn dialed(&self) -> Option<String> {
+        self.client.uplink.attached_to.lock().unwrap().as_ref().map(|a| a.dialed.clone())
+    }
+
+    fn attaches(&self) -> u64 {
+        self.client.counters.attaches.load(Ordering::Relaxed)
     }
 
     /// The client's current IPv4 address, as of its latest join.
@@ -1314,5 +1333,69 @@ async fn a_route_allowlist_keeps_an_unlisted_lan_out_of_the_tunnel() -> Result<(
     assert_eq!(a.client.engine.peers.lock().unwrap().owner_of("100.64.77.1".parse().unwrap()), None, "nor owned in a's tunnel table");
     assert!(a.os_has("10.99.0.0/16"), "the allowed network space is still routed");
     all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+// ---- relay_via: reaching a relay through nqvpn-forward ----
+
+/// A forwarder on `port` in front of `target`; aborting the task stops it
+/// and frees the port.
+async fn start_forwarder(port: u16, target: u16) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let fwd = nqvpn_forward::Forwarder::bind(format!("127.0.0.1:{port}").parse().unwrap(), nqvpn_forward::Options::new(format!("127.0.0.1:{target}")))
+        .await
+        .unwrap();
+    tokio::spawn(fwd.run())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_reaches_its_relay_through_a_forwarder_and_falls_back_while_it_is_down() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10, 20]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    let fport = port();
+    let fwd = start_forwarder(fport, rp[1].1).await;
+    let forwarder = format!("127.0.0.1:{fport}");
+    let a = ClientHandle::start_via(&w.url(), 10, RelayVia { relay: "r2".into(), addr: forwarder.clone() }).await;
+    let b = ClientHandle::start(&w.url(), 20).await;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    assert_eq!(a.attached_to(), Some(r2.node_id), "attached to the relay behind the forwarder");
+    assert_eq!(a.dialed().as_deref(), Some(forwarder.as_str()), "through the forwarder, still pinned to r2's certificate");
+    // Reconcile compares r2's published address, not the forwarder's: the
+    // session is not thrown away as stale.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(a.attaches(), 1, "the uplink through the forwarder is stable");
+    all_pairs_reach(&[&a, &b], Duration::from_secs(10)).await?;
+
+    // The forwarder goes away: a falls back to the fleet directly.
+    fwd.abort();
+    wait_until("a falls back to a direct relay", Duration::from_secs(40), || {
+        a.dialed().is_some_and(|d| d != forwarder) && a.attached_to().is_some()
+    })
+    .await?;
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+
+    // It comes back: a returns through it without being told.
+    let _fwd = start_forwarder(fport, rp[1].1).await;
+    wait_until("a returns through the forwarder", Duration::from_secs(30), || a.dialed().as_deref() == Some(forwarder.as_str())).await?;
+    assert_eq!(a.attached_to(), Some(r2.node_id));
+    all_pairs_reach(&[&a, &b], Duration::from_secs(20)).await?;
+    drop(r1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarder_to_the_wrong_relay_fails_the_certificate_pin() -> Result<()> {
+    let (w, rp) = World::new(&[1, 2], &[10]).await;
+    let r1 = RelayHandle::start(&w.url(), 1, rp[0].1).await;
+    let _r2 = RelayHandle::start(&w.url(), 2, rp[1].1).await;
+    // Claims to front r2 but delivers to r1: r1's certificate is not r2's.
+    let fport = port();
+    let _fwd = start_forwarder(fport, rp[0].1).await;
+    let forwarder = format!("127.0.0.1:{fport}");
+    let a = ClientHandle::start_via(&w.url(), 10, RelayVia { relay: "r2".into(), addr: forwarder.clone() }).await;
+    wait_until("a attaches somewhere", Duration::from_secs(30), || a.attached_to().is_some()).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_ne!(a.dialed().as_deref(), Some(forwarder.as_str()), "never attached through a forwarder that delivers to the wrong relay");
+    drop(r1);
     Ok(())
 }
